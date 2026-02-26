@@ -1,0 +1,33 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ${APP_NAME}-backend-netpol
+  namespace: ${K8S_NAMESPACE}
+spec:
+  podSelector:
+    matchLabels:
+      app: ${APP_NAME}-backend
+  policyTypes:
+    - Ingress
+  ingress:
+    # Allow from App Service subnet (VNet integration)
+    - from:
+        - ipBlock:
+            cidr: ${APPSERVICE_SUBNET_CIDR}
+      ports:
+        - protocol: TCP
+          port: 5001
+    # Allow from ingress-nginx namespace
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 5001
+    # Allow from same namespace (e.g., health checks, redis)
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 5001

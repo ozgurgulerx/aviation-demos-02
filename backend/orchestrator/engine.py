@@ -60,6 +60,11 @@ DEFAULT_RECOVERY_CRITERIA = [
 ]
 
 
+class _LoopCappedSignal(Exception):
+    """Raised when LLM-directed loop guard caps invocations gracefully."""
+    pass
+
+
 class OrchestratorDecision(BaseModel):
     decision_id: str = Field(default_factory=lambda: f"dec-{uuid.uuid4().hex[:8]}")
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -121,7 +126,9 @@ class OrchestratorEngine:
         self._max_executor_invocations_effective: int = 0
         self._loop_guard_reason: Optional[str] = None
         self._autonomous_turn_limits = autonomous_turn_limits or {}
-        self._deterministic_execution_timeout_seconds = 60
+        self._deterministic_execution_timeout_seconds = int(
+            os.getenv("DETERMINISTIC_EXECUTION_TIMEOUT_SECONDS", "600")
+        )
         self._coordinator_agent_id: Optional[str] = None
         self._coordinator_artifacts_emitted = False
 
@@ -314,7 +321,8 @@ class OrchestratorEngine:
             workflow_create_started_at = datetime.now(timezone.utc)
             await self._emit_stage_started("create_workflow", "Create Workflow")
             with traced_span(_tracer, "orchestrator.create_workflow"):
-                self.workflow = create_workflow(
+                self.workflow = await asyncio.to_thread(
+                    create_workflow,
                     workflow_type=self.workflow_type,
                     name=f"{self.workflow_type}_{self.run_id}",
                     problem=problem,
@@ -333,10 +341,15 @@ class OrchestratorEngine:
             # Phase 4: Execute
             execute_started_at = datetime.now(timezone.utc)
             await self._emit_stage_started("execute_workflow", "Execute Workflow")
-            if self._is_bounded_orchestration_mode():
-                default_limit = max(10, len(self.selected_agents) + 3)
+            n_agents = len(self.selected_agents)
+            if self._is_deterministic_mode():
+                # One pass through all specialists + coordinator synthesis
+                default_limit = max(20, n_agents * 2)
+            elif self._is_llm_directed_mode():
+                # Coordinator may cycle through specialists multiple times
+                default_limit = max(40, n_agents * 5)
             else:
-                default_limit = max(20, len(self.selected_agents) * 4)
+                default_limit = max(30, n_agents * 4)
             if self._max_executor_invocations_override is not None:
                 self._max_executor_invocations_effective = max(1, int(self._max_executor_invocations_override))
             else:
@@ -385,6 +398,14 @@ class OrchestratorEngine:
         self._coordinator_agent_id = scenario_config.get("coordinator")
 
         if self._is_llm_directed_mode():
+            await self.emit_event(
+                "workflow.status",
+                {
+                    "status": "llm_selection_started",
+                    "message": "LLM is selecting specialist set and handoff order.",
+                    "currentStep": "selecting_agents",
+                },
+            )
             await self._apply_llm_directed_selection(problem)
 
         selected_coordinator = next(
@@ -561,16 +582,28 @@ class OrchestratorEngine:
         }
         if supports_explicit_temperature(model):
             request_kwargs["temperature"] = 0
+        timeout_seconds = float(os.getenv("LLM_PLAN_TIMEOUT_SECONDS", "30"))
 
         try:
             client, _ = await get_shared_async_client(api_version=OPENAI_API_VERSION)
-            response = await client.chat.completions.create(**request_kwargs)
+            response = await asyncio.wait_for(
+                client.chat.completions.create(**request_kwargs),
+                timeout=timeout_seconds,
+            )
             raw_content = response.choices[0].message.content or ""
             parsed = self._extract_json_object_from_text(raw_content)
             if not isinstance(parsed, dict):
                 logger.warning("llm_orchestration_plan_parse_failed", run_id=self.run_id, scenario=self.scenario)
                 return None
             return parsed
+        except asyncio.TimeoutError:
+            logger.warning(
+                "llm_orchestration_plan_timeout",
+                run_id=self.run_id,
+                scenario=self.scenario,
+                timeout_seconds=timeout_seconds,
+            )
+            return None
         except Exception as exc:
             logger.warning(
                 "llm_orchestration_plan_failed",
@@ -585,8 +618,7 @@ class OrchestratorEngine:
         if not self.trace_emitter:
             return
 
-        for i, agent in enumerate(self.selected_agents):
-            await asyncio.sleep(0.1 * i)  # Stagger for activation cascade animation
+        for agent in self.selected_agents:
             await self.trace_emitter.emit_agent_activated(
                 agent_id=agent.agent_id, agent_name=agent.agent_name,
                 reason=agent.reason, data_sources=agent.data_sources,
@@ -1136,27 +1168,34 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         final_output = None
         agent_responses = []
 
-        async for event in self.workflow.run_stream(input_message):
-            await self._process_workflow_event(event)
+        try:
+            async for event in self.workflow.run_stream(input_message):
+                await self._process_workflow_event(event)
 
-            if isinstance(event, WorkflowOutputEvent):
-                final_output = event.data
+                if isinstance(event, WorkflowOutputEvent):
+                    final_output = event.data
 
-            if isinstance(event, AgentRunEvent):
-                response = event.data
-                if response is None:
-                    continue
-                agent_name = event.executor_id or "unknown"
-                agent_responses.append({
-                    "agent": agent_name,
-                    "messages": len(response.messages) if response.messages else 0,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
-                self.evidence.append({
-                    "evidence_id": f"ev-{uuid.uuid4().hex[:8]}",
-                    "type": "agent_response", "agent": agent_name,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
+                if isinstance(event, AgentRunEvent):
+                    response = event.data
+                    if response is None:
+                        continue
+                    agent_name = event.executor_id or "unknown"
+                    agent_responses.append({
+                        "agent": agent_name,
+                        "messages": len(response.messages) if response.messages else 0,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                    self.evidence.append({
+                        "evidence_id": f"ev-{uuid.uuid4().hex[:8]}",
+                        "type": "agent_response", "agent": agent_name,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+        except _LoopCappedSignal:
+            logger.info(
+                "workflow_loop_capped_graceful",
+                run_id=self.run_id,
+                agents_heard=len(agent_responses),
+            )
 
         if isinstance(final_output, dict):
             return final_output
@@ -1198,6 +1237,41 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                 self._max_executor_invocations_effective > 0
                 and self._executor_invocations_total > self._max_executor_invocations_effective
             ):
+                # For LLM-directed mode: if every specialist has been invoked
+                # at least once, treat limit breach as graceful completion
+                # rather than a hard failure.
+                specialist_ids = {
+                    a.agent_id for a in self.selected_agents
+                    if a.category != "coordinator"
+                }
+                all_heard = specialist_ids.issubset(self._agent_execution_counts.keys())
+
+                if self._is_llm_directed_mode() and all_heard:
+                    logger.warning(
+                        "llm_directed_loop_capped",
+                        run_id=self.run_id,
+                        invocations=self._executor_invocations_total,
+                        limit=self._max_executor_invocations_effective,
+                        specialists_heard=len(specialist_ids),
+                    )
+                    await self.emit_event(
+                        "workflow.status",
+                        {
+                            **event_data,
+                            "status": "loop_capped",
+                            "message": (
+                                f"All {len(specialist_ids)} specialists consulted; "
+                                f"capping at {self._max_executor_invocations_effective} invocations."
+                            ),
+                            "executorInvocations": self._executor_invocations_total,
+                            "maxExecutorInvocations": self._max_executor_invocations_effective,
+                            "workflowState": "COMPLETING",
+                        },
+                    )
+                    # Signal graceful stop — _stream_workflow will return
+                    # whatever results have been accumulated so far.
+                    raise _LoopCappedSignal()
+
                 reason = (
                     f"handoff_loop_guard_triggered: executor invocations exceeded "
                     f"{self._max_executor_invocations_effective}"

@@ -1,0 +1,31 @@
+FROM python:3.11-slim
+
+# Install dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc libpq-dev curl && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy requirements first for layer caching
+COPY backend/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY backend/ .
+
+# Create non-root user and /tmp for readOnlyRootFilesystem
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app \
+    && mkdir -p /tmp && chown appuser:appuser /tmp
+USER appuser
+
+# Set Python path
+ENV PYTHONPATH=/app
+
+EXPOSE 5001
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:5001/health || exit 1
+
+# Run with uvicorn
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "5001", "--workers", "2"]

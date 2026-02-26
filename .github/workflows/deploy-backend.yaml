@@ -1,0 +1,281 @@
+name: Deploy Backend to AKS
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'backend/**'
+      - 'Dockerfile.backend'
+      - 'k8s/**'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-backend-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TARGET_TENANT_ID: 52095a81-130f-4b06-83f1-9859b2c73de6
+  TARGET_SUBSCRIPTION_ID: 6a539906-6ce2-4e3b-84ee-89f701de18d8
+  AZURE_CONTAINER_REGISTRY: avrag705508acr.azurecr.io
+  IMAGE_NAME: aviation-multi-agent-backend
+  AKS_CLUSTER: aks-aviation-rag
+  AKS_RESOURCE_GROUP: rg-aviation-rag
+  K8S_NAMESPACE: aviation-multi-agent
+  APP_NAME: aviation-multi-agent
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 1: Lint & Test
+  # ─────────────────────────────────────────────────────────────────────────
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install Dependencies
+        run: pip install -r backend/requirements.txt
+
+      - name: Run Tests
+        run: pytest tests/ -v --tb=short -m "not integration"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 2: Build & Push
+  # ─────────────────────────────────────────────────────────────────────────
+  build-and-push:
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Validate Tenant & Subscription
+        run: |
+          CURRENT_TENANT=$(az account show --query tenantId -o tsv)
+          CURRENT_SUB=$(az account show --query id -o tsv)
+
+          if [[ "$CURRENT_TENANT" != "$TARGET_TENANT_ID" ]]; then
+            echo "::error::Tenant mismatch! Current: $CURRENT_TENANT Expected: $TARGET_TENANT_ID"
+            exit 1
+          fi
+          if [[ "$CURRENT_SUB" != "$TARGET_SUBSCRIPTION_ID" ]]; then
+            echo "::error::Subscription mismatch! Current: $CURRENT_SUB Expected: $TARGET_SUBSCRIPTION_ID"
+            exit 1
+          fi
+          echo "✓ Tenant and subscription validated"
+
+      - name: Build and Push to ACR
+        run: |
+          az acr login --name avrag705508acr
+          docker build -f Dockerfile.backend \
+            -t $AZURE_CONTAINER_REGISTRY/$IMAGE_NAME:${{ github.sha }} \
+            -t $AZURE_CONTAINER_REGISTRY/$IMAGE_NAME:latest \
+            .
+          docker push $AZURE_CONTAINER_REGISTRY/$IMAGE_NAME:${{ github.sha }}
+          docker push $AZURE_CONTAINER_REGISTRY/$IMAGE_NAME:latest
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 3: Deploy
+  # ─────────────────────────────────────────────────────────────────────────
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Validate Tenant & Subscription
+        run: |
+          CURRENT_TENANT=$(az account show --query tenantId -o tsv)
+          CURRENT_SUB=$(az account show --query id -o tsv)
+
+          if [[ "$CURRENT_TENANT" != "$TARGET_TENANT_ID" ]]; then
+            echo "::error::Tenant mismatch! Current: $CURRENT_TENANT Expected: $TARGET_TENANT_ID"
+            exit 1
+          fi
+          if [[ "$CURRENT_SUB" != "$TARGET_SUBSCRIPTION_ID" ]]; then
+            echo "::error::Subscription mismatch! Current: $CURRENT_SUB Expected: $TARGET_SUBSCRIPTION_ID"
+            exit 1
+          fi
+          echo "✓ Tenant and subscription validated"
+
+      - name: Validate Required Variables
+        env:
+          CHECK_OPENAI_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          CHECK_PGPASSWORD: ${{ secrets.PGPASSWORD }}
+        run: |
+          MISSING=""
+          [[ -z "$CHECK_OPENAI_KEY" ]] && MISSING="$MISSING AZURE_OPENAI_API_KEY"
+          [[ -z "$CHECK_PGPASSWORD" ]] && MISSING="$MISSING PGPASSWORD"
+          if [[ -n "$MISSING" ]]; then
+            echo "::error::Missing required secrets:$MISSING"
+            exit 1
+          fi
+          echo "✓ All required variables present"
+
+      - name: Get AKS Credentials
+        run: |
+          az aks get-credentials \
+            --resource-group $AKS_RESOURCE_GROUP \
+            --name $AKS_CLUSTER \
+            --overwrite-existing
+
+      - name: Create Image Pull Secret
+        run: |
+          # Always create acr-secret (idempotent) — serves as fallback if
+          # AKS managed identity AcrPull role is missing or revoked
+          ACR_TOKEN=$(az acr login --name avrag705508acr --expose-token --query accessToken -o tsv)
+          kubectl create secret docker-registry acr-secret \
+            --namespace=$K8S_NAMESPACE \
+            --docker-server=$AZURE_CONTAINER_REGISTRY \
+            --docker-username=00000000-0000-0000-0000-000000000000 \
+            --docker-password="$ACR_TOKEN" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Render K8s Manifests
+        run: |
+          export IMAGE_TAG="${{ github.sha }}"
+          chmod +x infra/scripts/render-k8s-manifests.sh
+          ./infra/scripts/render-k8s-manifests.sh
+
+      - name: Create Backend Secrets
+        run: |
+          # Create secrets via kubectl instead of envsubst to avoid
+          # writing secret values to rendered files on disk
+          kubectl create secret generic backend-secrets \
+            --namespace=$K8S_NAMESPACE \
+            --from-literal=AZURE_OPENAI_API_KEY="${{ secrets.AZURE_OPENAI_API_KEY }}" \
+            --from-literal=PGPASSWORD="${{ secrets.PGPASSWORD }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Apply Manifests
+        run: |
+          RENDERED=k8s/rendered
+
+          kubectl apply -f $RENDERED/namespace.yaml
+          kubectl apply -f $RENDERED/backend-serviceaccount.yaml
+          kubectl apply -f $RENDERED/backend-service.yaml
+          kubectl apply -f $RENDERED/backend-configmap.yaml
+          kubectl apply -f $RENDERED/redis-deployment.yaml
+          kubectl apply -f $RENDERED/backend-deployment.yaml
+          kubectl apply -f $RENDERED/backend-hpa.yaml
+          kubectl apply -f $RENDERED/backend-networkpolicy.yaml
+          kubectl apply -f $RENDERED/backend-pdb.yaml
+          kubectl apply -f $RENDERED/ingress.yaml 2>/dev/null || echo "⚠ Ingress skipped (controller may not be installed)"
+
+      - name: Set Image to Exact SHA
+        run: |
+          kubectl set image deployment/${APP_NAME}-backend \
+            backend=$AZURE_CONTAINER_REGISTRY/$IMAGE_NAME:${{ github.sha }} \
+            -n $K8S_NAMESPACE
+
+      - name: Stamp Deployment with Config Hashes
+        run: |
+          CONFIG_HASH=$(kubectl get configmap backend-config -n $K8S_NAMESPACE -o jsonpath='{.data}' | sha256sum | cut -c1-8)
+          SECRET_HASH=$(kubectl get secret backend-secrets -n $K8S_NAMESPACE -o jsonpath='{.data}' | sha256sum | cut -c1-8)
+
+          kubectl patch deployment ${APP_NAME}-backend -n $K8S_NAMESPACE \
+            --type merge \
+            -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"config-hash\":\"$CONFIG_HASH\",\"secret-hash\":\"$SECRET_HASH\"}}}}}"
+
+      - name: Monitor Rollout
+        run: |
+          TIMEOUT=900
+          POLL_INTERVAL=15
+          ELAPSED=0
+          DEPLOYMENT="${APP_NAME}-backend"
+
+          echo "Monitoring rollout of $DEPLOYMENT (timeout: ${TIMEOUT}s)..."
+
+          while [[ $ELAPSED -lt $TIMEOUT ]]; do
+            STATUS=$(kubectl rollout status deployment/$DEPLOYMENT -n $K8S_NAMESPACE --timeout=1s 2>&1 || true)
+
+            if echo "$STATUS" | grep -q "successfully rolled out"; then
+              echo "✓ Rollout complete"
+              break
+            fi
+
+            # Drift detection: check if image was changed externally
+            CURRENT_IMAGE=$(kubectl get deployment $DEPLOYMENT -n $K8S_NAMESPACE \
+              -o jsonpath='{.spec.template.spec.containers[0].image}')
+            EXPECTED_IMAGE="$AZURE_CONTAINER_REGISTRY/$IMAGE_NAME:${{ github.sha }}"
+            if [[ "$CURRENT_IMAGE" != "$EXPECTED_IMAGE" ]]; then
+              echo "::error::Image drift detected! Current: $CURRENT_IMAGE Expected: $EXPECTED_IMAGE"
+              exit 1
+            fi
+
+            echo "  Waiting... ($ELAPSED/${TIMEOUT}s)"
+            sleep $POLL_INTERVAL
+            ELAPSED=$((ELAPSED + POLL_INTERVAL))
+          done
+
+          if [[ $ELAPSED -ge $TIMEOUT ]]; then
+            echo "::error::Rollout timed out after ${TIMEOUT}s"
+            kubectl describe deployment $DEPLOYMENT -n $K8S_NAMESPACE
+            kubectl get pods -n $K8S_NAMESPACE -l app=$DEPLOYMENT
+            exit 1
+          fi
+
+      - name: Post-deploy Verification
+        run: |
+          echo "=== Pod Status ==="
+          kubectl get pods -n $K8S_NAMESPACE -l app=${APP_NAME}-backend -o wide
+
+          echo ""
+          echo "=== Image Verification ==="
+          EXPECTED_IMAGE="$AZURE_CONTAINER_REGISTRY/$IMAGE_NAME:${{ github.sha }}"
+          POD_IMAGES=$(kubectl get pods -n $K8S_NAMESPACE -l app=${APP_NAME}-backend \
+            -o jsonpath='{.items[*].spec.containers[0].image}')
+          for img in $POD_IMAGES; do
+            if [[ "$img" != "$EXPECTED_IMAGE" ]]; then
+              echo "::warning::Pod image mismatch: $img (expected $EXPECTED_IMAGE)"
+            fi
+          done
+          echo "Expected: $EXPECTED_IMAGE"
+          echo "Running:  $POD_IMAGES"
+
+          echo ""
+          echo "=== Health Check via Port-forward ==="
+          POD=$(kubectl get pods -n $K8S_NAMESPACE -l app=${APP_NAME}-backend \
+            -o jsonpath='{.items[0].metadata.name}')
+          kubectl port-forward "$POD" 5001:5001 -n $K8S_NAMESPACE &
+          PF_PID=$!
+          sleep 5
+
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5001/health || echo "000")
+          kill $PF_PID 2>/dev/null || true
+
+          if [[ "$HTTP_CODE" == "200" ]]; then
+            echo "✓ Health check passed (HTTP $HTTP_CODE)"
+          else
+            echo "::warning::Health check returned HTTP $HTTP_CODE"
+          fi
+
+          echo ""
+          echo "=== Services ==="
+          kubectl get svc -n $K8S_NAMESPACE

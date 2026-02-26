@@ -48,6 +48,14 @@ logger = structlog.get_logger()
 async def lifespan(app: FastAPI):
     """Application lifespan - initialize and cleanup resources."""
     logger.info("starting_aviation_solver_api")
+    # Warm Azure OpenAI client cache so first workflow doesn't pay credential cost
+    try:
+        from agents.client import get_shared_chat_client, get_orchestrator_chat_client
+        await asyncio.to_thread(get_shared_chat_client)
+        await asyncio.to_thread(get_orchestrator_chat_client)
+        logger.info("azure_openai_clients_warmed")
+    except Exception as e:
+        logger.warning("client_warmup_failed", error=str(e))
     yield
     logger.info("shutting_down_aviation_solver_api")
     await close_event_bus()
@@ -87,6 +95,49 @@ class SolveRequest(BaseModel):
     max_executor_invocations: Optional[int] = None
     autonomous_turn_limits: Optional[dict[str, int]] = None
     config: Optional[dict] = None
+
+
+WORKFLOW_SMOKE_CASES = [
+    {
+        "id": "ui-handoff-llm-directed",
+        "workflow_type": "handoff",
+        "orchestration_mode": "llm_directed",
+        "problem": (
+            "Severe thunderstorm at Chicago O'Hare (ORD) has caused a ground stop. "
+            "47 flights are delayed or cancelled, affecting approximately 6,800 passengers. "
+            "12 aircraft are grounded, 3 runways closed. Develop a recovery plan to minimize "
+            "total delay and passenger impact while maintaining crew legality and safety compliance."
+        ),
+    },
+    {
+        "id": "ui-handoff-deterministic",
+        "workflow_type": "handoff",
+        "orchestration_mode": "deterministic",
+        "problem": (
+            "Flight AA1847 (B737-800, N735AA) is en route from JFK to ORD and is "
+            "severely delayed by weather at the destination. Fuel remaining is 90 minutes. "
+            "The destination visibility is below minimums with thunderstorms. Recommend the "
+            "best diversion and recovery alternative."
+        ),
+    },
+    {
+        "id": "ui-sequential",
+        "workflow_type": "sequential",
+        "problem": (
+            "Aviation incident simulation: Gate gate-handoff at JFK for mixed baggage and "
+            "maintenance exceptions. Create a safe, practical recovery recommendation with "
+            "passenger communication and resource balancing."
+        ),
+    },
+]
+
+
+def _get_workflow_catalog():
+    """Return workflow IDs and sample payloads used by UI and validation tooling."""
+    return [
+        case.copy()
+        for case in WORKFLOW_SMOKE_CASES
+    ]
 
 
 class AgentInfo(BaseModel):
@@ -327,6 +378,15 @@ async def list_runs(
         "count": len(runs),
         "limit": limit,
         "offset": offset,
+    }
+
+
+@app.get("/api/av/workflows")
+async def list_workflows():
+    """List canonical workflow variants used by smoke tests and UI-driven runs."""
+    return {
+        "workflows": _get_workflow_catalog(),
+        "count": len(WORKFLOW_SMOKE_CASES),
     }
 
 

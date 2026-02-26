@@ -1,0 +1,23 @@
+# Git
+.git/
+.gitignore
+
+# Node
+node_modules/
+.next/
+out/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Local files
+.env
+.env.local
+*.log

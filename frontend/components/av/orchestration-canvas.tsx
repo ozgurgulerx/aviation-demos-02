@@ -14,11 +14,12 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { useAviationStore } from "@/store/aviation-store";
+import { TRACE_V2_ENABLED } from "@/lib/feature-flags";
 import { CoordinatorNode } from "./nodes/coordinator-node";
 import { AgentNode } from "./nodes/agent-node";
 import { GhostNode } from "./nodes/ghost-node";
 import { DataFlowEdge } from "./edges/data-flow-edge";
-import { Plane, Database, Radar } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Database, Plane, Radar, Radio } from "lucide-react";
 
 const nodeTypes = {
   coordinatorNode: CoordinatorNode,
@@ -160,9 +161,19 @@ function OrchestrationCanvasInner() {
   const agentEdges = useAviationStore((s) => s.agentEdges);
   const scenario = useAviationStore((s) => s.scenario);
   const dataSources = useAviationStore((s) => s.dataSources);
+  const runProgress = useAviationStore((s) => s.runProgress);
+  const noUpdateWarning = useAviationStore((s) => s.noUpdateWarning);
 
   const agentList = Object.values(agents);
   const hasAgents = agentList.length > 0;
+  const runningAgents = useMemo(
+    () => agentList.filter((a) => a.status === "thinking" || a.status === "querying"),
+    [agentList]
+  );
+  const completedAgents = useMemo(
+    () => agentList.filter((a) => a.status === "done"),
+    [agentList]
+  );
   const prevTopologyRef = useRef<string>("");
   const assembleTimerRef = useRef<NodeJS.Timeout | null>(null);
   const [isAssembling, setIsAssembling] = useState(false);
@@ -424,6 +435,53 @@ function OrchestrationCanvasInner() {
           </div>
         )}
       </div>
+
+      {TRACE_V2_ENABLED && (
+      <div className="absolute right-3 top-3 z-20 flex max-w-[40rem] flex-wrap items-center justify-end gap-2 text-[10px]">
+        <div className="rounded-lg border border-av-sky/24 bg-av-sky/10 px-2 py-1 font-semibold text-av-sky">
+          Progress {Math.round(runProgress.overallPct)}%
+        </div>
+        <div className="rounded-lg border border-av-green/24 bg-av-green/10 px-2 py-1 font-semibold text-av-green">
+          Done {completedAgents.length}
+        </div>
+        <div className="rounded-lg border border-av-gold/24 bg-av-gold/10 px-2 py-1 font-semibold text-av-gold">
+          Running {runningAgents.length}
+        </div>
+        {noUpdateWarning ? (
+          <div className="rounded-lg border border-av-gold/30 bg-av-gold/15 px-2 py-1 font-semibold text-av-gold inline-flex items-center gap-1">
+            <AlertTriangle className="w-3 h-3" />
+            Waiting for fresh traces
+          </div>
+        ) : (
+          <div className="rounded-lg border border-av-green/24 bg-av-green/10 px-2 py-1 font-semibold text-av-green inline-flex items-center gap-1">
+            <Radio className="w-3 h-3 animate-pulse" />
+            Live telemetry
+          </div>
+        )}
+      </div>
+      )}
+
+      {TRACE_V2_ENABLED && (
+      <div className="absolute left-3 bottom-3 z-20 flex max-w-[75%] flex-wrap items-center gap-2">
+        {runningAgents.length > 0 ? (
+          runningAgents.slice(0, 4).map((agent) => (
+            <div
+              key={`running-${agent.id}`}
+              className="rounded-full border border-av-sky/30 bg-av-midnight/78 px-2.5 py-1 text-[11px] text-av-sky inline-flex items-center gap-1.5"
+            >
+              <span className="h-1.5 w-1.5 rounded-full animate-pulse" style={{ backgroundColor: agent.color }} />
+              <span className="font-semibold">{agent.name}</span>
+              <span className="text-muted-foreground">{agent.currentStep || agent.status}</span>
+            </div>
+          ))
+        ) : (
+          <div className="rounded-full border border-av-green/30 bg-av-green/10 px-2.5 py-1 text-[11px] font-semibold text-av-green inline-flex items-center gap-1.5">
+            <CheckCircle2 className="w-3.5 h-3.5" />
+            No active agents. Waiting or completed.
+          </div>
+        )}
+      </div>
+      )}
 
       <ReactFlow
         nodes={nodes}

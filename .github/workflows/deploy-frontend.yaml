@@ -1,0 +1,168 @@
+name: Deploy Frontend to App Service
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-frontend-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TARGET_TENANT_ID: 52095a81-130f-4b06-83f1-9859b2c73de6
+  TARGET_SUBSCRIPTION_ID: 6a539906-6ce2-4e3b-84ee-89f701de18d8
+  AZURE_WEBAPP_NAME: aviation-multiagent-frontend-705508
+  AZURE_RG: rg-aviation-rag
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 1: Lint
+  # ─────────────────────────────────────────────────────────────────────────
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Dependencies
+        run: cd frontend && npm ci
+
+      - name: Lint
+        run: cd frontend && npx next lint
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 2: Build & Deploy
+  # ─────────────────────────────────────────────────────────────────────────
+  build-and-deploy:
+    needs: lint
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Validate Tenant & Subscription
+        run: |
+          CURRENT_TENANT=$(az account show --query tenantId -o tsv)
+          CURRENT_SUB=$(az account show --query id -o tsv)
+
+          if [[ "$CURRENT_TENANT" != "$TARGET_TENANT_ID" ]]; then
+            echo "::error::Tenant mismatch! Current: $CURRENT_TENANT Expected: $TARGET_TENANT_ID"
+            exit 1
+          fi
+          if [[ "$CURRENT_SUB" != "$TARGET_SUBSCRIPTION_ID" ]]; then
+            echo "::error::Subscription mismatch! Current: $CURRENT_SUB Expected: $TARGET_SUBSCRIPTION_ID"
+            exit 1
+          fi
+          echo "✓ Tenant and subscription validated"
+
+      - name: Validate Required Variables
+        run: |
+          if [[ -z "${{ secrets.BACKEND_URL }}" ]]; then
+            echo "::error::Missing required secret: BACKEND_URL"
+            exit 1
+          fi
+          echo "✓ Required variables present"
+
+      - name: Install Dependencies
+        run: cd frontend && npm ci
+
+      - name: Build Next.js
+        run: cd frontend && npm run build
+        env:
+          BACKEND_URL: ${{ secrets.BACKEND_URL }}
+
+      - name: Prepare Deployment Package
+        run: |
+          mkdir -p /tmp/deploy/.next
+
+          SERVER_JS=$(find frontend/.next/standalone -type f -name "server.js" ! -path "*/node_modules/*" | head -1)
+
+          if [ -z "$SERVER_JS" ]; then
+            echo "::error::server.js not found in standalone output"
+            exit 1
+          fi
+
+          STANDALONE_PATH=$(dirname "$SERVER_JS")
+          echo "Found standalone path: $STANDALONE_PATH"
+
+          cp "$STANDALONE_PATH/server.js" /tmp/deploy/
+          cp "$STANDALONE_PATH/package.json" /tmp/deploy/
+          cp -r "$STANDALONE_PATH/node_modules" /tmp/deploy/
+
+          if [ -d "$STANDALONE_PATH/.next" ]; then
+            cp -r "$STANDALONE_PATH/.next"/* /tmp/deploy/.next/
+          fi
+
+          cp -r frontend/.next/static /tmp/deploy/.next/static
+          mkdir -p /tmp/deploy/public
+          cp -r frontend/public/* /tmp/deploy/public/ 2>/dev/null || true
+
+          cd /tmp/deploy && zip -r /tmp/app.zip .
+
+      - name: Deploy to App Service
+        run: |
+          az webapp deploy --resource-group $AZURE_RG \
+            --name $AZURE_WEBAPP_NAME \
+            --src-path /tmp/app.zip \
+            --type zip \
+            --restart true
+
+      - name: Configure App Service
+        run: |
+          az webapp config appsettings set \
+            --name $AZURE_WEBAPP_NAME \
+            --resource-group $AZURE_RG \
+            --settings \
+              BACKEND_URL="${{ secrets.BACKEND_URL }}" \
+              WEBSITE_VNET_ROUTE_ALL=1 \
+              PORT=3000 \
+              WEBSITES_PORT=3000
+
+          az webapp config set \
+            --name $AZURE_WEBAPP_NAME \
+            --resource-group $AZURE_RG \
+            --startup-file "node server.js"
+
+      - name: Verify Deployment
+        run: |
+          echo "=== Health Check ==="
+          WEBAPP_URL="https://${AZURE_WEBAPP_NAME}.azurewebsites.net"
+
+          # Wait for app to start
+          sleep 30
+
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$WEBAPP_URL" || echo "000")
+          echo "GET $WEBAPP_URL → HTTP $HTTP_CODE"
+
+          if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "302" ]]; then
+            echo "✓ Frontend is accessible"
+          else
+            echo "::warning::Frontend returned HTTP $HTTP_CODE (may still be starting)"
+          fi

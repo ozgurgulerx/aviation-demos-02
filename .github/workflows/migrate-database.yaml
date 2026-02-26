@@ -1,0 +1,136 @@
+name: Migrate Database
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: 'Type "migrate" to confirm database migration'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TARGET_TENANT_ID: 52095a81-130f-4b06-83f1-9859b2c73de6
+  TARGET_SUBSCRIPTION_ID: 6a539906-6ce2-4e3b-84ee-89f701de18d8
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    if: github.event.inputs.confirmation == 'migrate'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate Confirmation
+        run: |
+          if [[ "${{ github.event.inputs.confirmation }}" != "migrate" ]]; then
+            echo "::error::Confirmation input must be 'migrate'. Got: '${{ github.event.inputs.confirmation }}'"
+            exit 1
+          fi
+          echo "✓ Migration confirmed"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install asyncpg
+        run: pip install asyncpg
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Validate Tenant
+        run: |
+          CURRENT_TENANT=$(az account show --query tenantId -o tsv)
+          if [[ "$CURRENT_TENANT" != "$TARGET_TENANT_ID" ]]; then
+            echo "::error::Tenant mismatch!"
+            exit 1
+          fi
+
+      - name: Run Migrations
+        env:
+          PGHOST: ${{ vars.PGHOST || 'aistartupstr.postgres.database.azure.com' }}
+          PGPORT: '5432'
+          PGDATABASE: 'fundrag'
+          PGUSER: 'ozgurguler'
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+        run: |
+          echo "=== Running SQL Migrations ==="
+
+          MIGRATION_DIR="backend/migrations"
+          if [[ ! -d "$MIGRATION_DIR" ]]; then
+            echo "::error::Migration directory not found: $MIGRATION_DIR"
+            exit 1
+          fi
+
+          # Run each .sql file in order
+          for sql_file in $(ls "$MIGRATION_DIR"/*.sql 2>/dev/null | sort); do
+            echo "Running: $(basename $sql_file)"
+            python3 -c "
+          import asyncio, asyncpg, os, sys
+
+          async def run():
+              conn = await asyncpg.connect(
+                  host=os.environ['PGHOST'],
+                  port=int(os.environ['PGPORT']),
+                  database=os.environ['PGDATABASE'],
+                  user=os.environ['PGUSER'],
+                  password=os.environ['PGPASSWORD'],
+                  ssl='require'
+              )
+              with open('$sql_file') as f:
+                  sql = f.read()
+              await conn.execute(sql)
+              await conn.close()
+              print(f'  ✓ Applied: $(basename $sql_file)')
+
+          asyncio.run(run())
+          "
+          done
+
+          echo ""
+          echo "=== All migrations applied ==="
+
+      - name: Verify Schema
+        env:
+          PGHOST: ${{ vars.PGHOST || 'aistartupstr.postgres.database.azure.com' }}
+          PGPORT: '5432'
+          PGDATABASE: 'fundrag'
+          PGUSER: 'ozgurguler'
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+        run: |
+          python3 -c "
+          import asyncio, asyncpg, os
+
+          async def verify():
+              conn = await asyncpg.connect(
+                  host=os.environ['PGHOST'],
+                  port=int(os.environ['PGPORT']),
+                  database=os.environ['PGDATABASE'],
+                  user=os.environ['PGUSER'],
+                  password=os.environ['PGPASSWORD'],
+                  ssl='require'
+              )
+              tables = await conn.fetch('''
+                  SELECT table_name FROM information_schema.tables
+                  WHERE table_schema = 'aviation_solver'
+                  ORDER BY table_name
+              ''')
+              await conn.close()
+
+              if not tables:
+                  print('⚠ No tables found in aviation_solver schema')
+              else:
+                  print(f'✓ aviation_solver schema has {len(tables)} table(s):')
+                  for t in tables:
+                      print(f'  - {t[\"table_name\"]}')
+
+          asyncio.run(verify())
+          "

@@ -1,0 +1,62 @@
+global:
+  namespace: aviation-multi-agent
+
+backend:
+  image:
+    registry: avrag705508acr.azurecr.io
+    repository: aviation-multi-agent-backend
+    tag: latest
+  port: 5001
+  replicas: 2
+  env:
+    AZURE_OPENAI_TENANT_ID: "52095a81-130f-4b06-83f1-9859b2c73de6"
+    AZURE_OPENAI_AUTH_MODE: "token"
+    AZURE_OPENAI_ENDPOINT: "https://aoai-ep-swedencentral02.openai.azure.com/"
+    AZURE_OPENAI_AGENT_DEPLOYMENT: "gpt-5-nano"
+    AZURE_OPENAI_ORCHESTRATOR_DEPLOYMENT: "gpt-5-mini"
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 2Gi
+    PGHOST: "aviationragpg705508.postgres.database.azure.com"
+    PGPORT: "5432"
+    PGDATABASE: "aviationrag"
+    PGUSER: "pgadmin"
+    OTEL_SERVICE_NAME: "aviation-multi-agent"
+    LOG_LEVEL: "INFO"
+
+redis:
+  image: redis:7-alpine
+  port: 6379
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilization: 70
+
+secrets:
+  inline:
+    enabled: false
+  keyvault:
+    enabled: false
+    name: ""
+    tenantId: ""
+
+ingress:
+  enabled: true
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"

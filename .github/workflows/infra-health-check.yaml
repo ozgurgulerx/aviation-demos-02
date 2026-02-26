@@ -1,0 +1,150 @@
+name: Infrastructure Health Check
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'  # Every 30 minutes
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TARGET_TENANT_ID: 52095a81-130f-4b06-83f1-9859b2c73de6
+  TARGET_SUBSCRIPTION_ID: 6a539906-6ce2-4e3b-84ee-89f701de18d8
+  AKS_CLUSTER: aks-aviation-rag
+  AKS_RESOURCE_GROUP: rg-aviation-rag
+  K8S_NAMESPACE: aviation-multi-agent
+  APP_NAME: aviation-multi-agent
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Validate Tenant
+        run: |
+          CURRENT_TENANT=$(az account show --query tenantId -o tsv)
+          if [[ "$CURRENT_TENANT" != "$TARGET_TENANT_ID" ]]; then
+            echo "::error::Tenant mismatch!"
+            exit 1
+          fi
+
+      - name: Check AKS Power State
+        id: aks-state
+        run: |
+          POWER_STATE=$(az aks show \
+            --resource-group $AKS_RESOURCE_GROUP \
+            --name $AKS_CLUSTER \
+            --query "powerState.code" -o tsv 2>/dev/null || echo "NotFound")
+
+          echo "power-state=$POWER_STATE" >> "$GITHUB_OUTPUT"
+          echo "AKS power state: $POWER_STATE"
+
+          if [[ "$POWER_STATE" == "Stopped" ]]; then
+            echo "AKS is stopped — starting cluster..."
+            az aks start --resource-group $AKS_RESOURCE_GROUP --name $AKS_CLUSTER
+            echo "started=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$POWER_STATE" == "Running" ]]; then
+            echo "started=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Unexpected AKS state: $POWER_STATE"
+            exit 1
+          fi
+
+      - name: Wait for Stabilization
+        if: steps.aks-state.outputs.started == 'true'
+        run: |
+          echo "Waiting for AKS to stabilize after start..."
+          sleep 60
+
+          # Verify it's running now
+          POWER_STATE=$(az aks show \
+            --resource-group $AKS_RESOURCE_GROUP \
+            --name $AKS_CLUSTER \
+            --query "powerState.code" -o tsv)
+
+          if [[ "$POWER_STATE" != "Running" ]]; then
+            echo "::error::AKS still not running after start: $POWER_STATE"
+            exit 1
+          fi
+          echo "✓ AKS is running"
+
+      - name: Get AKS Credentials
+        run: |
+          az aks get-credentials \
+            --resource-group $AKS_RESOURCE_GROUP \
+            --name $AKS_CLUSTER \
+            --overwrite-existing
+
+      - name: Verify Pods
+        id: pods
+        run: |
+          echo "=== Pod Status ==="
+          kubectl get pods -n $K8S_NAMESPACE -o wide
+
+          READY_PODS=$(kubectl get pods -n $K8S_NAMESPACE \
+            -l app=${APP_NAME}-backend \
+            --field-selector=status.phase=Running \
+            -o jsonpath='{.items[*].metadata.name}' | wc -w | tr -d ' ')
+
+          echo "ready-pods=$READY_PODS" >> "$GITHUB_OUTPUT"
+
+          if [[ "$READY_PODS" -eq 0 ]]; then
+            echo "::warning::No running backend pods found"
+          else
+            echo "✓ $READY_PODS backend pod(s) running"
+          fi
+
+      - name: Health Check via Port-forward
+        if: steps.pods.outputs.ready-pods != '0'
+        run: |
+          POD=$(kubectl get pods -n $K8S_NAMESPACE \
+            -l app=${APP_NAME}-backend \
+            --field-selector=status.phase=Running \
+            -o jsonpath='{.items[0].metadata.name}')
+
+          kubectl port-forward "$POD" 5001:5001 -n $K8S_NAMESPACE &
+          PF_PID=$!
+          sleep 5
+
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5001/health || echo "000")
+          BODY=$(curl -s http://localhost:5001/health || echo "{}")
+          kill $PF_PID 2>/dev/null || true
+
+          echo "Health endpoint: HTTP $HTTP_CODE"
+          echo "Response: $BODY"
+
+          if [[ "$HTTP_CODE" != "200" ]]; then
+            echo "::warning::Health check failed (HTTP $HTTP_CODE)"
+          fi
+
+      - name: Summary
+        run: |
+          POWER_STATE="${{ steps.aks-state.outputs.power-state }}"
+          STARTED="${{ steps.aks-state.outputs.started }}"
+          READY_PODS="${{ steps.pods.outputs.ready-pods }}"
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## Infrastructure Health Check
+
+          | Check | Status |
+          |-------|--------|
+          | AKS Cluster | ${POWER_STATE} |
+          | Auto-started | ${STARTED} |
+          | Ready Backend Pods | ${READY_PODS} |
+          | Namespace | ${K8S_NAMESPACE} |
+
+          **Timestamp:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          EOF
+
+          # Strip leading whitespace so markdown renders as a table, not a code block
+          sed -i 's/^          //' "$GITHUB_STEP_SUMMARY"

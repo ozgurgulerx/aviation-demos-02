@@ -1,9 +1,19 @@
 "use client";
 
 import { memo, useMemo } from "react";
-import { Plane } from "lucide-react";
+import { AlertTriangle, Gauge, Plane, Wifi } from "lucide-react";
 import { useAviationStore } from "@/store/aviation-store";
 import { cn } from "@/lib/utils";
+import { TRACE_V2_ENABLED } from "@/lib/feature-flags";
+
+function timeAgo(ts?: string): string {
+  if (!ts) return "n/a";
+  const deltaSec = Math.max(0, Math.floor((Date.now() - Date.parse(ts)) / 1000));
+  if (deltaSec < 5) return "just now";
+  if (deltaSec < 60) return `${deltaSec}s ago`;
+  const mins = Math.floor(deltaSec / 60);
+  return `${mins}m ago`;
+}
 
 function HeaderBarInner() {
   const currentRunId = useAviationStore((s) => s.currentRunId);
@@ -11,14 +21,16 @@ function HeaderBarInner() {
   const agents = useAviationStore((s) => s.agents);
   const clearEvents = useAviationStore((s) => s.clearEvents);
   const isConnected = useAviationStore((s) => s.isConnected);
-  const currentRun = useAviationStore((s) => s.currentRun);
+  const runProgress = useAviationStore((s) => s.runProgress);
+  const noUpdateWarning = useAviationStore((s) => s.noUpdateWarning);
 
   const includedAgents = useMemo(
     () => Object.values(agents).filter((a) => a.included),
     [agents]
   );
 
-  const progressPct = currentRun?.progress_pct ?? 0;
+  const progressPct = runProgress.overallPct ?? 0;
+  const hasActiveRun = !!currentRunId && runProgress.status === "running";
 
   return (
     <header className="relative z-20 shrink-0 px-3 pb-2 pt-3 md:px-4 md:pt-4">
@@ -108,12 +120,56 @@ function HeaderBarInner() {
         </div>
       </div>
 
-      {currentRunId && progressPct > 0 && (
+      {TRACE_V2_ENABLED && currentRunId && (
+        <div className="mt-2 grid grid-cols-2 gap-2 md:grid-cols-5">
+          <div className="av-panel-muted rounded-xl px-3 py-2">
+            <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Run State</p>
+            <p className={cn(
+              "mt-0.5 text-xs font-semibold capitalize",
+              runProgress.status === "completed" && "text-av-green",
+              runProgress.status === "failed" && "text-av-red",
+              runProgress.status === "running" && "text-av-sky",
+            )}>
+              {runProgress.status}
+            </p>
+          </div>
+          <div className="av-panel-muted rounded-xl px-3 py-2">
+            <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Overall Progress</p>
+            <p className="mt-0.5 text-xs font-semibold">{Math.round(progressPct)}%</p>
+          </div>
+          <div className="av-panel-muted rounded-xl px-3 py-2">
+            <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Agents</p>
+            <p className="mt-0.5 text-xs font-semibold">
+              {runProgress.agentsRunning} running / {runProgress.agentsDone} done / {runProgress.agentsErrored} errors
+            </p>
+          </div>
+          <div className="av-panel-muted rounded-xl px-3 py-2">
+            <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Last Update</p>
+            <p className="mt-0.5 text-xs font-semibold">{timeAgo(runProgress.lastUpdateAt)}</p>
+          </div>
+          <div className="av-panel-muted rounded-xl px-3 py-2">
+            <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Telemetry</p>
+            <p className="mt-0.5 flex items-center gap-1 text-xs font-semibold">
+              {noUpdateWarning ? <AlertTriangle className="h-3.5 w-3.5 text-av-gold" /> : <Wifi className="h-3.5 w-3.5 text-av-green" />}
+              {noUpdateWarning ? "Stale updates" : "Healthy"}
+            </p>
+          </div>
+        </div>
+      )}
+
+      {currentRunId && (
         <div className="pointer-events-none absolute bottom-2 left-3 right-3 h-[2px] bg-transparent md:left-4 md:right-4">
           <div
             className="h-full bg-av-sky transition-all duration-700 ease-out"
             style={{ width: `${Math.min(progressPct, 100)}%` }}
           />
+        </div>
+      )}
+
+      {TRACE_V2_ENABLED && hasActiveRun && (
+        <div className="mt-2 flex items-center gap-1.5 rounded-full border border-av-sky/25 bg-av-sky/10 px-3 py-1 text-[11px] font-medium text-av-sky">
+          <Gauge className="h-3.5 w-3.5" />
+          {runProgress.currentStep || "processing"}
         </div>
       )}
     </header>

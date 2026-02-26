@@ -128,19 +128,24 @@ def create_coordinator_workflow(
 
     coordinator_instructions = f"""You are the Aviation Decision Coordinator for a {scenario.replace('_', ' ')} scenario.
 
-You MUST delegate analysis to specialists by calling the handoff tools below.
-DO NOT analyze the problem yourself first — hand off to specialists immediately.
-
-## Handoff Tools (call these in order):
+## Phase 1 — Delegate (ONE round only)
+Call each specialist handoff tool EXACTLY ONCE, in order:
 {handoff_directives}
 
-## Process:
-1. Call each handoff tool above to delegate to that specialist
-2. After ALL specialists have reported back, synthesize their findings
-3. Score recovery options using your scoring tools
-4. Output ranked options with your recommendation
+IMPORTANT: Do NOT call the same specialist twice. Once you have heard back from
+ALL {len(specialists)} specialists, move to Phase 2.
 
-Start by calling the first handoff tool now.
+## Phase 2 — Synthesize
+After all specialists have reported back:
+1. Summarize findings from each specialist
+2. Score 3-5 recovery options using score_recovery_option
+3. Rank them using rank_options
+4. Generate implementation plan using generate_plan
+5. Output your FINAL recommendation and timeline
+
+You are DONE after Phase 2. Do not delegate again.
+
+Start now by calling the first handoff tool.
 """
     coordinator.default_options["instructions"] = coordinator_instructions
     coordinator_ref = coordinator.name or coordinator.id
@@ -179,18 +184,39 @@ Start by calling the first handoff tool now.
     }
     builder = builder.with_autonomous_mode(turn_limits=turn_limits)
 
+    n_specialists = len(specialists)
+
     def should_terminate(conversation):
-        if len(conversation) < 6:
+        n_msgs = len(conversation)
+        if n_msgs < 4:
             return False
-        recent = " ".join(getattr(m, "text", "") or "" for m in conversation[-8:]).lower()
-        has_recommendation = "recommend" in recent
+        recent = " ".join(getattr(m, "text", "") or "" for m in conversation[-12:]).lower()
+        has_recommendation = "recommend" in recent or "final" in recent
         has_timeline = "timeline" in recent or "implementation" in recent
         has_final_tool_signal = (
             "generate_plan" in recent
             or "rank_options" in recent
             or "score_recovery_option" in recent
         )
-        return (has_recommendation and has_timeline) or has_final_tool_signal
+        # Safety: terminate if conversation is long enough that all specialists
+        # should have reported back (prevents infinite cycling)
+        conversation_long_enough = n_msgs > (n_specialists * 6 + 10)
+        should_stop = (
+            (has_recommendation and has_timeline)
+            or has_final_tool_signal
+            or conversation_long_enough
+        )
+        if should_stop or n_msgs % 20 == 0:
+            logger.info(
+                "termination_check",
+                n_msgs=n_msgs,
+                should_stop=should_stop,
+                has_recommendation=has_recommendation,
+                has_timeline=has_timeline,
+                has_final_tool_signal=has_final_tool_signal,
+                conversation_long_enough=conversation_long_enough,
+            )
+        return should_stop
 
     builder = builder.with_termination_condition(should_terminate)
 
@@ -326,7 +352,7 @@ def create_workflow(
         scenario_config = SCENARIO_AGENTS.get(scenario, SCENARIO_AGENTS["hub_disruption"])
         active_ids = active_agent_ids or (scenario_config["agents"] + [scenario_config["coordinator"]])
         mode = orchestration_mode or OrchestrationMode.LLM_DIRECTED
-        if mode == OrchestrationMode.HANDOFF_MESH:
+        if mode == OrchestrationMode.LLM_DIRECTED:
             return create_coordinator_workflow(
                 scenario=scenario,
                 active_agent_ids=active_ids,
@@ -334,7 +360,7 @@ def create_workflow(
                 autonomous_turn_limits=autonomous_turn_limits,
                 name=name or f"handoff_{scenario}",
             )
-        if mode in {OrchestrationMode.DETERMINISTIC, OrchestrationMode.LLM_DIRECTED}:
+        if mode == OrchestrationMode.DETERMINISTIC:
             return create_deterministic_coordinator_workflow(
                 scenario=scenario,
                 active_agent_ids=active_ids,

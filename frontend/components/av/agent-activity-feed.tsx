@@ -74,6 +74,69 @@ function describeEvent(
         details: [payload.success === false ? "failed" : "completed"],
         color: payload.success === false ? "hsl(var(--av-red))" : color,
       };
+    case EventKinds.EXECUTOR_INVOKED:
+      return {
+        title: `${agentName} invoked`,
+        body: objective || event.message,
+        details: ["executor", "invoked"],
+        color,
+      };
+    case EventKinds.EXECUTOR_COMPLETED:
+      return {
+        title: `${agentName} executor complete`,
+        body: event.message,
+        details: [payloadString(payload, "status", "completed")],
+        color,
+      };
+    case EventKinds.AGENT_OBJECTIVE:
+      return {
+        title: `${agentName} objective`,
+        body: objective || event.message,
+        details: [payloadString(payload, "currentStep", "objective")],
+        color,
+      };
+    case EventKinds.AGENT_PROGRESS:
+      return {
+        title: `${agentName} progress`,
+        body: `${Math.round(payloadNumber(payload, "percentComplete", 0))}% complete`,
+        details: [payloadString(payload, "currentStep", "streaming")],
+        color,
+      };
+    case EventKinds.AGENT_COMPLETED:
+    case EventKinds.AGENT_COMPLETED_LEGACY:
+      return {
+        title: `${agentName} completed`,
+        body: payloadString(payload, "summary", event.message),
+        details: [
+          payloadString(payload, "completionReason", "completed"),
+          `${payloadNumber(payload, "durationMs", 0)}ms`,
+        ],
+        color: "hsl(var(--av-green))",
+      };
+    case EventKinds.TOOL_CALLED:
+    case EventKinds.TOOL_CALLED_LEGACY:
+      return {
+        title: `${agentName} tool called`,
+        body: payloadString(payload, "toolName", event.message),
+        details: ["tool.called"],
+        color: "hsl(var(--av-gold))",
+      };
+    case EventKinds.TOOL_COMPLETED:
+    case EventKinds.TOOL_COMPLETED_LEGACY:
+      return {
+        title: `${agentName} tool completed`,
+        body: payloadString(payload, "toolName", event.message),
+        details: [`${payloadNumber(payload, "latencyMs", 0)}ms`],
+        color: "hsl(var(--av-green))",
+      };
+    case EventKinds.TOOL_FAILED:
+    case EventKinds.TOOL_FAILED_LEGACY:
+      return {
+        title: `${agentName} tool failed`,
+        body: payloadString(payload, "error", event.message),
+        details: [payloadString(payload, "toolName", "tool")],
+        color: "hsl(var(--av-red))",
+      };
     case EventKinds.DATA_SOURCE_QUERY_START:
       return {
         title: `${agentName} querying ${sourceType}`,

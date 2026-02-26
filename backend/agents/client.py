@@ -39,12 +39,53 @@ def _auth_mode() -> str:
     return (os.getenv("AZURE_OPENAI_AUTH_MODE", "auto") or "auto").strip().lower()
 
 
-def _build_credential():
-    """Build an Azure credential, preferring tenant-scoped CLI credential when configured."""
+def _resolve_aoai_tenant_id() -> str:
+    """Resolve Azure OpenAI tenant with explicit tenant lock fallback.
+
+    UI/runtime guardrails define EXPECTED_RUNTIME_TENANT_ID for this environment.
+    When AZURE_OPENAI_TENANT_ID is not explicitly set, we fall back to the
+    expected runtime tenant to avoid accidental tenant drift in CI/deployments.
+    """
     aoai_tenant = os.getenv("AZURE_OPENAI_TENANT_ID", "").strip()
     if aoai_tenant:
-        logger.info("azure_credential_initialized", method="AzureCliCredential", tenant_id=aoai_tenant)
-        return AzureCliCredential(tenant_id=aoai_tenant)
+        return aoai_tenant
+
+    fallback_tenant = os.getenv("EXPECTED_RUNTIME_TENANT_ID", "").strip()
+    if fallback_tenant:
+        logger.warning(
+            "azure_openai_tenant_fallback_used",
+            source="EXPECTED_RUNTIME_TENANT_ID",
+            tenant_id=fallback_tenant,
+        )
+        return fallback_tenant
+
+    return ""
+
+
+def _build_credential():
+    """Build an Azure credential, preferring tenant-scoped CLI credential when configured."""
+    aoai_tenant = _resolve_aoai_tenant_id()
+    if aoai_tenant:
+        source = (
+            "AZURE_OPENAI_TENANT_ID"
+            if os.getenv("AZURE_OPENAI_TENANT_ID", "").strip()
+            else "EXPECTED_RUNTIME_TENANT_ID"
+        )
+        try:
+            cli_credential = AzureCliCredential(tenant_id=aoai_tenant)
+            # Probe once so we can detect environments (like container) where the
+            # CLI binary is not available and fall back to DefaultAzureCredential.
+            cli_credential.get_token(COGNITIVE_SCOPE)
+            logger.info("azure_credential_initialized", method="AzureCliCredential", tenant_id=aoai_tenant, tenant_source=source)
+            return cli_credential
+        except Exception as exc:
+            logger.warning(
+                "azure_cli_credential_unavailable",
+                tenant_id=aoai_tenant,
+                tenant_source=source,
+                error=str(exc),
+                fallback="DefaultAzureCredential",
+            )
     try:
         credential = DefaultAzureCredential()
         logger.info("azure_credential_initialized", method="DefaultAzureCredential")
