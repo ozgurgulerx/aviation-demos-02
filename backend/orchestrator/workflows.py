@@ -3,7 +3,7 @@ Workflow definitions using Microsoft Agent Framework patterns.
 Implements sequential and LLM-driven handoff orchestration for aviation domain.
 """
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from agent_framework import (
     ChatAgent,
@@ -71,6 +71,7 @@ def create_sequential_workflow(name: str = "sequential_aviation_solver") -> Work
 def create_coordinator_workflow(
     scenario: str,
     active_agent_ids: List[str],
+    autonomous_turn_limits: Optional[Dict[str, int]] = None,
     name: Optional[str] = None,
 ) -> Workflow:
     """
@@ -128,6 +129,17 @@ DO NOT analyze the problem yourself first — hand off to specialists immediatel
 Start by calling the first handoff tool now.
 """
     coordinator.default_options["instructions"] = coordinator_instructions
+    coordinator_ref = coordinator.name or coordinator.id
+    for specialist in specialists:
+        specialist_base = specialist.default_options.get("instructions") or ""
+        specialist.default_options["instructions"] = (
+            f"{specialist_base}\n\n"
+            "Workflow protocol:\n"
+            "- Run one focused analysis pass using your tools.\n"
+            "- Return concise, evidence-backed findings.\n"
+            f"- Immediately call `handoff_to_{coordinator_ref}` after your findings.\n"
+            "- Do not hand off to any other specialist.\n"
+        )
 
     # Build handoff workflow
     all_participants = [coordinator] + specialists
@@ -136,13 +148,35 @@ Start by calling the first handoff tool now.
         participants=all_participants,
     ).with_start_agent(coordinator)
 
-    builder = builder.with_autonomous_mode()
+    # Explicit routing: coordinator <-> specialists (no specialist-to-specialist mesh).
+    builder = builder.add_handoff(coordinator, specialists)
+    for specialist in specialists:
+        builder = builder.add_handoff(specialist, [coordinator])
+
+    configured_turn_limits = autonomous_turn_limits or {}
+    coordinator_turn_limit = configured_turn_limits.get(coordinator.name or coordinator.id, 8)
+    specialist_turn_limits = {
+        (s.name or s.id): configured_turn_limits.get(s.name or s.id, 2)
+        for s in specialists
+    }
+    turn_limits = {
+        (coordinator.name or coordinator.id): max(1, int(coordinator_turn_limit)),
+        **{k: max(1, int(v)) for k, v in specialist_turn_limits.items()},
+    }
+    builder = builder.with_autonomous_mode(turn_limits=turn_limits)
 
     def should_terminate(conversation):
         if len(conversation) < 6:
             return False
-        recent = " ".join(getattr(m, "text", "") or "" for m in conversation[-5:]).lower()
-        return ("recommend" in recent or "implementation" in recent) and len(conversation) > 12
+        recent = " ".join(getattr(m, "text", "") or "" for m in conversation[-8:]).lower()
+        has_recommendation = "recommend" in recent
+        has_timeline = "timeline" in recent or "implementation" in recent
+        has_final_tool_signal = (
+            "generate_plan" in recent
+            or "rank_options" in recent
+            or "score_recovery_option" in recent
+        )
+        return (has_recommendation and has_timeline) or has_final_tool_signal
 
     builder = builder.with_termination_condition(should_terminate)
 
@@ -163,6 +197,7 @@ def create_workflow(
     workflow_type: str,
     name: Optional[str] = None,
     problem: str = "",
+    autonomous_turn_limits: Optional[Dict[str, int]] = None,
     **kwargs,
 ) -> Workflow:
     """Factory function to create workflows of different types."""
@@ -178,6 +213,7 @@ def create_workflow(
         return create_coordinator_workflow(
             scenario=scenario,
             active_agent_ids=active_ids,
+            autonomous_turn_limits=autonomous_turn_limits,
             name=name or f"handoff_{scenario}",
         )
 

@@ -67,6 +67,8 @@ class OrchestratorEngine:
         event_emitter: Optional[Callable] = None,
         workflow_type: str = WorkflowType.HANDOFF,
         enable_checkpointing: bool = True,
+        max_executor_invocations: Optional[int] = None,
+        autonomous_turn_limits: Optional[Dict[str, int]] = None,
     ):
         self.run_id = run_id
         self.event_emitter = event_emitter
@@ -94,6 +96,12 @@ class OrchestratorEngine:
         self._completed_agent_ids: set[str] = set()
         self._failed_agent_ids: set[str] = set()
         self._activated_agent_ids: set[str] = set()
+        self._agent_execution_counts: Dict[str, int] = {}
+        self._executor_invocations_total: int = 0
+        self._max_executor_invocations_override = max_executor_invocations
+        self._max_executor_invocations_effective: int = 0
+        self._loop_guard_reason: Optional[str] = None
+        self._autonomous_turn_limits = autonomous_turn_limits or {}
 
         if enable_checkpointing:
             self.checkpoint_storage = InMemoryCheckpointStorage()
@@ -165,6 +173,8 @@ class OrchestratorEngine:
             "agentsRunning": len(self._active_agent_ids),
             "agentsDone": len(self._completed_agent_ids),
             "agentsErrored": len(self._failed_agent_ids),
+            "executorInvocations": self._executor_invocations_total,
+            "maxExecutorInvocations": self._max_executor_invocations_effective,
             "currentStep": current_step,
         }
 
@@ -253,6 +263,7 @@ class OrchestratorEngine:
                     workflow_type=self.workflow_type,
                     name=f"{self.workflow_type}_{self.run_id}",
                     problem=problem,
+                    autonomous_turn_limits=self._autonomous_turn_limits,
                 )
                 await self.emit_event("orchestrator.workflow_created", {
                     "workflow_type": self.workflow_type, "scenario": self.scenario,
@@ -262,6 +273,11 @@ class OrchestratorEngine:
             # Phase 4: Execute
             execute_started_at = datetime.now(timezone.utc)
             await self._emit_stage_started("execute_workflow", "Execute Workflow")
+            default_limit = max(20, len(self.selected_agents) * 4)
+            if self._max_executor_invocations_override is not None:
+                self._max_executor_invocations_effective = max(1, int(self._max_executor_invocations_override))
+            else:
+                self._max_executor_invocations_effective = default_limit
             input_message = self._build_workflow_input(problem)
             with traced_span(_tracer, "workflow.execute"):
                 result = await self._execute_workflow_with_events(input_message)
@@ -592,6 +608,8 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         self._failed_agent_ids.clear()
         self._agent_started_at.clear()
         self._agent_progress_pct.clear()
+        self._agent_execution_counts.clear()
+        self._executor_invocations_total = 0
         self._active_query_contexts.clear()
         self._last_executor_id = None
         logger.info("workflow_state_reset", run_id=self.run_id)
@@ -603,6 +621,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             workflow_type=self.workflow_type,
             name=f"{self.workflow_type}_{self.run_id}_retry",
             problem=input_message,
+            autonomous_turn_limits=self._autonomous_turn_limits,
         )
 
     async def _stream_workflow(self, input_message: str) -> Dict[str, Any]:
@@ -658,13 +677,39 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
 
         if isinstance(event, ExecutorInvokedEvent):
             executor_id = event.executor_id or "unknown"
+            self._executor_invocations_total += 1
             profile = self._get_agent_profile(executor_id)
             agent_name = profile.agent_name if profile else executor_id
+            execution_count = self._agent_execution_counts.get(executor_id, 0) + 1
+            self._agent_execution_counts[executor_id] = execution_count
             objective = "Analyze disruption state and produce evidence-backed findings"
             if profile:
                 objective = (
                     f"Analyze {self.scenario.replace('_', ' ')} using {', '.join(profile.data_sources) or 'domain tools'}"
                 )
+
+            if (
+                self._max_executor_invocations_effective > 0
+                and self._executor_invocations_total > self._max_executor_invocations_effective
+            ):
+                reason = (
+                    f"handoff_loop_guard_triggered: executor invocations exceeded "
+                    f"{self._max_executor_invocations_effective}"
+                )
+                self._loop_guard_reason = reason
+                await self.emit_event(
+                    "workflow.failed",
+                    {
+                        **event_data,
+                        "error": reason,
+                        "reason": "handoff_loop_guard_triggered",
+                        "loopGuardTriggered": True,
+                        "executorInvocations": self._executor_invocations_total,
+                        "maxExecutorInvocations": self._max_executor_invocations_effective,
+                        "workflowState": "FAILED",
+                    },
+                )
+                raise RuntimeError(reason)
 
             self._agent_started_at[executor_id] = datetime.now(timezone.utc)
             self._active_agent_ids.add(executor_id)
@@ -678,6 +723,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                     "executor_name": agent_name,
                     "agentId": executor_id,
                     "agentName": agent_name,
+                    "executionCount": execution_count,
                 },
             )
             await self.emit_event(
@@ -689,6 +735,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                     "objective": objective,
                     "currentStep": "starting_analysis",
                     "percentComplete": self._agent_progress_pct[executor_id],
+                    "executionCount": execution_count,
                 },
             )
 
@@ -725,6 +772,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             ended_at = datetime.now(timezone.utc)
             duration_ms = int((ended_at - started_at).total_seconds() * 1000)
             self._agent_progress_pct[executor_id] = 100.0
+            execution_count = self._agent_execution_counts.get(executor_id, 1)
 
             await self.emit_event(
                 "executor.completed",
@@ -735,41 +783,40 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                     "agentId": executor_id,
                     "agentName": agent_name,
                     "status": "completed",
+                    "executionCount": execution_count,
                 },
             )
 
-            # Some framework versions emit ExecutorCompletedEvent without AgentRunEvent.
-            # Emit agent.completed here as a fallback so UI completion state is reliable.
-            if executor_id not in self._completed_agent_ids:
-                self._completed_agent_ids.add(executor_id)
-                await self.emit_event(
-                    "agent.completed",
-                    {
-                        **event_data,
-                        "agentId": executor_id,
-                        "agentName": agent_name,
-                        "agent_name": agent_name,
-                        "message_count": 0,
-                        "summary": f"{agent_name} completed execution.",
-                        "status": "completed",
-                        "completionReason": "executor_completed",
-                        "startedAt": started_at.isoformat(),
-                        "endedAt": ended_at.isoformat(),
-                        "durationMs": duration_ms,
-                    },
-                )
-                if self.trace_emitter:
-                    await self.trace_emitter.emit_span_ended(
-                        agent_id=executor_id,
-                        agent_name=agent_name,
-                        success=True,
-                        result_summary=f"{agent_name} completed execution.",
-                    )
-                await self._emit_query_completions_and_evidence(
+            self._completed_agent_ids.add(executor_id)
+            await self.emit_event(
+                "agent.completed",
+                {
+                    **event_data,
+                    "agentId": executor_id,
+                    "agentName": agent_name,
+                    "agent_name": agent_name,
+                    "message_count": 0,
+                    "summary": f"{agent_name} completed execution.",
+                    "status": "completed",
+                    "completionReason": "executor_completed",
+                    "startedAt": started_at.isoformat(),
+                    "endedAt": ended_at.isoformat(),
+                    "durationMs": duration_ms,
+                    "executionCount": execution_count,
+                },
+            )
+            if self.trace_emitter:
+                await self.trace_emitter.emit_span_ended(
                     agent_id=executor_id,
-                    response_text=f"{agent_name} completed execution.",
-                    message_count=0,
+                    agent_name=agent_name,
+                    success=True,
+                    result_summary=f"{agent_name} completed execution.",
                 )
+            await self._emit_query_completions_and_evidence(
+                agent_id=executor_id,
+                response_text=f"{agent_name} completed execution.",
+                message_count=0,
+            )
 
             await self._emit_progress(f"executor_completed:{executor_id}")
             return
@@ -787,36 +834,37 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             started_at = self._agent_started_at.get(agent_id, datetime.now(timezone.utc))
             ended_at = datetime.now(timezone.utc)
             duration_ms = int((ended_at - started_at).total_seconds() * 1000)
+            execution_count = self._agent_execution_counts.get(agent_id, 1)
 
             self._active_agent_ids.discard(agent_id)
             self._agent_progress_pct[agent_id] = 100.0
 
-            if agent_id not in self._completed_agent_ids:
-                self._completed_agent_ids.add(agent_id)
-                await self.emit_event(
-                    "agent.completed",
-                    {
-                        **event_data,
-                        "agentId": agent_id,
-                        "agentName": agent_name,
-                        "agent_name": agent_name,
-                        "message_count": message_count,
-                        "summary": response_text[:240],
-                        "status": "completed",
-                        "completionReason": "analysis_complete",
-                        "startedAt": started_at.isoformat(),
-                        "endedAt": ended_at.isoformat(),
-                        "durationMs": duration_ms,
-                    },
-                )
+            self._completed_agent_ids.add(agent_id)
+            await self.emit_event(
+                "agent.completed",
+                {
+                    **event_data,
+                    "agentId": agent_id,
+                    "agentName": agent_name,
+                    "agent_name": agent_name,
+                    "message_count": message_count,
+                    "summary": response_text[:240],
+                    "status": "completed",
+                    "completionReason": "analysis_complete",
+                    "startedAt": started_at.isoformat(),
+                    "endedAt": ended_at.isoformat(),
+                    "durationMs": duration_ms,
+                    "executionCount": execution_count,
+                },
+            )
 
-                if self.trace_emitter:
-                    await self.trace_emitter.emit_span_ended(
-                        agent_id=agent_id,
-                        agent_name=agent_name,
-                        success=True,
-                        result_summary=response_text[:220] or "Analysis complete",
-                    )
+            if self.trace_emitter:
+                await self.trace_emitter.emit_span_ended(
+                    agent_id=agent_id,
+                    agent_name=agent_name,
+                    success=True,
+                    result_summary=response_text[:220] or "Analysis complete",
+                )
 
             await self._emit_query_completions_and_evidence(
                 agent_id=agent_id,
@@ -843,6 +891,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                     "agentName": agent_name,
                     "percentComplete": next_progress,
                     "currentStep": "streaming_analysis",
+                    "executionCount": self._agent_execution_counts.get(executor_id, 0),
                 },
             )
             await self.emit_event(
@@ -853,15 +902,9 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                     "agentName": agent_name,
                     "percentComplete": next_progress,
                     "currentStep": "streaming_analysis",
+                    "executionCount": self._agent_execution_counts.get(executor_id, 0),
                 },
             )
-            if self.trace_emitter:
-                await self.trace_emitter.emit_agent_progress(
-                    agent_id=executor_id,
-                    agent_name=agent_name,
-                    percent_complete=next_progress,
-                    current_step="streaming_analysis",
-                )
             await self._emit_progress(f"agent_streaming:{executor_id}")
             return
 
@@ -901,4 +944,5 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
 
         if isinstance(event, WorkflowStatusEvent):
             event_data["status"] = "status_update"
+            event_data["workflowState"] = getattr(event.state, "value", str(event.state))
             await self.emit_event("workflow.status", event_data)
