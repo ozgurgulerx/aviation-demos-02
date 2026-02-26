@@ -10,7 +10,7 @@ import pytest
 from agent_framework import ExecutorCompletedEvent, ExecutorInvokedEvent, WorkflowRunState, WorkflowStatusEvent
 
 from orchestrator.agent_registry import AgentSelectionResult, SCENARIO_AGENTS
-from orchestrator.engine import OrchestratorEngine
+from orchestrator.engine import OrchestratorEngine, _LoopCappedSignal
 from orchestrator.trace_emitter import TraceEmitter
 from orchestrator.workflows import (
     OrchestrationMode,
@@ -21,12 +21,12 @@ from orchestrator.workflows import (
 )
 
 
-def _agent(agent_id: str, name: str) -> AgentSelectionResult:
+def _agent(agent_id: str, name: str, category: str = "specialist") -> AgentSelectionResult:
     return AgentSelectionResult(
         agent_id=agent_id,
         agent_name=name,
         short_name=name,
-        category="specialist",
+        category=category,
         included=True,
         reason="test",
         conditions_evaluated=["test"],
@@ -61,7 +61,8 @@ async def test_executor_completed_emits_agent_completed_on_repeated_runs():
 
 
 @pytest.mark.asyncio
-async def test_loop_guard_emits_workflow_failed_and_raises():
+async def test_loop_guard_raises_runtime_error_in_sequential_mode():
+    """In sequential mode, loop guard raises RuntimeError (not _LoopCappedSignal)."""
     captured: list[tuple[str, dict]] = []
 
     async def emit(event_type: str, payload: dict):
@@ -71,6 +72,7 @@ async def test_loop_guard_emits_workflow_failed_and_raises():
         run_id="test-loop-guard",
         event_emitter=emit,
         enable_checkpointing=False,
+        workflow_type=WorkflowType.SEQUENTIAL,
         max_executor_invocations=1,
     )
     profile = _agent("agent_guard", "Agent Guard")
@@ -90,6 +92,36 @@ async def test_loop_guard_emits_workflow_failed_and_raises():
 
 
 @pytest.mark.asyncio
+async def test_loop_guard_raises_loop_capped_signal_in_llm_directed_mode():
+    """In LLM-directed mode with all specialists heard, raises _LoopCappedSignal."""
+    captured: list[tuple[str, dict]] = []
+
+    async def emit(event_type: str, payload: dict):
+        captured.append((event_type, payload))
+
+    engine = OrchestratorEngine(
+        run_id="test-loop-cap",
+        event_emitter=emit,
+        enable_checkpointing=False,
+        workflow_type=WorkflowType.HANDOFF,
+        orchestration_mode=OrchestrationMode.LLM_DIRECTED,
+        max_executor_invocations=1,
+    )
+    profile = _agent("specialist_a", "Specialist A", category="specialist")
+    engine.selected_agents = [profile]
+    engine._agent_lookup = {profile.agent_id: profile}
+    engine._max_executor_invocations_effective = 1
+
+    await engine._process_workflow_event(ExecutorInvokedEvent("specialist_a"))
+
+    with pytest.raises(_LoopCappedSignal):
+        await engine._process_workflow_event(ExecutorInvokedEvent("specialist_a"))
+
+    status_events = [p for t, p in captured if t == "workflow.status" and p.get("status") == "loop_capped"]
+    assert status_events, "workflow.status with loop_capped should be emitted"
+
+
+@pytest.mark.asyncio
 async def test_workflow_status_event_includes_workflow_state():
     captured: list[tuple[str, dict]] = []
 
@@ -105,6 +137,15 @@ async def test_workflow_status_event_includes_workflow_state():
     assert status_events[0]["workflowState"] == "IDLE"
 
 
+@pytest.fixture
+def _set_aoai_endpoint(monkeypatch):
+    """Set a dummy AZURE_OPENAI_ENDPOINT so agent factories don't fail."""
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://dummy.openai.azure.com/")
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "dummy-key-for-testing")
+    monkeypatch.setenv("AZURE_OPENAI_AUTH_MODE", "api-key")
+
+
+@pytest.mark.usefixtures("_set_aoai_endpoint")
 def test_coordinator_workflow_constrains_handoff_targets_and_turn_limits():
     workflow = create_coordinator_workflow(
         scenario="hub_disruption",
@@ -139,6 +180,7 @@ def test_coordinator_workflow_constrains_handoff_targets_and_turn_limits():
         assert getattr(specialist_executor, "_autonomous_mode_turn_limit") == 2
 
 
+@pytest.mark.usefixtures("_set_aoai_endpoint")
 def test_deterministic_workflow_orders_specialists_then_coordinator():
     scenario = "diversion"
     scenario_config = SCENARIO_AGENTS[scenario]
@@ -159,15 +201,10 @@ def test_deterministic_workflow_orders_specialists_then_coordinator():
         assert getattr(executor, "_handoff_targets", set()) in (set(), None)
 
 
+@pytest.mark.usefixtures("_set_aoai_endpoint")
 def test_workflow_factory_routes_handoff_modes():
     problem = "Need a diversion plan to an alternate airport due to severe weather."
-    scenario = "diversion"
-    coordinator_id = SCENARIO_AGENTS[scenario]["coordinator"]
 
-    default_workflow = create_workflow(
-        workflow_type=WorkflowType.HANDOFF,
-        problem=problem,
-    )
     llm_directed_workflow = create_workflow(
         workflow_type=WorkflowType.HANDOFF,
         problem=problem,
@@ -178,16 +215,14 @@ def test_workflow_factory_routes_handoff_modes():
         problem=problem,
         orchestration_mode=OrchestrationMode.DETERMINISTIC,
     )
-    mesh_workflow = create_workflow(
-        workflow_type=WorkflowType.HANDOFF,
-        problem=problem,
-        orchestration_mode=OrchestrationMode.HANDOFF_MESH,
-    )
 
-    assert getattr(default_workflow.executors[coordinator_id], "_handoff_targets", set()) in (set(), None)
-    assert getattr(llm_directed_workflow.executors[coordinator_id], "_handoff_targets", set()) in (set(), None)
+    # LLM-directed uses HandoffBuilder — coordinator has handoff targets
+    scenario_config = SCENARIO_AGENTS["diversion"]
+    coordinator_id = scenario_config["coordinator"]
+    assert len(getattr(llm_directed_workflow.executors[coordinator_id], "_handoff_targets")) >= 1
+
+    # Deterministic uses SequentialBuilder — no handoff targets
     assert getattr(deterministic_workflow.executors[coordinator_id], "_handoff_targets", set()) in (set(), None)
-    assert len(getattr(mesh_workflow.executors[coordinator_id], "_handoff_targets")) >= 1
 
 
 @pytest.mark.asyncio

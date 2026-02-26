@@ -13,32 +13,34 @@ from orchestrator.agent_registry import (
 
 
 class TestAgentRegistry:
-    def test_registry_has_three_agents(self):
-        assert len(AGENT_REGISTRY) == 3
+    def test_registry_has_twenty_agents(self):
+        assert len(AGENT_REGISTRY) == 20
 
     def test_get_agent_registry_returns_copy(self):
         registry = get_agent_registry()
-        assert len(registry) == 3
+        assert len(registry) == 20
 
-    def test_agent_ids(self):
+    def test_agent_ids_include_key_agents(self):
         ids = [a.id for a in AGENT_REGISTRY]
-        assert "flight_analyst" in ids
-        assert "operations_advisor" in ids
-        assert "safety_inspector" in ids
+        assert "situation_assessment" in ids
+        assert "fleet_recovery" in ids
+        assert "recovery_coordinator" in ids
+        assert "decision_coordinator" in ids
 
     def test_agent_categories(self):
-        for agent in AGENT_REGISTRY:
-            assert agent.category == "core"
+        categories = {a.category for a in AGENT_REGISTRY}
+        assert "specialist" in categories
+        assert "coordinator" in categories
 
     def test_agent_priorities_ordered(self):
         priorities = [a.priority for a in AGENT_REGISTRY]
         assert priorities == sorted(priorities)
 
     def test_get_agent_by_id_found(self):
-        agent = get_agent_by_id("flight_analyst")
+        agent = get_agent_by_id("situation_assessment")
         assert agent is not None
-        assert agent.name == "Flight Analyst Agent"
-        assert agent.short_name == "Flight"
+        assert agent.name == "Situation Assessment"
+        assert agent.short_name == "Situation"
 
     def test_get_agent_by_id_not_found(self):
         agent = get_agent_by_id("nonexistent")
@@ -46,10 +48,10 @@ class TestAgentRegistry:
 
 
 class TestAgentSelection:
-    def test_select_all_agents_for_generic_problem(self):
+    def test_select_agents_for_generic_problem(self):
         included, excluded = select_agents_for_problem("Flight delayed due to weather")
-        assert len(included) == 3
-        assert len(excluded) == 0
+        assert len(included) >= 3
+        assert len(included) + len(excluded) == 20
 
     def test_included_agents_sorted_by_priority(self):
         included, _ = select_agents_for_problem("Test problem")
@@ -62,14 +64,14 @@ class TestAgentSelection:
             assert result.agent_id
             assert result.agent_name
             assert result.short_name
-            assert result.category == "core"
+            assert result.category in {"specialist", "coordinator"}
             assert result.included is True
             assert result.reason
             assert len(result.conditions_evaluated) > 0
 
     def test_empty_problem_still_selects(self):
         included, excluded = select_agents_for_problem("")
-        assert len(included) == 3
+        assert len(included) >= 3
 
 
 class TestAgentDefinition:
@@ -78,7 +80,7 @@ class TestAgentDefinition:
             id="test_agent",
             name="Test Agent",
             short_name="Test",
-            category="conditional",
+            category="specialist",
             description="A test agent",
             default_include=False,
             priority=99,
