@@ -10,7 +10,6 @@ from agent_framework import (
     Workflow,
     SequentialBuilder,
     HandoffBuilder,
-    ChatMessage,
 )
 import structlog
 
@@ -26,6 +25,12 @@ logger = structlog.get_logger()
 class WorkflowType:
     SEQUENTIAL = "sequential"
     HANDOFF = "handoff"
+
+
+class OrchestrationMode:
+    LLM_DIRECTED = "llm_directed"
+    DETERMINISTIC = "deterministic"
+    HANDOFF_MESH = "handoff_mesh"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -71,6 +76,7 @@ def create_sequential_workflow(name: str = "sequential_aviation_solver") -> Work
 def create_coordinator_workflow(
     scenario: str,
     active_agent_ids: List[str],
+    coordinator_id: Optional[str] = None,
     autonomous_turn_limits: Optional[Dict[str, int]] = None,
     name: Optional[str] = None,
 ) -> Workflow:
@@ -84,10 +90,18 @@ def create_coordinator_workflow(
 
     # Determine coordinator ID
     scenario_config = SCENARIO_AGENTS.get(scenario, SCENARIO_AGENTS["hub_disruption"])
-    coordinator_id = scenario_config["coordinator"]
+    resolved_coordinator_id = coordinator_id
+    if not resolved_coordinator_id:
+        for agent_id in active_agent_ids:
+            agent_def = get_agent_by_id(agent_id)
+            if agent_def and agent_def.category == "coordinator":
+                resolved_coordinator_id = agent_id
+                break
+    if not resolved_coordinator_id:
+        resolved_coordinator_id = scenario_config["coordinator"]
 
     # Build coordinator agent with orchestrator-tier model
-    coordinator = _create_agent_by_id(coordinator_id)
+    coordinator = _create_agent_by_id(resolved_coordinator_id)
     if not coordinator:
         # Fallback
         from agents import create_flight_analyst
@@ -96,7 +110,7 @@ def create_coordinator_workflow(
     # Build specialist agents
     specialists: List[ChatAgent] = []
     for agent_id in active_agent_ids:
-        if agent_id == coordinator_id:
+        if agent_id == resolved_coordinator_id:
             continue
         agent = _create_agent_by_id(agent_id)
         if agent:
@@ -184,7 +198,105 @@ Start by calling the first handoff tool now.
 
     logger.info(
         "coordinator_workflow_created", name=workflow_name,
-        coordinator=coordinator_id, specialist_count=len(specialists),
+        coordinator=resolved_coordinator_id, specialist_count=len(specialists),
+    )
+    return workflow
+
+
+def create_deterministic_coordinator_workflow(
+    scenario: str,
+    active_agent_ids: List[str],
+    coordinator_id: Optional[str] = None,
+    name: Optional[str] = None,
+) -> Workflow:
+    """
+    Create a deterministic coordinator workflow.
+    Specialists execute once in scenario order, then coordinator synthesizes final output.
+    """
+    workflow_name = name or f"{scenario}_deterministic_workflow"
+    logger.info(
+        "creating_deterministic_coordinator_workflow",
+        name=workflow_name,
+        scenario=scenario,
+        agents=active_agent_ids,
+    )
+
+    scenario_config = SCENARIO_AGENTS.get(scenario, SCENARIO_AGENTS["hub_disruption"])
+    resolved_coordinator_id = coordinator_id
+    if not resolved_coordinator_id:
+        for agent_id in active_agent_ids:
+            agent_def = get_agent_by_id(agent_id)
+            if agent_def and agent_def.category == "coordinator":
+                resolved_coordinator_id = agent_id
+                break
+    if not resolved_coordinator_id:
+        resolved_coordinator_id = scenario_config["coordinator"]
+    active_id_set = set(active_agent_ids)
+
+    coordinator = _create_agent_by_id(resolved_coordinator_id)
+    if not coordinator:
+        from agents import create_flight_analyst
+        coordinator = create_flight_analyst(name="coordinator_fallback")
+
+    specialists: List[ChatAgent] = []
+    for agent_id in active_agent_ids:
+        if agent_id == resolved_coordinator_id or agent_id not in active_id_set:
+            continue
+        agent = _create_agent_by_id(agent_id)
+        if agent:
+            specialists.append(agent)
+
+    if not specialists:
+        logger.warning("no_specialists_created_deterministic", scenario=scenario)
+        participants = [coordinator]
+        workflow = SequentialBuilder().participants(participants).build()
+        logger.info(
+            "deterministic_coordinator_workflow_created",
+            name=workflow_name,
+            coordinator=resolved_coordinator_id,
+            specialist_count=0,
+        )
+        return workflow
+
+    coordinator.default_options["instructions"] = f"""You are the Aviation Decision Coordinator for a {scenario.replace('_', ' ')} scenario.
+
+You are running in bounded orchestration mode. Specialists have already executed.
+Your job is to synthesize their findings into a final decision using your scoring and planning tools.
+
+Requirements:
+1) Score recovery/decision options with explicit criteria.
+2) Provide ranked options and select one recommendation.
+3) Provide an implementation timeline.
+4) End with a JSON block that follows this schema exactly:
+{{
+  "criteria": ["delay_reduction", "crew_margin", "safety_score", "cost_impact", "passenger_impact"],
+  "options": [
+    {{
+      "optionId": "opt-1",
+      "description": "short description",
+      "rank": 1,
+      "scores": {{
+        "delay_reduction": 0,
+        "crew_margin": 0,
+        "safety_score": 0,
+        "cost_impact": 0,
+        "passenger_impact": 0
+      }}
+    }}
+  ],
+  "selectedOptionId": "opt-1",
+  "summary": "brief recommendation summary",
+  "timeline": [{{"time": "T+0", "action": "action text", "agent": "agent_id"}}]
+}}
+"""
+
+    participants = [*specialists, coordinator]
+    workflow = SequentialBuilder().participants(participants).build()
+    logger.info(
+        "deterministic_coordinator_workflow_created",
+        name=workflow_name,
+        coordinator=resolved_coordinator_id,
+        specialist_count=len(specialists),
     )
     return workflow
 
@@ -197,7 +309,10 @@ def create_workflow(
     workflow_type: str,
     name: Optional[str] = None,
     problem: str = "",
+    active_agent_ids: Optional[List[str]] = None,
+    coordinator_id: Optional[str] = None,
     autonomous_turn_limits: Optional[Dict[str, int]] = None,
+    orchestration_mode: Optional[str] = None,
     **kwargs,
 ) -> Workflow:
     """Factory function to create workflows of different types."""
@@ -209,13 +324,24 @@ def create_workflow(
     elif workflow_type == WorkflowType.HANDOFF:
         scenario = detect_scenario(problem)
         scenario_config = SCENARIO_AGENTS.get(scenario, SCENARIO_AGENTS["hub_disruption"])
-        active_ids = scenario_config["agents"] + [scenario_config["coordinator"]]
-        return create_coordinator_workflow(
-            scenario=scenario,
-            active_agent_ids=active_ids,
-            autonomous_turn_limits=autonomous_turn_limits,
-            name=name or f"handoff_{scenario}",
-        )
+        active_ids = active_agent_ids or (scenario_config["agents"] + [scenario_config["coordinator"]])
+        mode = orchestration_mode or OrchestrationMode.LLM_DIRECTED
+        if mode == OrchestrationMode.HANDOFF_MESH:
+            return create_coordinator_workflow(
+                scenario=scenario,
+                active_agent_ids=active_ids,
+                coordinator_id=coordinator_id,
+                autonomous_turn_limits=autonomous_turn_limits,
+                name=name or f"handoff_{scenario}",
+            )
+        if mode in {OrchestrationMode.DETERMINISTIC, OrchestrationMode.LLM_DIRECTED}:
+            return create_deterministic_coordinator_workflow(
+                scenario=scenario,
+                active_agent_ids=active_ids,
+                coordinator_id=coordinator_id,
+                name=name or f"handoff_{scenario}",
+            )
+        raise ValueError(f"Unknown orchestration mode: {mode}")
 
     else:
         raise ValueError(f"Unknown workflow type: {workflow_type}")

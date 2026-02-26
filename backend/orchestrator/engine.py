@@ -8,6 +8,9 @@ Supports:
 """
 
 import asyncio
+import json
+import os
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
@@ -31,19 +34,30 @@ from agent_framework import (
 from pydantic import BaseModel, Field
 import structlog
 
-from orchestrator.workflows import WorkflowType, create_workflow
+from orchestrator.workflows import OrchestrationMode, WorkflowType, create_workflow
 from orchestrator.middleware import EvidenceCollector
 from orchestrator.agent_registry import (
+    SCENARIO_AGENTS,
+    get_agent_by_id,
     select_agents_for_problem,
     detect_scenario,
     AgentSelectionResult,
 )
 from orchestrator.trace_emitter import TraceEmitter
 from telemetry import get_tracer, traced_span
+from data_sources.azure_client import get_shared_async_client
+from data_sources.shared_utils import OPENAI_API_VERSION, supports_explicit_temperature
 
 logger = structlog.get_logger()
 
 _tracer = get_tracer("orchestrator")
+DEFAULT_RECOVERY_CRITERIA = [
+    "delay_reduction",
+    "crew_margin",
+    "safety_score",
+    "cost_impact",
+    "passenger_impact",
+]
 
 
 class OrchestratorDecision(BaseModel):
@@ -66,6 +80,7 @@ class OrchestratorEngine:
         run_id: str,
         event_emitter: Optional[Callable] = None,
         workflow_type: str = WorkflowType.HANDOFF,
+        orchestration_mode: Optional[str] = None,
         enable_checkpointing: bool = True,
         max_executor_invocations: Optional[int] = None,
         autonomous_turn_limits: Optional[Dict[str, int]] = None,
@@ -73,6 +88,10 @@ class OrchestratorEngine:
         self.run_id = run_id
         self.event_emitter = event_emitter
         self.workflow_type = workflow_type
+        self.orchestration_mode = self._resolve_orchestration_mode(
+            workflow_type=workflow_type,
+            orchestration_mode=orchestration_mode,
+        )
         self.enable_checkpointing = enable_checkpointing
         self.evidence_collector = EvidenceCollector()
         self.workflow: Optional[Workflow] = None
@@ -102,13 +121,47 @@ class OrchestratorEngine:
         self._max_executor_invocations_effective: int = 0
         self._loop_guard_reason: Optional[str] = None
         self._autonomous_turn_limits = autonomous_turn_limits or {}
+        self._deterministic_execution_timeout_seconds = 60
+        self._coordinator_agent_id: Optional[str] = None
+        self._coordinator_artifacts_emitted = False
 
         if enable_checkpointing:
             self.checkpoint_storage = InMemoryCheckpointStorage()
         else:
             self.checkpoint_storage = None
 
-        logger.info("orchestrator_initialized", run_id=run_id, workflow_type=workflow_type)
+        logger.info(
+            "orchestrator_initialized",
+            run_id=run_id,
+            workflow_type=workflow_type,
+            orchestration_mode=self.orchestration_mode,
+        )
+
+    @staticmethod
+    def _resolve_orchestration_mode(workflow_type: str, orchestration_mode: Optional[str]) -> Optional[str]:
+        if workflow_type != WorkflowType.HANDOFF:
+            return orchestration_mode
+        if orchestration_mode:
+            return orchestration_mode
+        return OrchestrationMode.LLM_DIRECTED
+
+    def _is_deterministic_mode(self) -> bool:
+        return (
+            self.workflow_type == WorkflowType.HANDOFF
+            and self.orchestration_mode == OrchestrationMode.DETERMINISTIC
+        )
+
+    def _is_llm_directed_mode(self) -> bool:
+        return (
+            self.workflow_type == WorkflowType.HANDOFF
+            and self.orchestration_mode == OrchestrationMode.LLM_DIRECTED
+        )
+
+    def _is_bounded_orchestration_mode(self) -> bool:
+        return (
+            self.workflow_type == WorkflowType.HANDOFF
+            and self.orchestration_mode in {OrchestrationMode.DETERMINISTIC, OrchestrationMode.LLM_DIRECTED}
+        )
 
     async def emit_event(self, event_type: str, payload: Dict[str, Any]):
         if self.event_emitter:
@@ -236,7 +289,9 @@ class OrchestratorEngine:
         self.trace_emitter = TraceEmitter(run_id=self.run_id, event_callback=self.event_emitter)
 
         await self.emit_event("orchestrator.run_started", {
-            "workflow_type": self.workflow_type, "problem_summary": problem[:200],
+            "workflow_type": self.workflow_type,
+            "orchestration_mode": self.orchestration_mode,
+            "problem_summary": problem[:200],
         })
         await self._emit_progress("run_started")
 
@@ -263,17 +318,25 @@ class OrchestratorEngine:
                     workflow_type=self.workflow_type,
                     name=f"{self.workflow_type}_{self.run_id}",
                     problem=problem,
+                    active_agent_ids=[a.agent_id for a in self.selected_agents],
+                    coordinator_id=self._coordinator_agent_id,
                     autonomous_turn_limits=self._autonomous_turn_limits,
+                    orchestration_mode=self.orchestration_mode,
                 )
                 await self.emit_event("orchestrator.workflow_created", {
-                    "workflow_type": self.workflow_type, "scenario": self.scenario,
+                    "workflow_type": self.workflow_type,
+                    "orchestration_mode": self.orchestration_mode,
+                    "scenario": self.scenario,
                 })
             await self._emit_stage_completed("create_workflow", "Create Workflow", workflow_create_started_at)
 
             # Phase 4: Execute
             execute_started_at = datetime.now(timezone.utc)
             await self._emit_stage_started("execute_workflow", "Execute Workflow")
-            default_limit = max(20, len(self.selected_agents) * 4)
+            if self._is_bounded_orchestration_mode():
+                default_limit = max(10, len(self.selected_agents) + 3)
+            else:
+                default_limit = max(20, len(self.selected_agents) * 4)
             if self._max_executor_invocations_override is not None:
                 self._max_executor_invocations_effective = max(1, int(self._max_executor_invocations_override))
             else:
@@ -294,7 +357,9 @@ class OrchestratorEngine:
 
             await self.emit_event("orchestrator.run_completed", {
                 "result": result, "decision_count": len(self.decisions),
-                "evidence_count": len(self.evidence), "scenario": self.scenario,
+                "evidence_count": len(self.evidence),
+                "scenario": self.scenario,
+                "orchestration_mode": self.orchestration_mode,
             })
             await self._emit_progress("run_completed")
 
@@ -307,13 +372,28 @@ class OrchestratorEngine:
                 confidence=1.0, action={"error": str(e)},
             )
             await self.emit_event("orchestrator.run_failed", {
-                "error": str(e), "decision_count": len(self.decisions),
+                "error": str(e),
+                "decision_count": len(self.decisions),
+                "orchestration_mode": self.orchestration_mode,
             })
             logger.error("orchestrator_run_failed", run_id=self.run_id, error=str(e))
             raise
 
     async def _select_agents(self, problem: str):
         self.selected_agents, self.excluded_agents = select_agents_for_problem(problem)
+        scenario_config = SCENARIO_AGENTS.get(self.scenario, SCENARIO_AGENTS["hub_disruption"])
+        self._coordinator_agent_id = scenario_config.get("coordinator")
+
+        if self._is_llm_directed_mode():
+            await self._apply_llm_directed_selection(problem)
+
+        selected_coordinator = next(
+            (agent.agent_id for agent in self.selected_agents if agent.category == "coordinator"),
+            None,
+        )
+        if selected_coordinator:
+            self._coordinator_agent_id = selected_coordinator
+
         self._agent_lookup = {
             a.agent_id: a for a in [*self.selected_agents, *self.excluded_agents]
         }
@@ -335,6 +415,170 @@ class OrchestratorEngine:
                 decision_type="include_agent", reasoning=agent.reason,
                 action={"agent_id": agent.agent_id, "agent_name": agent.agent_name},
             )
+
+    async def _apply_llm_directed_selection(self, problem: str):
+        scenario_config = SCENARIO_AGENTS.get(self.scenario, SCENARIO_AGENTS["hub_disruption"])
+        default_coordinator_id = scenario_config.get("coordinator")
+        selected_baseline = {agent.agent_id for agent in self.selected_agents}
+        all_profiles = [*self.selected_agents, *self.excluded_agents]
+        profile_map = {profile.agent_id: profile for profile in all_profiles}
+        selectable_profiles = [profile for profile in all_profiles if profile.category != "placeholder"]
+
+        llm_plan = await self._llm_plan_agent_selection(
+            problem=problem,
+            selectable_profiles=selectable_profiles,
+            default_coordinator_id=default_coordinator_id,
+        )
+        if not llm_plan:
+            return
+
+        selected_ids_raw = llm_plan.get("selectedAgentIds", [])
+        execution_order_raw = llm_plan.get("executionOrder", [])
+        excluded_ids_raw = llm_plan.get("excludedAgentIds", [])
+        agent_reasons = llm_plan.get("agentReasons", {})
+        reasoning = str(llm_plan.get("reasoning") or "LLM-directed orchestration selected agent set.")
+        confidence = llm_plan.get("confidence", 0.8)
+        try:
+            confidence_value = max(0.0, min(float(confidence), 1.0))
+        except (TypeError, ValueError):
+            confidence_value = 0.8
+
+        selectable_ids = {profile.agent_id for profile in selectable_profiles}
+        selected_ids = [
+            agent_id for agent_id in selected_ids_raw
+            if isinstance(agent_id, str) and agent_id in selectable_ids
+        ]
+        execution_order = [
+            agent_id for agent_id in execution_order_raw
+            if isinstance(agent_id, str) and agent_id in selectable_ids
+        ]
+        excluded_ids = {
+            agent_id for agent_id in excluded_ids_raw
+            if isinstance(agent_id, str) and agent_id in selectable_ids
+        }
+
+        if not selected_ids:
+            selected_ids = [agent.agent_id for agent in self.selected_agents if agent.agent_id in selectable_ids]
+        if not selected_ids:
+            selected_ids = list(selectable_ids)
+
+        coordinator_id = str(llm_plan.get("coordinatorAgentId") or "").strip()
+        coordinator_def = get_agent_by_id(coordinator_id) if coordinator_id else None
+        if not coordinator_def or coordinator_def.category != "coordinator":
+            coordinator_id = default_coordinator_id or ""
+        if coordinator_id and coordinator_id not in selected_ids and coordinator_id in selectable_ids:
+            selected_ids.append(coordinator_id)
+
+        ordered_selected_ids: List[str] = []
+        for agent_id in execution_order:
+            if agent_id in selected_ids and agent_id not in ordered_selected_ids:
+                ordered_selected_ids.append(agent_id)
+        for agent_id in selected_ids:
+            if agent_id not in ordered_selected_ids:
+                ordered_selected_ids.append(agent_id)
+
+        if coordinator_id and coordinator_id in ordered_selected_ids:
+            ordered_selected_ids = [
+                *[agent_id for agent_id in ordered_selected_ids if agent_id != coordinator_id],
+                coordinator_id,
+            ]
+
+        selected_profiles: List[AgentSelectionResult] = []
+        excluded_profiles: List[AgentSelectionResult] = []
+        ordered_set = set(ordered_selected_ids)
+
+        for agent_id in ordered_selected_ids:
+            profile = profile_map.get(agent_id)
+            if not profile:
+                continue
+            reason_suffix = str(agent_reasons.get(agent_id) or "").strip()
+            reason = f"LLM-selected for this query. {reason_suffix}".strip()
+            selected_profiles.append(profile.model_copy(update={"included": True, "reason": reason}))
+
+        for profile in all_profiles:
+            if profile.agent_id in ordered_set:
+                continue
+            was_selected = profile.agent_id in selected_baseline
+            llm_excluded = profile.agent_id in excluded_ids
+            reason_prefix = "LLM-excluded for this query." if llm_excluded or was_selected else profile.reason
+            excluded_profiles.append(profile.model_copy(update={"included": False, "reason": reason_prefix}))
+
+        if selected_profiles:
+            self.selected_agents = selected_profiles
+            self.excluded_agents = excluded_profiles
+            self._coordinator_agent_id = coordinator_id or self._coordinator_agent_id
+            if self.trace_emitter:
+                await self.trace_emitter.emit_decision(
+                    decision_type="llm_agent_selection",
+                    reason=reasoning,
+                    confidence=confidence_value,
+                    inputs_considered=[
+                        f"scenario:{self.scenario}",
+                        f"selected:{','.join(agent.agent_id for agent in selected_profiles)}",
+                    ],
+                )
+
+    async def _llm_plan_agent_selection(
+        self,
+        problem: str,
+        selectable_profiles: List[AgentSelectionResult],
+        default_coordinator_id: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        if not selectable_profiles:
+            return None
+
+        model = os.getenv("AZURE_OPENAI_ORCHESTRATOR_DEPLOYMENT", "gpt-5-mini")
+        candidate_payload = [
+            {
+                "agentId": profile.agent_id,
+                "agentName": profile.agent_name,
+                "category": profile.category,
+                "priority": profile.priority,
+                "dataSources": profile.data_sources,
+                "defaultIncluded": profile.included,
+                "defaultReason": profile.reason,
+            }
+            for profile in selectable_profiles
+        ]
+        system_prompt = (
+            "You are an orchestration planner. Choose the best subset of agents and execution order for the query. "
+            "Return strict JSON only with keys: selectedAgentIds, excludedAgentIds, executionOrder, "
+            "coordinatorAgentId, confidence, reasoning, agentReasons. "
+            "Rules: include exactly one coordinator agent and put coordinator last in executionOrder."
+        )
+        user_payload = {
+            "problem": problem,
+            "scenario": self.scenario,
+            "defaultCoordinatorId": default_coordinator_id,
+            "candidateAgents": candidate_payload,
+        }
+        request_kwargs: Dict[str, Any] = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=True)},
+            ],
+        }
+        if supports_explicit_temperature(model):
+            request_kwargs["temperature"] = 0
+
+        try:
+            client, _ = await get_shared_async_client(api_version=OPENAI_API_VERSION)
+            response = await client.chat.completions.create(**request_kwargs)
+            raw_content = response.choices[0].message.content or ""
+            parsed = self._extract_json_object_from_text(raw_content)
+            if not isinstance(parsed, dict):
+                logger.warning("llm_orchestration_plan_parse_failed", run_id=self.run_id, scenario=self.scenario)
+                return None
+            return parsed
+        except Exception as exc:
+            logger.warning(
+                "llm_orchestration_plan_failed",
+                run_id=self.run_id,
+                scenario=self.scenario,
+                error=str(exc),
+            )
+            return None
 
     async def _emit_agent_activations(self):
         """Emit agent.activated and agent.excluded events for the canvas UI."""
@@ -424,6 +668,223 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             chunks.append(str(msg))
         merged = " ".join(chunks).strip()
         return merged[:1200]
+
+    @staticmethod
+    def _normalize_score(value: Any) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        return round(max(0.0, min(parsed, 100.0)), 2)
+
+    def _extract_json_object_from_text(self, text: str) -> Optional[Dict[str, Any]]:
+        fenced_blocks = re.findall(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+        for block in fenced_blocks:
+            try:
+                parsed = json.loads(block.strip())
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+
+        decoder = json.JSONDecoder()
+        for idx, char in enumerate(text):
+            if char != "{":
+                continue
+            try:
+                parsed, _ = decoder.raw_decode(text[idx:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+        return None
+
+    def _parse_heuristic_artifacts(self, text: str) -> Dict[str, Any]:
+        options: List[Dict[str, Any]] = []
+        timeline: List[Dict[str, Any]] = []
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        recommendation_match = re.search(r"(?im)^(?:recommend(?:ation)?|selected option)\s*[:\-]\s*(.+)$", text)
+        selected_option_id = ""
+
+        for line in lines:
+            option_match = re.match(r"(?i)^option\s*(\d+)\s*[:\-)\.]\s*(.+)$", line)
+            ranked_match = re.match(r"^(\d+)[\).:\-]\s*(.+)$", line)
+            matched = option_match or ranked_match
+            if matched:
+                rank = int(matched.group(1))
+                description = matched.group(2).strip()
+                options.append(
+                    {
+                        "optionId": f"opt-{rank}",
+                        "description": description,
+                        "rank": rank,
+                        "scores": {criterion: 0.0 for criterion in DEFAULT_RECOVERY_CRITERIA},
+                    }
+                )
+                continue
+
+            timeline_match = re.match(r"(?i)^(?:[-*]\s*)?(T\+\S+)\s*[:\-]\s*(.+)$", line)
+            if timeline_match:
+                timeline.append(
+                    {
+                        "time": timeline_match.group(1),
+                        "action": timeline_match.group(2).strip(),
+                        "agent": "",
+                    }
+                )
+
+        if recommendation_match:
+            selection_text = recommendation_match.group(1)
+            id_match = re.search(r"(?i)(opt[-_ ]?\d+)", selection_text)
+            if id_match:
+                selected_option_id = id_match.group(1).lower().replace(" ", "-").replace("_", "-")
+        if not selected_option_id and options:
+            selected_option_id = options[0]["optionId"]
+
+        summary_match = re.search(r"(?im)^summary\s*[:\-]\s*(.+)$", text)
+        if summary_match:
+            summary = summary_match.group(1).strip()
+        elif recommendation_match:
+            summary = recommendation_match.group(1).strip()
+        else:
+            summary = re.sub(r"\s+", " ", text).strip()[:280]
+
+        return {
+            "criteria": DEFAULT_RECOVERY_CRITERIA.copy(),
+            "options": options,
+            "timeline": timeline,
+            "selectedOptionId": selected_option_id,
+            "summary": summary or "Coordinator synthesized specialist findings.",
+        }
+
+    def _parse_coordinator_artifacts(self, response_text: str) -> Dict[str, Any]:
+        parsed_json = self._extract_json_object_from_text(response_text)
+        if not isinstance(parsed_json, dict):
+            return self._parse_heuristic_artifacts(response_text)
+
+        criteria_raw = parsed_json.get("criteria")
+        criteria = [str(item) for item in criteria_raw if isinstance(item, str)] if isinstance(criteria_raw, list) else []
+        criteria = criteria or DEFAULT_RECOVERY_CRITERIA.copy()
+
+        options: List[Dict[str, Any]] = []
+        raw_options = parsed_json.get("options")
+        if isinstance(raw_options, list):
+            for idx, item in enumerate(raw_options):
+                if not isinstance(item, dict):
+                    continue
+                option_id = str(item.get("optionId") or item.get("id") or f"opt-{idx + 1}")
+                description = str(item.get("description") or item.get("summary") or option_id)
+                rank_raw = item.get("rank", idx + 1)
+                try:
+                    rank = int(rank_raw)
+                except (TypeError, ValueError):
+                    rank = idx + 1
+                raw_scores = item.get("scores") if isinstance(item.get("scores"), dict) else {}
+                scores = {
+                    criterion: self._normalize_score(raw_scores.get(criterion, 0))
+                    for criterion in criteria
+                }
+                options.append(
+                    {
+                        "optionId": option_id,
+                        "description": description,
+                        "rank": rank,
+                        "scores": scores,
+                    }
+                )
+
+        timeline: List[Dict[str, Any]] = []
+        raw_timeline = parsed_json.get("timeline")
+        if isinstance(raw_timeline, list):
+            for idx, item in enumerate(raw_timeline):
+                if isinstance(item, dict):
+                    timeline.append(
+                        {
+                            "time": str(item.get("time") or f"T+{idx}"),
+                            "action": str(item.get("action") or item.get("summary") or "Action"),
+                            "agent": str(item.get("agent") or ""),
+                        }
+                    )
+                elif isinstance(item, str):
+                    timeline.append({"time": f"T+{idx}", "action": item.strip(), "agent": ""})
+
+        selected_option_id = str(parsed_json.get("selectedOptionId") or "")
+        summary = str(parsed_json.get("summary") or "").strip()
+
+        if not summary:
+            summary = re.sub(r"\s+", " ", response_text).strip()[:280]
+        if not selected_option_id and options:
+            selected_option_id = options[0]["optionId"]
+
+        if not options and not timeline:
+            return self._parse_heuristic_artifacts(response_text)
+
+        return {
+            "criteria": criteria,
+            "options": options,
+            "timeline": timeline,
+            "selectedOptionId": selected_option_id,
+            "summary": summary or "Coordinator synthesized specialist findings.",
+        }
+
+    async def _emit_coordinator_artifacts(self, response_text: str):
+        if self._coordinator_artifacts_emitted:
+            return
+
+        artifacts = self._parse_coordinator_artifacts(response_text)
+        options = artifacts.get("options", [])
+        criteria = artifacts.get("criteria", DEFAULT_RECOVERY_CRITERIA.copy())
+        timeline = artifacts.get("timeline", [])
+        selected_option_id = artifacts.get("selectedOptionId", "")
+        summary = artifacts.get("summary", "Coordinator synthesized specialist findings.")
+
+        if options:
+            for option in options:
+                if self.trace_emitter:
+                    await self.trace_emitter.emit_recovery_option(
+                        option_id=option["optionId"],
+                        description=option["description"],
+                        scores=option["scores"],
+                        rank=option["rank"],
+                    )
+                else:
+                    await self.emit_event("recovery.option", option)
+
+            scores = {option["optionId"]: option["scores"] for option in options}
+            if self.trace_emitter:
+                await self.trace_emitter.emit_coordinator_scoring(
+                    options=options,
+                    criteria=criteria,
+                    scores=scores,
+                )
+            else:
+                await self.emit_event(
+                    "coordinator.scoring",
+                    {
+                        "options": options,
+                        "criteria": criteria,
+                        "scores": scores,
+                    },
+                )
+
+        if self.trace_emitter:
+            await self.trace_emitter.emit_coordinator_plan(
+                selected_option_id=selected_option_id,
+                timeline=timeline,
+                summary=summary,
+            )
+        else:
+            await self.emit_event(
+                "coordinator.plan",
+                {
+                    "selectedOptionId": selected_option_id,
+                    "timeline": timeline,
+                    "summary": summary,
+                    "options": options,
+                },
+            )
+
+        self._coordinator_artifacts_emitted = True
 
     def _estimate_result_count(self, agent_id: str, source_type: str, response_text: str, index: int) -> int:
         base = max(len(response_text) // 55, 8)
@@ -554,7 +1015,31 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         max_retries = 3
         for attempt in range(1, max_retries + 1):
             try:
+                if self._is_bounded_orchestration_mode():
+                    return await asyncio.wait_for(
+                        self._stream_workflow(input_message),
+                        timeout=self._deterministic_execution_timeout_seconds,
+                    )
                 return await self._stream_workflow(input_message)
+            except asyncio.TimeoutError as exc:
+                if self._is_bounded_orchestration_mode():
+                    timeout_reason = (
+                        "llm_directed_execution_timeout"
+                        if self._is_llm_directed_mode()
+                        else "deterministic_execution_timeout"
+                    )
+                    await self.emit_event(
+                        "workflow.failed",
+                        {
+                            "error": "bounded orchestration execution timeout",
+                            "reason": timeout_reason,
+                            "workflowState": "FAILED",
+                            "timeoutSeconds": self._deterministic_execution_timeout_seconds,
+                            "orchestration_mode": self.orchestration_mode,
+                        },
+                    )
+                    raise RuntimeError(timeout_reason) from exc
+                raise
             except AuthenticationError:
                 clear_client_cache()
                 if attempt >= max_retries:
@@ -594,6 +1079,23 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                     await asyncio.sleep(delay)
                 else:
                     raise
+            except Exception as exc:
+                if self._is_bounded_orchestration_mode():
+                    failure_reason = (
+                        "llm_directed_execution_error"
+                        if self._is_llm_directed_mode()
+                        else "deterministic_execution_error"
+                    )
+                    await self.emit_event(
+                        "workflow.failed",
+                        {
+                            "error": str(exc),
+                            "reason": failure_reason,
+                            "workflowState": "FAILED",
+                            "orchestration_mode": self.orchestration_mode,
+                        },
+                    )
+                raise
         # unreachable, but satisfies type checkers
         raise RuntimeError("Retry loop exited unexpectedly")
 
@@ -612,6 +1114,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         self._executor_invocations_total = 0
         self._active_query_contexts.clear()
         self._last_executor_id = None
+        self._coordinator_artifacts_emitted = False
         logger.info("workflow_state_reset", run_id=self.run_id)
 
     def _rebuild_workflow(self, input_message: str) -> None:
@@ -621,7 +1124,10 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             workflow_type=self.workflow_type,
             name=f"{self.workflow_type}_{self.run_id}_retry",
             problem=input_message,
+            active_agent_ids=[a.agent_id for a in self.selected_agents],
+            coordinator_id=self._coordinator_agent_id,
             autonomous_turn_limits=self._autonomous_turn_limits,
+            orchestration_mode=self.orchestration_mode,
         )
 
     async def _stream_workflow(self, input_message: str) -> Dict[str, Any]:
@@ -871,6 +1377,12 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                 response_text=response_text,
                 message_count=message_count,
             )
+            if (
+                self._is_bounded_orchestration_mode()
+                and self._coordinator_agent_id
+                and agent_id == self._coordinator_agent_id
+            ):
+                await self._emit_coordinator_artifacts(response_text)
             await self._emit_progress(f"agent_completed:{agent_id}")
             return
 

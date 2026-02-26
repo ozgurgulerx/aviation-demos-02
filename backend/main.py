@@ -83,6 +83,7 @@ class SolveRequest(BaseModel):
     """Request to start a new solver run."""
     problem: str
     workflow_type: Optional[str] = "sequential"
+    orchestration_mode: Optional[str] = None
     max_executor_invocations: Optional[int] = None
     autonomous_turn_limits: Optional[dict[str, int]] = None
     config: Optional[dict] = None
@@ -195,6 +196,13 @@ async def start_solve(request: SolveRequest, background_tasks: BackgroundTasks):
 
         workflow_type = request.workflow_type or "handoff"
         config = request.config or {}
+        orchestration_mode = request.orchestration_mode
+        if orchestration_mode is None:
+            raw_mode = config.get("orchestration_mode")
+            if isinstance(raw_mode, str):
+                orchestration_mode = raw_mode
+        if orchestration_mode is None and workflow_type == "handoff":
+            orchestration_mode = "llm_directed"
         max_executor_invocations = request.max_executor_invocations
         if max_executor_invocations is None:
             raw_limit = config.get("max_executor_invocations")
@@ -214,6 +222,7 @@ async def start_solve(request: SolveRequest, background_tasks: BackgroundTasks):
             problem_description=request.problem,
             config={
                 "workflow_type": workflow_type,
+                "orchestration_mode": orchestration_mode,
                 "scenario": scenario,
                 "max_executor_invocations": max_executor_invocations,
                 "autonomous_turn_limits": autonomous_turn_limits,
@@ -226,11 +235,18 @@ async def start_solve(request: SolveRequest, background_tasks: BackgroundTasks):
             run.run_id,
             request.problem,
             workflow_type,
+            orchestration_mode,
             max_executor_invocations,
             autonomous_turn_limits,
         )
 
-        logger.info("solve_started", run_id=run.run_id, workflow_type=workflow_type, scenario=scenario)
+        logger.info(
+            "solve_started",
+            run_id=run.run_id,
+            workflow_type=workflow_type,
+            orchestration_mode=orchestration_mode,
+            scenario=scenario,
+        )
 
         return SolveResponse(
             run_id=run.run_id,
@@ -338,6 +354,7 @@ async def execute_workflow(
     run_id: str,
     problem: str,
     workflow_type: str = "sequential",
+    orchestration_mode: Optional[str] = None,
     max_executor_invocations: Optional[int] = None,
     autonomous_turn_limits: Optional[dict[str, int]] = None,
 ):
@@ -347,7 +364,12 @@ async def execute_workflow(
     """
     from orchestrator.engine import OrchestratorEngine
 
-    logger.info("workflow_execution_started", run_id=run_id, workflow_type=workflow_type)
+    logger.info(
+        "workflow_execution_started",
+        run_id=run_id,
+        workflow_type=workflow_type,
+        orchestration_mode=orchestration_mode,
+    )
 
     run_store = None
     event_bus = None
@@ -363,7 +385,11 @@ async def execute_workflow(
             run_id=run_id,
             kind=EventKind.RUN_STARTED,
             message=f"Aviation solver started with {workflow_type} workflow",
-            payload={"workflow_type": workflow_type, "problem": problem[:200]},
+            payload={
+                "workflow_type": workflow_type,
+                "orchestration_mode": orchestration_mode,
+                "problem": problem[:200],
+            },
         ))
 
         def resolve_event_kind(event_type: str) -> EventKind:
@@ -448,7 +474,12 @@ async def execute_workflow(
                 trace_id=trace_id,
                 span_id=span_id,
                 parent_span_id=parent_span_id,
-                payload={"event_type": event_type, "workflow_type": workflow_type, **payload},
+                payload={
+                    "event_type": event_type,
+                    "workflow_type": workflow_type,
+                    "orchestration_mode": orchestration_mode,
+                    **payload,
+                },
             ))
 
         # Create and run orchestrator
@@ -456,6 +487,7 @@ async def execute_workflow(
             run_id=run_id,
             event_emitter=emit_event,
             workflow_type=workflow_type,
+            orchestration_mode=orchestration_mode,
             max_executor_invocations=max_executor_invocations,
             autonomous_turn_limits=autonomous_turn_limits,
         )
@@ -470,7 +502,11 @@ async def execute_workflow(
             run_id=run_id,
             kind=EventKind.RUN_COMPLETED,
             message=f"Aviation solver completed using {workflow_type} workflow",
-            payload={"result": result, "workflow_type": workflow_type},
+            payload={
+                "result": result,
+                "workflow_type": workflow_type,
+                "orchestration_mode": orchestration_mode,
+            },
         ))
 
         logger.info("workflow_execution_completed", run_id=run_id)
@@ -487,7 +523,11 @@ async def execute_workflow(
                     kind=EventKind.RUN_FAILED,
                     level="error",
                     message=f"Solver run failed: {str(e)}",
-                    payload={"error": str(e), "workflow_type": workflow_type},
+                    payload={
+                        "error": str(e),
+                        "workflow_type": workflow_type,
+                        "orchestration_mode": orchestration_mode,
+                    },
                 ))
         except Exception as cleanup_err:
             logger.error(
