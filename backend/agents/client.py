@@ -1,6 +1,6 @@
 """
 Shared Azure OpenAI chat client factory for Agent Framework agents.
-Uses DefaultAzureCredential for Azure-native authentication.
+Supports AZURE_OPENAI_AUTH_MODE to choose between api-key and Entra token auth.
 
 Supports separate model deployments for:
 - Agents: AZURE_OPENAI_AGENT_DEPLOYMENT (default: gpt-5-nano)
@@ -34,8 +34,17 @@ AZURE_OPENAI_ORCHESTRATOR_DEPLOYMENT = os.getenv("AZURE_OPENAI_ORCHESTRATOR_DEPL
 COGNITIVE_SCOPE = "https://cognitiveservices.azure.com/.default"
 
 
-def get_credential():
-    """Get Azure credential for authentication."""
+def _auth_mode() -> str:
+    """Read AZURE_OPENAI_AUTH_MODE: 'api-key', 'token', or 'auto' (default)."""
+    return (os.getenv("AZURE_OPENAI_AUTH_MODE", "auto") or "auto").strip().lower()
+
+
+def _build_credential():
+    """Build an Azure credential, preferring tenant-scoped CLI credential when configured."""
+    aoai_tenant = os.getenv("AZURE_OPENAI_TENANT_ID", "").strip()
+    if aoai_tenant:
+        logger.info("azure_credential_initialized", method="AzureCliCredential", tenant_id=aoai_tenant)
+        return AzureCliCredential(tenant_id=aoai_tenant)
     try:
         credential = DefaultAzureCredential()
         logger.info("azure_credential_initialized", method="DefaultAzureCredential")
@@ -51,6 +60,37 @@ def get_credential():
             return None
 
 
+def _create_token_client(endpoint: str, deployment: str, api_version: str, credential) -> AzureOpenAIChatClient:
+    """Create client using Entra ID token auth."""
+    def _ad_token_provider() -> str:
+        token = credential.get_token(COGNITIVE_SCOPE)
+        return token.token
+
+    saved_key = os.environ.pop("AZURE_OPENAI_API_KEY", None)
+    try:
+        client = AzureOpenAIChatClient(
+            endpoint=endpoint,
+            deployment_name=deployment,
+            api_version=api_version,
+            ad_token_provider=_ad_token_provider,
+            env_file_path="",  # Prevent .env-based key fallback.
+        )
+    finally:
+        if saved_key is not None:
+            os.environ["AZURE_OPENAI_API_KEY"] = saved_key
+    return client
+
+
+def _create_apikey_client(endpoint: str, deployment: str, api_version: str, api_key: str) -> AzureOpenAIChatClient:
+    """Create client using API key auth."""
+    return AzureOpenAIChatClient(
+        endpoint=endpoint,
+        api_key=api_key,
+        deployment_name=deployment,
+        api_version=api_version,
+    )
+
+
 def get_chat_client(
     endpoint: Optional[str] = None,
     deployment: Optional[str] = None,
@@ -59,6 +99,7 @@ def get_chat_client(
 ) -> AzureOpenAIChatClient:
     """
     Factory for Azure OpenAI chat client.
+    Respects AZURE_OPENAI_AUTH_MODE: 'api-key' | 'token' | 'auto' (default).
 
     Args:
         endpoint: Azure OpenAI endpoint URL
@@ -84,42 +125,47 @@ def get_chat_client(
             "Set AZURE_OPENAI_ENDPOINT environment variable."
         )
 
-    credential = get_credential()
+    mode = _auth_mode()
+    api_key = AZURE_OPENAI_KEY
 
+    # --- api-key mode: skip credential entirely ---
+    if mode == "api-key":
+        if not api_key:
+            raise ValueError("AZURE_OPENAI_AUTH_MODE=api-key requires AZURE_OPENAI_API_KEY")
+        client = _create_apikey_client(_endpoint, _deployment, _api_version, api_key)
+        logger.info("chat_client_created", endpoint=_endpoint, deployment=_deployment, auth="api_key", mode=mode)
+        return client
+
+    # --- token mode: use credential, fail if unavailable ---
+    if mode == "token":
+        credential = _build_credential()
+        if not credential:
+            raise ValueError("AZURE_OPENAI_AUTH_MODE=token but no Azure credential available")
+        client = _create_token_client(_endpoint, _deployment, _api_version, credential)
+        logger.info("chat_client_created", endpoint=_endpoint, deployment=_deployment, auth="entra_token", mode=mode)
+        return client
+
+    # --- auto mode (default): try credential with validation, fallback to api-key ---
+    credential = _build_credential()
     if credential:
-        # Use explicit Entra token flow to avoid API-key fallback on key-disabled resources.
-        def _ad_token_provider() -> str:
-            token = credential.get_token(COGNITIVE_SCOPE)
-            return token.token
-
-        saved_key = os.environ.pop("AZURE_OPENAI_API_KEY", None)
         try:
-            client = AzureOpenAIChatClient(
-                endpoint=_endpoint,
-                deployment_name=_deployment,
-                api_version=_api_version,
-                ad_token_provider=_ad_token_provider,
-                env_file_path="",  # Prevent .env-based key fallback.
-            )
-        finally:
-            if saved_key is not None:
-                os.environ["AZURE_OPENAI_API_KEY"] = saved_key
-        logger.info("chat_client_created", endpoint=_endpoint, deployment=_deployment, auth="entra_token")
-    elif AZURE_OPENAI_KEY:
-        client = AzureOpenAIChatClient(
-            endpoint=_endpoint,
-            api_key=AZURE_OPENAI_KEY,
-            deployment_name=_deployment,
-            api_version=_api_version,
-        )
-        logger.info("chat_client_created", endpoint=_endpoint, deployment=_deployment, auth="api_key")
-    else:
-        raise ValueError(
-            "No Azure authentication available. "
-            "Set up DefaultAzureCredential or AZURE_OPENAI_API_KEY."
-        )
+            credential.get_token(COGNITIVE_SCOPE)
+            client = _create_token_client(_endpoint, _deployment, _api_version, credential)
+            logger.info("chat_client_created", endpoint=_endpoint, deployment=_deployment, auth="entra_token", mode=mode)
+            return client
+        except Exception as e:
+            logger.warning("entra_token_validation_failed", error=str(e), fallback="api_key")
 
-    return client
+    if api_key:
+        client = _create_apikey_client(_endpoint, _deployment, _api_version, api_key)
+        logger.info("chat_client_created", endpoint=_endpoint, deployment=_deployment, auth="api_key", mode=mode)
+        return client
+
+    raise ValueError(
+        "No Azure authentication available. "
+        "Set AZURE_OPENAI_AUTH_MODE=api-key with AZURE_OPENAI_API_KEY, "
+        "or configure DefaultAzureCredential for token auth."
+    )
 
 
 def get_shared_chat_client() -> AzureOpenAIChatClient:
