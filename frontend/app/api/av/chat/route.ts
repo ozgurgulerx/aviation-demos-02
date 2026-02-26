@@ -24,7 +24,12 @@ export async function POST(request: NextRequest) {
     const response = await fetch(`${backendUrl}/api/av/solve`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ problem: message, workflow_type: "handoff" }),
+      body: JSON.stringify({
+        problem: message,
+        workflow_type: "handoff",
+        orchestration_mode: "deterministic",
+        max_executor_invocations: 200,
+      }),
     });
 
     if (!response.ok) {

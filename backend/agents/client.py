@@ -169,6 +169,20 @@ def get_chat_client(
     mode = _auth_mode()
     api_key = AZURE_OPENAI_KEY
 
+    # --- prefer API key when present (auto mode + key fallback + explicit api-key) ---
+    # This avoids token-based auth drift (for example, tenant mismatch between
+    # EXPECTED_RUNTIME_TENANT_ID and the resource tenant).
+    if api_key and mode != "token":
+        client = _create_apikey_client(_endpoint, _deployment, _api_version, api_key)
+        logger.info(
+            "chat_client_created",
+            endpoint=_endpoint,
+            deployment=_deployment,
+            auth="api_key",
+            mode=mode,
+        )
+        return client
+
     # --- api-key mode: skip credential entirely ---
     if mode == "api-key":
         if not api_key:

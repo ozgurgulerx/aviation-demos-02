@@ -109,6 +109,9 @@ def init_async_openai_client(
     api_key = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
     mode = _auth_mode()
 
+    if api_key and mode != "token":
+        return _api_key_client(resolved_endpoint, resolved_api_version, api_key), "api-key"
+
     if mode == "api-key":
         if not api_key:
             raise ValueError("AZURE_OPENAI_AUTH_MODE=api-key requires AZURE_OPENAI_API_KEY")

@@ -116,10 +116,11 @@ class AsyncUnifiedRetriever:
         self._fabric_graph_endpoint = os.getenv("FABRIC_GRAPH_ENDPOINT", "")
         self._fabric_sql_endpoint = os.getenv("FABRIC_SQL_ENDPOINT", "")
         self._embedding_deployment = os.getenv("AZURE_TEXT_EMBEDDING_DEPLOYMENT_NAME", "text-embedding-3-small")
+        self._query_timeout_seconds = int(os.getenv("UNIFIED_RETRIEVER_QUERY_TIMEOUT_SECONDS", "45"))
 
     async def _get_http(self) -> httpx.AsyncClient:
         if self._http is None or self._http.is_closed:
-            self._http = httpx.AsyncClient(timeout=30.0)
+            self._http = httpx.AsyncClient(timeout=self._query_timeout_seconds)
         return self._http
 
     async def close(self):
@@ -145,6 +146,14 @@ class AsyncUnifiedRetriever:
                 logger.warning("Failed to close Cosmos credential: %s", e)
             self._cosmos_credential = None
 
+    async def _with_timeout(self, operation: str, awaitable):
+        """Run an awaitable with a bounded timeout and normalize timeout exceptions."""
+        try:
+            return await asyncio.wait_for(awaitable, timeout=self._query_timeout_seconds)
+        except asyncio.TimeoutError as exc:
+            logger.error("%s timed out after %ss", operation, self._query_timeout_seconds)
+            raise TimeoutError(f"{operation} timed out after {self._query_timeout_seconds}s") from exc
+
     # ------------------------------------------------------------------
     # Fabric token acquisition
     # ------------------------------------------------------------------
@@ -161,14 +170,17 @@ class AsyncUnifiedRetriever:
 
         if client_id and client_secret and tenant_id:
             http = await self._get_http()
-            resp = await http.post(
-                f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token",
-                data={
-                    "grant_type": "client_credentials",
-                    "client_id": client_id,
-                    "client_secret": client_secret,
-                    "scope": "https://analysis.windows.net/powerbi/api/.default",
-                },
+            resp = await self._with_timeout(
+                "fabric service-principal token request",
+                http.post(
+                    f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token",
+                    data={
+                        "grant_type": "client_credentials",
+                        "client_id": client_id,
+                        "client_secret": client_secret,
+                        "scope": "https://analysis.windows.net/powerbi/api/.default",
+                    },
+                ),
             )
             resp.raise_for_status()
             return resp.json()["access_token"]
@@ -177,7 +189,10 @@ class AsyncUnifiedRetriever:
         try:
             from azure.identity.aio import AzureCliCredential
             cred = AzureCliCredential()
-            token = await cred.get_token("https://analysis.windows.net/powerbi/api/.default")
+            token = await self._with_timeout(
+                "fabric azure-cli token request",
+                cred.get_token("https://analysis.windows.net/powerbi/api/.default"),
+            )
             await cred.close()
             return token.token
         except Exception as e:
@@ -197,15 +212,20 @@ class AsyncUnifiedRetriever:
             return [], [Citation(source_type="SQL", title="No database connection")]
 
         try:
-            schemas = schema or (await self._schema_provider.snapshot()).get("sql_schema", {})
+            schemas = schema or (
+                await self._with_timeout("sql schema snapshot", self._schema_provider.snapshot())
+            ).get("sql_schema", {})
             airports = _extract_airports_from_query(query)
 
-            sql = await self._sql_writer.generate(
-                user_query=query,
-                evidence_type="FlightSchedule",
-                sql_schema=schemas,
-                entities={"airports": airports, "flight_ids": [], "routes": []},
-                time_window={"horizon_min": 60},
+            sql = await self._with_timeout(
+                "sql generation",
+                self._sql_writer.generate(
+                    user_query=query,
+                    evidence_type="FlightSchedule",
+                    sql_schema=schemas,
+                    entities={"airports": airports, "flight_ids": [], "routes": []},
+                    time_window={"horizon_min": 60},
+                ),
             )
 
             if not sql or "NEED_SCHEMA" in sql:
@@ -218,7 +238,7 @@ class AsyncUnifiedRetriever:
                 return [], [Citation(source_type="SQL", title="Only SELECT queries allowed")]
 
             async with self._pg_pool.acquire() as conn:
-                records = await conn.fetch(sql)
+                records = await self._with_timeout("sql execution", conn.fetch(sql))
 
             rows = [dict(r) for r in records]
             citations = [
@@ -233,6 +253,9 @@ class AsyncUnifiedRetriever:
             ]
             return rows, citations
 
+        except TimeoutError as e:
+            logger.error("SQL query timed out: %s", e)
+            return [], [Citation(source_type="SQL", title=f"SQL error: {str(e)[:100]}")]
         except Exception as e:
             logger.error("SQL query failed: %s", e)
             return [], [Citation(source_type="SQL", title=f"SQL error: {str(e)[:100]}")]
@@ -250,15 +273,20 @@ class AsyncUnifiedRetriever:
             return [], [Citation(source_type="KQL", title="KQL endpoint not configured")]
 
         try:
-            schemas = (await self._schema_provider.snapshot()).get("kql_schema", {})
+            schemas = (
+                await self._with_timeout("kql schema snapshot", self._schema_provider.snapshot())
+            ).get("kql_schema", {})
             airports = _extract_airports_from_query(query)
 
-            kql = await self._kql_writer.generate(
-                user_query=query,
-                evidence_type="LivePositions",
-                kql_schema=schemas,
-                entities={"airports": airports, "flight_ids": []},
-                time_window={"horizon_min": window_minutes},
+            kql = await self._with_timeout(
+                "kql generation",
+                self._kql_writer.generate(
+                    user_query=query,
+                    evidence_type="LivePositions",
+                    kql_schema=schemas,
+                    entities={"airports": airports, "flight_ids": []},
+                    time_window={"horizon_min": window_minutes},
+                ),
             )
 
             if not kql or "NEED_SCHEMA" in kql:
@@ -269,10 +297,13 @@ class AsyncUnifiedRetriever:
                 return [], [Citation(source_type="KQL", title="No Fabric token available")]
 
             http = await self._get_http()
-            resp = await http.post(
-                self._fabric_kql_endpoint,
-                json={"db": self._fabric_kql_database, "csl": kql},
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            resp = await self._with_timeout(
+                "kql execution",
+                http.post(
+                    self._fabric_kql_endpoint,
+                    json={"db": self._fabric_kql_database, "csl": kql},
+                    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                ),
             )
             resp.raise_for_status()
             data = resp.json()
@@ -290,6 +321,9 @@ class AsyncUnifiedRetriever:
             ]
             return rows, citations
 
+        except TimeoutError as e:
+            logger.error("KQL query timed out: %s", e)
+            return [], [Citation(source_type="KQL", title=f"KQL error: {str(e)[:100]}")]
         except Exception as e:
             logger.error("KQL query failed: %s", e)
             return [], [Citation(source_type="KQL", title=f"KQL error: {str(e)[:100]}")]
@@ -345,10 +379,13 @@ class AsyncUnifiedRetriever:
         airports = _extract_airports_from_query(query)
         start_node = airports[0] if airports else "KORD"
 
-        resp = await http.post(
-            self._fabric_graph_endpoint,
-            json={"startNode": start_node, "hops": hops, "query": query},
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        resp = await self._with_timeout(
+            "graph fabric execution",
+            http.post(
+                self._fabric_graph_endpoint,
+                json={"startNode": start_node, "hops": hops, "query": query},
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            ),
         )
         resp.raise_for_status()
         data = resp.json()
@@ -392,7 +429,10 @@ class AsyncUnifiedRetriever:
         """
         try:
             async with self._pg_pool.acquire() as conn:
-                records = await conn.fetch(sql, start, hops)
+                records = await self._with_timeout(
+                    "graph pg fallback execution",
+                    conn.fetch(sql, start, hops),
+                )
             rows = [dict(r) for r in records]
             citations = [
                 Citation(
@@ -405,6 +445,9 @@ class AsyncUnifiedRetriever:
                 )
             ]
             return rows, citations
+        except TimeoutError as e:
+            logger.error("Graph PG fallback timed out: %s", e)
+            return [], [Citation(source_type="GRAPH", title=f"Graph error: {str(e)[:100]}")]
         except Exception as e:
             logger.error("Graph PG fallback failed: %s", e)
             return [], [Citation(source_type="GRAPH", title=f"Graph error: {str(e)[:100]}")]
@@ -438,7 +481,7 @@ class AsyncUnifiedRetriever:
 
         try:
             client = await self._get_search_client(search_endpoint, search_key, index_name)
-            embedding = await self.get_embedding(query)
+            embedding = await self._with_timeout("embedding generation", self.get_embedding(query))
 
             vector_query = VectorizedQuery(
                 vector=embedding,
@@ -446,28 +489,34 @@ class AsyncUnifiedRetriever:
                 fields="content_vector",
             ) if embedding else None
 
-            results = await client.search(
-                search_text=query,
-                vector_queries=[vector_query] if vector_query else None,
-                top=top,
-            )
+            async def _execute_search():
+                results = await client.search(
+                    search_text=query,
+                    vector_queries=[vector_query] if vector_query else None,
+                    top=top,
+                )
 
-            rows: List[Dict[str, Any]] = []
-            citations: List[Citation] = []
-            async for result in results:
-                row = {k: v for k, v in result.items() if k != "content_vector"}
-                rows.append(row)
-                citations.append(Citation(
-                    source_type=source,
-                    identifier=str(result.get("id", "")),
-                    title=str(result.get("title", result.get("chunk_id", "")))[:100],
-                    content_preview=str(result.get("content", result.get("chunk", "")))[:200],
-                    score=result.get("@search.score", 0.0),
-                    dataset=index_name,
-                ))
+                rows: List[Dict[str, Any]] = []
+                citations: List[Citation] = []
+                async for result in results:
+                    row = {k: v for k, v in result.items() if k != "content_vector"}
+                    rows.append(row)
+                    citations.append(Citation(
+                        source_type=source,
+                        identifier=str(result.get("id", "")),
+                        title=str(result.get("title", result.get("chunk_id", "")))[:100],
+                        content_preview=str(result.get("content", result.get("chunk", "")))[:200],
+                        score=result.get("@search.score", 0.0),
+                        dataset=index_name,
+                    ))
 
-            return rows, citations
+                return rows, citations
 
+            return await self._with_timeout("semantic search", _execute_search())
+
+        except TimeoutError as e:
+            logger.error("Semantic search timed out: %s", e)
+            return [], [Citation(source_type=source, title=f"Search error: {str(e)[:100]}")]
         except Exception as e:
             logger.error("Semantic search failed (%s): %s", source, e)
             return [], [Citation(source_type=source, title=f"Search error: {str(e)[:100]}")]
@@ -521,13 +570,17 @@ class AsyncUnifiedRetriever:
                 cosmos_query = "SELECT * FROM c OFFSET 0 LIMIT 20"
                 params = []
 
-            rows: List[Dict[str, Any]] = []
-            async for item in container.query_items(
-                query=cosmos_query,
-                parameters=params if params else None,
-                enable_cross_partition_query=True,
-            ):
-                rows.append(item)
+            async def _execute_nosql_query():
+                rows: List[Dict[str, Any]] = []
+                async for item in container.query_items(
+                    query=cosmos_query,
+                    parameters=params if params else None,
+                    enable_cross_partition_query=True,
+                ):
+                    rows.append(item)
+                return rows
+
+            rows = await self._with_timeout("cosmos query", _execute_nosql_query())
 
             citations = [
                 Citation(
@@ -541,6 +594,9 @@ class AsyncUnifiedRetriever:
             ]
             return rows, citations
 
+        except TimeoutError as e:
+            logger.error("Cosmos query timed out: %s", e)
+            return [], [Citation(source_type="NOSQL", title=f"Cosmos error: {str(e)[:100]}")]
         except Exception as e:
             logger.error("Cosmos query failed: %s", e)
             return [], [Citation(source_type="NOSQL", title=f"Cosmos error: {str(e)[:100]}")]
@@ -575,35 +631,42 @@ class AsyncUnifiedRetriever:
                 return [], [Citation(source_type="FABRIC_SQL", title="No Fabric token")]
 
             # Generate T-SQL via LLM
-            tsql = await self._sql_writer.generate(
-                user_query=query,
-                evidence_type="HistoricalDelays",
-                sql_schema={"tables": {
-                    "bts_ontime_reporting": {
-                        "columns": {
-                            "year": "int", "month": "int", "carrier": "varchar",
-                            "origin": "varchar", "dest": "varchar",
-                            "dep_delay": "float", "arr_delay": "float",
-                            "cancelled": "float", "diverted": "float",
-                            "carrier_delay": "float", "weather_delay": "float",
-                            "nas_delay": "float", "security_delay": "float",
-                            "late_aircraft_delay": "float",
+            tsql = await self._with_timeout(
+                "fabric sql generation",
+                self._sql_writer.generate(
+                    user_query=query,
+                    evidence_type="HistoricalDelays",
+                    sql_schema={"tables": {
+                        "bts_ontime_reporting": {
+                            "columns": {
+                                "year": "int", "month": "int", "carrier": "varchar",
+                                "origin": "varchar", "dest": "varchar",
+                                "dep_delay": "float", "arr_delay": "float",
+                                "cancelled": "float", "diverted": "float",
+                                "carrier_delay": "float", "weather_delay": "float",
+                                "nas_delay": "float", "security_delay": "float",
+                                "late_aircraft_delay": "float",
+                            }
                         }
                     }
-                }},
-                entities={"airports": _extract_airports_from_query(query), "flight_ids": []},
-                time_window={"horizon_min": 0},
-                constraints={"dialect": "tsql"},
+                    },
+                    entities={"airports": _extract_airports_from_query(query), "flight_ids": []},
+                    time_window={"horizon_min": 0},
+                    constraints={"dialect": "tsql"},
+                ),
             )
 
             if not tsql or "NEED_SCHEMA" in tsql:
                 return [], [Citation(source_type="FABRIC_SQL", title="Could not generate T-SQL")]
 
             http = await self._get_http()
-            resp = await http.post(
-                self._fabric_sql_endpoint,
-                json={"query": tsql},
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            resp = await self._with_timeout(
+                "fabric sql execution",
+                http.post(
+                    self._fabric_sql_endpoint,
+                    json={"query": tsql},
+                    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                ),
             )
             resp.raise_for_status()
             data = resp.json()
@@ -621,6 +684,9 @@ class AsyncUnifiedRetriever:
             ]
             return rows, citations
 
+        except TimeoutError as e:
+            logger.error("Fabric SQL query timed out: %s", e)
+            return [], [Citation(source_type="FABRIC_SQL", title=f"Fabric SQL error: {str(e)[:100]}")]
         except Exception as e:
             logger.error("Fabric SQL query failed: %s", e)
             return [], [Citation(source_type="FABRIC_SQL", title=f"Fabric SQL error: {str(e)[:100]}")]
@@ -647,7 +713,7 @@ class AsyncUnifiedRetriever:
             return rows
 
         try:
-            rows = await asyncio.to_thread(_sync_query)
+            rows = await self._with_timeout("fabric sql tds", asyncio.to_thread(_sync_query))
             citations = [
                 Citation(
                     source_type="FABRIC_SQL",
@@ -658,6 +724,9 @@ class AsyncUnifiedRetriever:
                 )
             ]
             return rows, citations
+        except TimeoutError as e:
+            logger.error("Fabric SQL TDS timed out: %s", e)
+            return [], [Citation(source_type="FABRIC_SQL", title=f"TDS error: {str(e)[:100]}")]
         except Exception as e:
             logger.error("Fabric SQL TDS failed: %s", e)
             return [], [Citation(source_type="FABRIC_SQL", title=f"TDS error: {str(e)[:100]}")]
@@ -673,9 +742,12 @@ class AsyncUnifiedRetriever:
         try:
             from data_sources.azure_client import get_shared_async_client
             client, _ = await get_shared_async_client(api_version=OPENAI_API_VERSION)
-            response = await client.embeddings.create(
-                model=self._embedding_deployment,
-                input=text,
+            response = await self._with_timeout(
+                "embedding api call",
+                client.embeddings.create(
+                    model=self._embedding_deployment,
+                    input=text,
+                ),
             )
             if not response.data:
                 logger.warning("Empty embedding response for text: %s", text[:50])
@@ -717,7 +789,7 @@ class AsyncUnifiedRetriever:
         results = {}
         for source, task in tasks.items():
             try:
-                results[source] = await task
+                results[source] = await self._with_timeout(f"source {source}", task)
             except Exception as e:
                 logger.error("Source %s failed: %s", source, e)
                 results[source] = ([], [Citation(source_type=source, title=f"Error: {str(e)[:80]}")])
