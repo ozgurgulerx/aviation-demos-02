@@ -127,7 +127,7 @@ DO NOT analyze the problem yourself first — hand off to specialists immediatel
 
 Start by calling the first handoff tool now.
 """
-    coordinator._instructions = coordinator_instructions
+    coordinator.default_options["instructions"] = coordinator_instructions
 
     # Build handoff workflow
     all_participants = [coordinator] + specialists
