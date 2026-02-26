@@ -40,7 +40,7 @@ export default function Home() {
 
                 <Panel defaultSize={30} minSize={8} maxSize={62}>
                   <BottomDrawer
-                    children={{
+                    panels={{
                       activity: <AgentActivityFeed />,
                       timeline: <EventTimeline />,
                       plan: <RecoveryPlanView />,

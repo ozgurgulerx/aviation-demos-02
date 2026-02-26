@@ -6,7 +6,7 @@ import { useAviationStore } from "@/store/aviation-store";
 import { cn } from "@/lib/utils";
 
 interface BottomDrawerProps {
-  children: {
+  panels: {
     activity: React.ReactNode;
     timeline: React.ReactNode;
     plan: React.ReactNode;
@@ -14,7 +14,7 @@ interface BottomDrawerProps {
   };
 }
 
-export function BottomDrawer({ children }: BottomDrawerProps) {
+export function BottomDrawer({ panels }: BottomDrawerProps) {
   const {
     bottomDrawerTab,
     setBottomDrawerTab,
@@ -88,16 +88,16 @@ export function BottomDrawer({ children }: BottomDrawerProps) {
       {bottomDrawerOpen && (
         <div className="min-h-0 flex-1 overflow-hidden">
           <Tabs.Content value="activity" className="av-scroll h-full overflow-y-auto">
-            {children.activity}
+            {panels.activity}
           </Tabs.Content>
           <Tabs.Content value="timeline" className="av-scroll h-full overflow-y-auto">
-            {children.timeline}
+            {panels.timeline}
           </Tabs.Content>
           <Tabs.Content value="plan" className="av-scroll h-full overflow-y-auto">
-            {children.plan}
+            {panels.plan}
           </Tabs.Content>
           <Tabs.Content value="sources" className="av-scroll h-full overflow-y-auto">
-            {children.sources}
+            {panels.sources}
           </Tabs.Content>
         </div>
       )}

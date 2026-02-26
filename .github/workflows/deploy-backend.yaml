@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'backend/**'
+      - 'tests/**'
       - 'Dockerfile.backend'
       - 'k8s/**'
   workflow_dispatch:
