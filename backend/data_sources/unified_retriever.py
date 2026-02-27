@@ -188,13 +188,21 @@ class AsyncUnifiedRetriever:
         # Fallback to Azure CLI credential
         try:
             from azure.identity.aio import AzureCliCredential
+
             cred = AzureCliCredential()
-            token = await self._with_timeout(
-                "fabric azure-cli token request",
-                cred.get_token("https://analysis.windows.net/powerbi/api/.default"),
-            )
-            await cred.close()
-            return token.token
+            token = None
+            try:
+                token = await self._with_timeout(
+                    "fabric azure-cli token request",
+                    cred.get_token("https://analysis.windows.net/powerbi/api/.default"),
+                )
+            finally:
+                try:
+                    await cred.close()
+                except Exception as close_error:
+                    logger.warning("Failed to close Azure CLI credential: %s", close_error)
+
+            return token.token if token else ""
         except Exception as e:
             logger.warning("Fabric token acquisition failed: %s", e)
             return ""

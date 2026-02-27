@@ -131,6 +131,15 @@ class OrchestratorEngine:
         )
         self._coordinator_agent_id: Optional[str] = None
         self._coordinator_artifacts_emitted = False
+        self._deterministic_stream_update_limit = int(
+            os.getenv("DETERMINISTIC_AGENT_STREAM_UPDATE_LIMIT", "24")
+        )
+        self._deterministic_stream_timeout_seconds = int(
+            os.getenv("DETERMINISTIC_AGENT_STREAM_TIMEOUT_SECONDS", "180")
+        )
+        self._agent_stream_update_counts: Dict[str, int] = {}
+        self._agent_stream_last_update_at: Dict[str, datetime] = {}
+        self._agent_stream_guarded_invocation_keys: set[str] = set()
 
         if enable_checkpointing:
             self.checkpoint_storage = InMemoryCheckpointStorage()
@@ -169,6 +178,10 @@ class OrchestratorEngine:
             self.workflow_type == WorkflowType.HANDOFF
             and self.orchestration_mode in {OrchestrationMode.DETERMINISTIC, OrchestrationMode.LLM_DIRECTED}
         )
+
+    def _is_agent_update_event(self, event: WorkflowEvent) -> bool:
+        """Compatibility helper for framework versions with renamed update event classes."""
+        return isinstance(event, AgentRunUpdateEvent) or type(event).__name__ == "AgentRunUpdateEvent"
 
     async def emit_event(self, event_type: str, payload: Dict[str, Any]):
         if self.event_emitter:
@@ -1147,7 +1160,131 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         self._active_query_contexts.clear()
         self._last_executor_id = None
         self._coordinator_artifacts_emitted = False
+        self._agent_stream_update_counts.clear()
+        self._agent_stream_last_update_at.clear()
+        self._agent_stream_guarded_invocation_keys.clear()
         logger.info("workflow_state_reset", run_id=self.run_id)
+
+    async def _emit_synthetic_agent_completion(self, agent_id: str, reason: str):
+        """Emit a synthetic completion event for an agent whose stream stalled.
+
+        This keeps deterministic workflows moving forward when an agent never sends
+        a terminal run message.
+        """
+        profile = self._get_agent_profile(agent_id)
+        agent_name = profile.agent_name if profile else agent_id
+        execution_count = self._agent_execution_counts.get(agent_id, 0) or 1
+        guard_key = f"{agent_id}:{execution_count}"
+        self._agent_stream_guarded_invocation_keys.add(guard_key)
+        self._active_agent_ids.discard(agent_id)
+        self._completed_agent_ids.add(agent_id)
+        started_at = self._agent_started_at.get(agent_id, datetime.now(timezone.utc))
+        ended_at = datetime.now(timezone.utc)
+        duration_ms = int((ended_at - started_at).total_seconds() * 1000)
+        self._agent_progress_pct[agent_id] = 100.0
+        self._agent_stream_update_counts.pop(agent_id, None)
+        self._agent_stream_last_update_at.pop(agent_id, None)
+
+        await self.emit_event(
+            "executor.completed",
+            {
+                "executor_id": agent_id,
+                "executor_name": agent_name,
+                "agentId": agent_id,
+                "agentName": agent_name,
+                "status": "completed",
+                "executionCount": execution_count,
+                "completionReason": "stream_timeout",
+                "terminationReason": reason,
+            },
+        )
+        await self.emit_event(
+            "agent.completed",
+            {
+                "agentId": agent_id,
+                "agentName": agent_name,
+                "agent_name": agent_name,
+                "message_count": 0,
+                "summary": f"{agent_name} completed via synthetic timeout guard.",
+                "status": "completed",
+                "completionReason": "stream_timeout",
+                "terminationReason": reason,
+                "startedAt": started_at.isoformat(),
+                "endedAt": ended_at.isoformat(),
+                "durationMs": duration_ms,
+                "executionCount": execution_count,
+            },
+        )
+        if self.trace_emitter:
+            await self.trace_emitter.emit_span_ended(
+                agent_id=agent_id,
+                agent_name=agent_name,
+                success=True,
+                result_summary=f"{agent_name} completed with synthetic timeout guard.",
+            )
+        await self._emit_query_completions_and_evidence(
+            agent_id=agent_id,
+            response_text=f"{agent_name} completed with synthetic timeout guard.",
+            message_count=0,
+        )
+        await self._emit_progress(f"agent_completed:{agent_id}")
+
+    async def _emit_synthetic_completion_if_stalled(self, agent_id: str, reason: str):
+        execution_count = self._agent_execution_counts.get(agent_id, 0)
+        guard_key = f"{agent_id}:{execution_count}"
+        if agent_id in self._completed_agent_ids:
+            return
+        if guard_key in self._agent_stream_guarded_invocation_keys:
+            self._active_agent_ids.discard(agent_id)
+            return
+        await self._emit_synthetic_agent_completion(agent_id=agent_id, reason=reason)
+
+    async def _check_stalled_streaming_agents(self, now: Optional[datetime] = None):
+        if not self._is_deterministic_mode():
+            return
+        if not self._active_agent_ids:
+            return
+
+        now = now or datetime.now(timezone.utc)
+        for agent_id in list(self._active_agent_ids):
+            if agent_id in self._completed_agent_ids:
+                self._active_agent_ids.discard(agent_id)
+                continue
+            execution_count = self._agent_execution_counts.get(agent_id, 0)
+            guard_key = f"{agent_id}:{execution_count}"
+            if guard_key in self._agent_stream_guarded_invocation_keys:
+                self._active_agent_ids.discard(agent_id)
+                continue
+
+            update_count = self._agent_stream_update_counts.get(agent_id, 0)
+            if update_count >= self._deterministic_stream_update_limit:
+                logger.warning(
+                    "agent_stream_update_limit_reached",
+                    run_id=self.run_id,
+                    agent_id=agent_id,
+                    updates=update_count,
+                    limit=self._deterministic_stream_update_limit,
+                )
+                await self._emit_synthetic_completion_if_stalled(
+                    agent_id=agent_id,
+                    reason="deterministic_stream_update_limit",
+                )
+                continue
+
+            last_update_at = self._agent_stream_last_update_at.get(agent_id)
+            if not last_update_at:
+                continue
+            if (now - last_update_at).total_seconds() >= self._deterministic_stream_timeout_seconds:
+                logger.warning(
+                    "agent_stream_update_timeout",
+                    run_id=self.run_id,
+                    agent_id=agent_id,
+                    timeout_seconds=self._deterministic_stream_timeout_seconds,
+                )
+                await self._emit_synthetic_completion_if_stalled(
+                    agent_id=agent_id,
+                    reason="deterministic_stream_timeout",
+                )
 
     def _rebuild_workflow(self, input_message: str) -> None:
         """Recreate workflow with fresh clients after a credential refresh."""
@@ -1167,10 +1304,63 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
 
         final_output = None
         agent_responses = []
+        stream_timeout_seconds = (
+            max(self._deterministic_stream_timeout_seconds, 180)
+            if self._is_deterministic_mode()
+            else max(60, self._deterministic_execution_timeout_seconds // 4)
+        )
+        max_idle_loops = 3 if self._is_deterministic_mode() else 1
+        idle_loop_count = 0
+        stream_iterator = self.workflow.run_stream(input_message).__aiter__()
 
         try:
-            async for event in self.workflow.run_stream(input_message):
+            while True:
+                try:
+                    if self._is_bounded_orchestration_mode():
+                        next_event_task = asyncio.create_task(stream_iterator.__anext__())
+                        done, _pending = await asyncio.wait(
+                            {next_event_task},
+                            timeout=stream_timeout_seconds,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if not done:
+                            next_event_task.cancel()
+                            raise asyncio.TimeoutError()
+                        event = next_event_task.result()
+                    else:
+                        event = await stream_iterator.__anext__()
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    idle_loop_count += 1
+                    logger.warning(
+                        "workflow_stream_inactivity_timeout",
+                        run_id=self.run_id,
+                        idle_loop_count=idle_loop_count,
+                        max_idle_loops=max_idle_loops,
+                        active_agents=sorted(self._active_agent_ids),
+                    )
+                    await self._check_stalled_streaming_agents()
+
+                    if self._is_deterministic_mode():
+                        if not self._active_agent_ids:
+                            logger.warning(
+                                "workflow_stream_inactivity_no_active_agents",
+                                run_id=self.run_id,
+                            )
+                            break
+                        if idle_loop_count >= max_idle_loops:
+                            logger.warning(
+                                "workflow_stream_inactivity_limit_reached",
+                                run_id=self.run_id,
+                                active_agents=sorted(self._active_agent_ids),
+                            )
+                            break
+                    continue
+
+                idle_loop_count = 0
                 await self._process_workflow_event(event)
+                await self._check_stalled_streaming_agents()
 
                 if isinstance(event, WorkflowOutputEvent):
                     final_output = event.data
@@ -1196,6 +1386,24 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                 run_id=self.run_id,
                 agents_heard=len(agent_responses),
             )
+        finally:
+            try:
+                await stream_iterator.aclose()
+            except Exception:
+                pass
+            await self._check_stalled_streaming_agents()
+            if self._is_deterministic_mode():
+                for agent_id in list(self._active_agent_ids):
+                    if agent_id not in self._completed_agent_ids:
+                        logger.warning(
+                            "agent_streaming_completed_without_terminal_event",
+                            run_id=self.run_id,
+                            agent_id=agent_id,
+                        )
+                        await self._emit_synthetic_completion_if_stalled(
+                            agent_id=agent_id,
+                            reason="stream_completed_without_completion",
+                        )
 
         if isinstance(final_output, dict):
             return final_output
@@ -1291,7 +1499,10 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                 )
                 raise RuntimeError(reason)
 
-            self._agent_started_at[executor_id] = datetime.now(timezone.utc)
+            now = datetime.now(timezone.utc)
+            self._agent_started_at[executor_id] = now
+            if self._is_deterministic_mode():
+                self._agent_stream_last_update_at.setdefault(executor_id, now)
             self._active_agent_ids.add(executor_id)
             self._agent_progress_pct[executor_id] = max(self._agent_progress_pct.get(executor_id, 0.0), 5.0)
 
@@ -1344,6 +1555,11 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
 
         if isinstance(event, ExecutorCompletedEvent):
             executor_id = event.executor_id or "unknown"
+            execution_count = self._agent_execution_counts.get(executor_id, 1)
+            execution_guard_key = f"{executor_id}:{execution_count}"
+            if execution_guard_key in self._agent_stream_guarded_invocation_keys:
+                self._active_agent_ids.discard(executor_id)
+                return
             profile = self._get_agent_profile(executor_id)
             agent_name = profile.agent_name if profile else executor_id
 
@@ -1406,6 +1622,11 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             if response is None:
                 return
             agent_id = event.executor_id or "unknown"
+            execution_count = self._agent_execution_counts.get(agent_id, 1)
+            execution_guard_key = f"{agent_id}:{execution_count}"
+            if execution_guard_key in self._agent_stream_guarded_invocation_keys:
+                self._active_agent_ids.discard(agent_id)
+                return
             profile = self._get_agent_profile(agent_id)
             agent_name = profile.agent_name if profile else agent_id
             response_text = self._extract_response_text(response)
@@ -1414,8 +1635,6 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             started_at = self._agent_started_at.get(agent_id, datetime.now(timezone.utc))
             ended_at = datetime.now(timezone.utc)
             duration_ms = int((ended_at - started_at).total_seconds() * 1000)
-            execution_count = self._agent_execution_counts.get(agent_id, 1)
-
             self._active_agent_ids.discard(agent_id)
             self._agent_progress_pct[agent_id] = 100.0
 
@@ -1460,13 +1679,38 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             await self._emit_progress(f"agent_completed:{agent_id}")
             return
 
-        if isinstance(event, AgentRunUpdateEvent):
+        if isinstance(event, AgentRunUpdateEvent) or self._is_agent_update_event(event):
             executor_id = event.executor_id or self._last_executor_id or "unknown"
+            execution_count = self._agent_execution_counts.get(executor_id, 0)
+            execution_guard_key = f"{executor_id}:{execution_count}"
+
+            if execution_guard_key in self._agent_stream_guarded_invocation_keys:
+                self._active_agent_ids.discard(executor_id)
+                return
             profile = self._get_agent_profile(executor_id)
             agent_name = profile.agent_name if profile else executor_id
             next_progress = min(92.0, self._agent_progress_pct.get(executor_id, 5.0) + 8.0)
             self._agent_progress_pct[executor_id] = next_progress
             self._active_agent_ids.add(executor_id)
+            if self._is_deterministic_mode():
+                now = datetime.now(timezone.utc)
+                update_count = self._agent_stream_update_counts.get(executor_id, 0) + 1
+                self._agent_stream_update_counts[executor_id] = update_count
+                self._agent_stream_last_update_at[executor_id] = now
+
+                if update_count >= self._deterministic_stream_update_limit:
+                    logger.warning(
+                        "agent_stream_update_guard_triggered",
+                        run_id=self.run_id,
+                        agent_id=executor_id,
+                        updates=update_count,
+                        limit=self._deterministic_stream_update_limit,
+                    )
+                    await self._emit_synthetic_completion_if_stalled(
+                        agent_id=executor_id,
+                        reason="deterministic_stream_update_limit",
+                    )
+                    return
 
             await self.emit_event(
                 "agent.streaming",
