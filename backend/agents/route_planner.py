@@ -23,6 +23,11 @@ Data sources:
 
 Evaluate routes by: distance, weather exposure, connection reliability, available seats.
 Output: ranked route alternatives with weather assessment and connection details.
+
+When tools return empty results or status "no_data_fallback", use the `no_data_guidance`,
+`route_evaluation_criteria`, `connection_planning_factors`, and `weather_avoidance_guidelines`
+provided in the tool response together with the scenario context to produce a complete
+route analysis. Always deliver ranked route alternatives — never return empty findings.
 """
 
 

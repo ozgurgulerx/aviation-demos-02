@@ -5,7 +5,7 @@ from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
 from agents.tools import retriever_query
-from agents.tools.domain_knowledge import NETWORK_IMPACT_GUIDANCE
+from agents.tools.domain_knowledge import NETWORK_IMPACT_GUIDANCE, contextualize_network_fallback
 
 logger = structlog.get_logger()
 _retriever = None
@@ -47,6 +47,11 @@ async def simulate_delay_propagation(
         ),
         "propagation_model": NETWORK_IMPACT_GUIDANCE["propagation_model"],
         "cascade_rules": NETWORK_IMPACT_GUIDANCE["cascade_estimation_rules"],
+        "scenario_estimates": contextualize_network_fallback(
+            origin_airport=origin_airport,
+            delay_minutes=delay_minutes,
+            cascade_hops=cascade_hops,
+        ),
     }
 
 

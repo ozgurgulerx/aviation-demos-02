@@ -38,6 +38,12 @@ async def query_crew_availability(
             "and reserve crew procedures below to recommend crew sourcing strategies."
         ),
         "scheduling_sops": CREW_SCHEDULING_SOPS,
+        "scenario_estimates": {
+            "base_airport": base_airport,
+            "role_queried": role,
+            "reserve_response_time": CREW_SCHEDULING_SOPS["reserve_crew"]["airport_standby_response"],
+            "sourcing_priority": CREW_SCHEDULING_SOPS["pairing_guidelines"]["priority_order"],
+        },
     }
 
 

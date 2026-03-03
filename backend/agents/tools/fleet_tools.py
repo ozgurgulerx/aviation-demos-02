@@ -28,6 +28,8 @@ async def find_available_tails(
         if rows:
             return {"available_tails": rows[:10], "citations": [c.__dict__ for c in cits]}
     # Fallback: provide fleet availability estimation guidance
+    is_wide_body = aircraft_type.upper().startswith(("B77", "B78", "A33", "A35", "A38"))
+    spare_ratio = "3-5%" if is_wide_body else "5-8%"
     return {
         "aircraft_type": aircraft_type,
         "base": base_airport,
@@ -40,6 +42,15 @@ async def find_available_tails(
         ),
         "fleet_availability_estimation": FLEET_RECOVERY_GUIDANCE["fleet_availability_estimation"],
         "ground_time_minimums": FLEET_RECOVERY_GUIDANCE["ground_time_minimums"],
+        "scenario_estimates": {
+            "base_airport": base_airport,
+            "aircraft_type": aircraft_type,
+            "spare_ratio": spare_ratio,
+            "typical_turnaround": FLEET_RECOVERY_GUIDANCE["ground_time_minimums"].get(
+                "wide_body_domestic" if is_wide_body else "narrow_body_domestic",
+                "45-60 minutes",
+            ),
+        },
     }
 
 

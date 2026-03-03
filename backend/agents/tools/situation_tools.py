@@ -6,7 +6,7 @@ from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
 from agents.tools import retriever_query
-from agents.tools.domain_knowledge import DISRUPTION_FRAMEWORK
+from agents.tools.domain_knowledge import DISRUPTION_FRAMEWORK, contextualize_disruption_fallback
 
 logger = structlog.get_logger()
 
@@ -48,6 +48,9 @@ async def map_disruption_scope(
             "to estimate the scope of disruption."
         ),
         "disruption_framework": DISRUPTION_FRAMEWORK,
+        "scenario_estimates": contextualize_disruption_fallback(
+            airports=airports, time_window_hours=time_window_hours,
+        ),
     }
 
 

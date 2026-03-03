@@ -22,6 +22,11 @@ Data sources:
 
 Look for: repeat deferrals on same JASC code, trending failure rates, seasonal patterns.
 Output: risk assessment, recommended inspections, and supporting precedent data.
+
+When tools return empty results or status "no_data_fallback", use the `no_data_guidance`,
+`jasc_code_families`, `deferral_escalation_thresholds`, and `inspection_escalation_criteria`
+provided in the tool response together with the scenario context to produce a complete
+maintenance assessment. Always deliver a full risk analysis with recommendations — never return empty findings.
 """
 
 

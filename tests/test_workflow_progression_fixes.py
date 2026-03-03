@@ -667,6 +667,191 @@ async def test_reset_workflow_state_clears_handoff_snapshots():
 
 
 @pytest.mark.usefixtures("_set_aoai_endpoint")
+def test_problem_injected_into_specialist_instructions():
+    """create_coordinator_workflow with problem= injects scenario context into specialist instructions."""
+    problem = "Severe thunderstorm at ORD — 47 flights cancelled, 6800 passengers displaced."
+    workflow = create_coordinator_workflow(
+        scenario="hub_disruption",
+        active_agent_ids=[
+            "situation_assessment",
+            "fleet_recovery",
+            "crew_recovery",
+            "network_impact",
+            "weather_safety",
+            "passenger_impact",
+            "recovery_coordinator",
+        ],
+        problem=problem,
+    )
+
+    specialist_ids = {
+        "situation_assessment", "fleet_recovery", "crew_recovery",
+        "network_impact", "weather_safety", "passenger_impact",
+    }
+    for specialist_id in specialist_ids:
+        executor = workflow.executors[specialist_id]
+        agent = executor._agent
+        instructions = agent.default_options.get("instructions", "")
+        assert "thunderstorm at ORD" in instructions, (
+            f"{specialist_id} instructions missing problem context"
+        )
+        assert "Current Scenario" in instructions
+
+
+@pytest.mark.usefixtures("_set_aoai_endpoint")
+def test_coordinator_instructions_include_json_schema():
+    """LLM-directed coordinator instructions should include the JSON output schema."""
+    workflow = create_coordinator_workflow(
+        scenario="hub_disruption",
+        active_agent_ids=[
+            "situation_assessment",
+            "fleet_recovery",
+            "recovery_coordinator",
+        ],
+    )
+    coordinator_executor = workflow.executors["recovery_coordinator"]
+    instructions = coordinator_executor._agent.default_options.get("instructions", "")
+    assert "selectedOptionId" in instructions
+    assert "timeline" in instructions
+    assert "criteria" in instructions
+
+
+@pytest.mark.usefixtures("_set_aoai_endpoint")
+def test_problem_passed_through_create_workflow():
+    """create_workflow(problem=...) should propagate into specialist instructions."""
+    problem = "Ground stop at JFK due to low visibility — 30 flights held."
+    workflow = create_workflow(
+        workflow_type=WorkflowType.HANDOFF,
+        problem=problem,
+        orchestration_mode=OrchestrationMode.LLM_DIRECTED,
+    )
+    # Find any specialist executor and check for problem text
+    found = False
+    for eid, executor in workflow.executors.items():
+        agent = getattr(executor, "_agent", None)
+        if agent and "JFK" in (agent.default_options.get("instructions") or ""):
+            found = True
+            break
+    assert found, "Problem text not found in any specialist instructions"
+
+
+@pytest.mark.usefixtures("_set_aoai_endpoint")
+def test_coordinator_turn_limits_with_problem():
+    """Turn limits should remain correct even when problem is injected."""
+    workflow = create_coordinator_workflow(
+        scenario="hub_disruption",
+        active_agent_ids=[
+            "situation_assessment",
+            "fleet_recovery",
+            "crew_recovery",
+            "network_impact",
+            "weather_safety",
+            "passenger_impact",
+            "recovery_coordinator",
+        ],
+        problem="Test problem for turn limit validation.",
+    )
+    coordinator_executor = workflow.executors["recovery_coordinator"]
+    # 6 specialists + 6 = 12
+    assert getattr(coordinator_executor, "_autonomous_mode_turn_limit") == 12
+
+
+class TestScenarioAwareFallbacks:
+    """Tests for scenario-aware fallback helpers and their integration in tools."""
+
+    def test_disruption_fallback_basic(self):
+        from agents.tools.domain_knowledge import contextualize_disruption_fallback
+        result = contextualize_disruption_fallback(["ORD"], time_window_hours=6)
+        assert result["hub_airport"] == "ORD"
+        assert result["time_window_hours"] == 6
+        assert result["recovery_category"] == "minor"
+
+    def test_disruption_fallback_major(self):
+        from agents.tools.domain_knowledge import contextualize_disruption_fallback
+        result = contextualize_disruption_fallback(
+            ["ORD"], cancelled_flights=47, affected_pax=6800,
+        )
+        assert result["recovery_category"] == "major"
+        assert result["estimated_cascade_flights"] == round(47 * 1.8)
+        assert result["connecting_pax_at_risk"] == round(6800 * 0.50)
+
+    def test_network_fallback_basic(self):
+        from agents.tools.domain_knowledge import contextualize_network_fallback
+        result = contextualize_network_fallback("ORD", delay_minutes=90, cascade_hops=3)
+        assert result["origin_airport"] == "ORD"
+        assert result["reactionary_delay_minutes"] == 72
+        assert result["recovery_category"] == "moderate"
+
+    def test_network_fallback_major(self):
+        from agents.tools.domain_knowledge import contextualize_network_fallback
+        result = contextualize_network_fallback("ORD", delay_minutes=180, cascade_hops=2)
+        assert result["recovery_category"] == "major"
+
+    def test_passenger_fallback_basic(self):
+        from agents.tools.domain_knowledge import contextualize_passenger_fallback
+        result = contextualize_passenger_fallback("ORD", cancelled_flights=47)
+        assert result["hub_airport"] == "ORD"
+        assert result["displaced_pax"] == 47 * 150
+        assert result["rebooking_pressure"] == "extreme"
+
+    def test_passenger_fallback_low(self):
+        from agents.tools.domain_knowledge import contextualize_passenger_fallback
+        result = contextualize_passenger_fallback("SFO", cancelled_flights=2)
+        assert result["rebooking_pressure"] == "low"
+
+    @pytest.mark.asyncio
+    async def test_map_disruption_scope_returns_scenario_estimates(self):
+        from agents.tools.situation_tools import map_disruption_scope
+        result = await map_disruption_scope(["ORD"], time_window_hours=6)
+        assert result["status"] == "no_data_fallback"
+        assert "scenario_estimates" in result
+        assert result["scenario_estimates"]["hub_airport"] == "ORD"
+
+    @pytest.mark.asyncio
+    async def test_simulate_delay_propagation_returns_scenario_estimates(self):
+        from agents.tools.network_tools import simulate_delay_propagation
+        result = await simulate_delay_propagation("ORD", delay_minutes=120, cascade_hops=3)
+        assert result["status"] == "no_data_fallback"
+        assert "scenario_estimates" in result
+        assert result["scenario_estimates"]["origin_airport"] == "ORD"
+
+    @pytest.mark.asyncio
+    async def test_estimate_rebooking_load_returns_scenario_estimates(self):
+        from agents.tools.passenger_tools import estimate_rebooking_load
+        result = await estimate_rebooking_load("ORD", cancelled_flights=47)
+        assert result["status"] == "no_data_fallback"
+        assert "scenario_estimates" in result
+        assert result["scenario_estimates"]["hub_airport"] == "ORD"
+        assert result["scenario_estimates"]["displaced_pax"] == 47 * 150
+
+    @pytest.mark.asyncio
+    async def test_query_crew_availability_returns_scenario_estimates(self):
+        from agents.tools.crew_tools import query_crew_availability
+        result = await query_crew_availability("ORD", role="captain")
+        assert result["status"] == "no_data_fallback"
+        assert "scenario_estimates" in result
+        assert result["scenario_estimates"]["base_airport"] == "ORD"
+        assert result["scenario_estimates"]["role_queried"] == "captain"
+
+    @pytest.mark.asyncio
+    async def test_find_available_tails_returns_scenario_estimates(self):
+        from agents.tools.fleet_tools import find_available_tails
+        result = await find_available_tails("B737", "ORD")
+        assert result["status"] == "no_data_fallback"
+        assert "scenario_estimates" in result
+        assert result["scenario_estimates"]["base_airport"] == "ORD"
+        assert result["scenario_estimates"]["spare_ratio"] == "5-8%"
+
+    @pytest.mark.asyncio
+    async def test_check_sigmets_returns_scenario_estimates(self):
+        from agents.tools.weather_safety_tools import check_sigmets_pireps
+        result = await check_sigmets_pireps(["ORD", "MDW"])
+        assert result["status"] == "no_data_fallback"
+        assert "scenario_estimates" in result
+        assert result["scenario_estimates"]["airports_assessed"] == ["ORD", "MDW"]
+
+
+@pytest.mark.usefixtures("_set_aoai_endpoint")
 def test_specialist_turn_limits_are_four():
     """Specialist default turn limits should be 4 (not 2) to allow text generation before handoff."""
     workflow = create_coordinator_workflow(

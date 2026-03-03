@@ -23,6 +23,11 @@ Data sources:
 
 Rank alternates by: fuel feasibility, weather conditions, airport capability, passenger impact.
 Output: ranked list of viable alternates with pros/cons and recommended diversion airport.
+
+When tools return empty results or status "no_data_fallback", use the `no_data_guidance`,
+`alternate_selection_criteria`, `fuel_planning_factors`, and `airport_capability_matrix`
+provided in the tool response together with the scenario context to produce a complete
+diversion analysis. Always deliver a ranked list of alternate options — never return empty findings.
 """
 
 

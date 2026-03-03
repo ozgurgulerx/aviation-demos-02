@@ -309,3 +309,269 @@ PASSENGER_IMPACT_GUIDANCE = {
         "Tier 5: Passengers requiring partner airline or next-day rebooking",
     ],
 }
+
+# ── Maintenance Prediction Guidance ────────────────────────────────
+MAINTENANCE_PREDICTION_GUIDANCE = {
+    "jasc_code_families": {
+        "21xx": "Air conditioning / pressurization",
+        "27xx": "Flight controls",
+        "29xx": "Hydraulic power",
+        "32xx": "Landing gear",
+        "34xx": "Navigation",
+        "49xx": "Auxiliary power unit (APU)",
+        "52xx": "Doors",
+        "72xx": "Engine (turbine/turboprop)",
+        "73xx": "Engine fuel and control",
+        "76xx": "Engine controls",
+        "78xx": "Engine exhaust",
+        "80xx": "Starting",
+    },
+    "deferral_escalation_thresholds": {
+        "review": "2 repeat deferrals on same JASC code within 30 days — engineering review",
+        "escalate": "3 repeat deferrals on same JASC code within 30 days — escalate to fleet manager",
+        "ad_sb_review": "5+ fleet-wide occurrences on same JASC code — AD/SB compliance review",
+    },
+    "trend_analysis_framework": {
+        "rate_calculation": "Defect rate = events per 1000 flight hours (or per 100 cycles)",
+        "fleet_vs_tail": "Compare tail-specific rate against fleet average; >2x fleet avg = outlier",
+        "seasonal_adjustment": "Account for seasonal factors: icing (winter), heat (summer APU/pack loads)",
+        "rolling_window": "Use 30/60/90 day rolling windows to detect accelerating trends",
+    },
+    "inspection_escalation_criteria": [
+        "Borescope inspection: repeated engine (72xx/73xx) deferrals or performance degradation",
+        "NDT (non-destructive testing): structural (53xx/57xx) repeat items or hard-landing events",
+        "Detailed systems check: avionics (34xx) intermittent faults or multiple MEL deferrals",
+        "Enhanced lubrication/rigging: flight control (27xx) or landing gear (32xx) trending items",
+    ],
+    "regulatory_refs": {
+        "FAR 121.135": "Minimum equipment list (MEL) — operator must maintain and follow MEL",
+        "AC 120-16G": "Air carrier maintenance programs — continuous analysis and surveillance",
+        "AD_compliance": "Airworthiness Directives — mandatory when fleet-wide trend matches known AD condition",
+        "SB_review": "Service Bulletins — evaluate applicability when repeat deferrals align with SB scope",
+    },
+}
+
+# ── Scenario Contextualization Helpers ─────────────────────────
+# These functions take tool input parameters and produce scenario-specific
+# estimates using domain heuristics, so fallback responses are grounded in the
+# actual disruption details rather than generic benchmarks.
+
+
+def contextualize_disruption_fallback(
+    airports: list[str],
+    time_window_hours: int = 6,
+    cancelled_flights: int = 0,
+    affected_pax: int = 0,
+) -> dict:
+    """Compute scenario-specific disruption estimates from input parameters."""
+    hub = airports[0] if airports else "unknown"
+    cascade_flights = round(cancelled_flights * 1.8) if cancelled_flights else 0
+    connecting_pax_at_risk = round(affected_pax * 0.50) if affected_pax else 0
+    if cancelled_flights > 30:
+        recovery_category = "major"
+        recovery_hours = "12-24"
+    elif cancelled_flights > 10:
+        recovery_category = "moderate"
+        recovery_hours = "4-8"
+    else:
+        recovery_category = "minor"
+        recovery_hours = "2-4"
+    return {
+        "hub_airport": hub,
+        "airports_affected": airports,
+        "time_window_hours": time_window_hours,
+        "cancelled_flights": cancelled_flights,
+        "estimated_cascade_flights": cascade_flights,
+        "affected_pax": affected_pax,
+        "connecting_pax_at_risk": connecting_pax_at_risk,
+        "recovery_category": recovery_category,
+        "estimated_recovery_hours": recovery_hours,
+    }
+
+
+def contextualize_network_fallback(
+    origin_airport: str,
+    delay_minutes: int = 0,
+    cascade_hops: int = 3,
+) -> dict:
+    """Compute scenario-specific network propagation estimates."""
+    reactionary_delay = round(delay_minutes * 0.8)
+    flights_per_hop = 1.8
+    total_affected = round(flights_per_hop ** min(cascade_hops, 4))
+    if delay_minutes > 120:
+        recovery_category = "major"
+    elif delay_minutes > 60:
+        recovery_category = "moderate"
+    else:
+        recovery_category = "minor"
+    return {
+        "origin_airport": origin_airport,
+        "primary_delay_minutes": delay_minutes,
+        "reactionary_delay_minutes": reactionary_delay,
+        "cascade_hops": cascade_hops,
+        "estimated_affected_flights": total_affected,
+        "recovery_category": recovery_category,
+    }
+
+
+def contextualize_passenger_fallback(
+    hub_airport: str,
+    cancelled_flights: int = 0,
+    avg_pax_per_flight: int = 150,
+) -> dict:
+    """Compute scenario-specific passenger impact estimates."""
+    displaced_pax = cancelled_flights * avg_pax_per_flight
+    critical_connections = round(displaced_pax * 0.50)
+    if displaced_pax > 5000:
+        rebooking_pressure = "extreme"
+    elif displaced_pax > 2000:
+        rebooking_pressure = "high"
+    elif displaced_pax > 500:
+        rebooking_pressure = "moderate"
+    else:
+        rebooking_pressure = "low"
+    return {
+        "hub_airport": hub_airport,
+        "cancelled_flights": cancelled_flights,
+        "displaced_pax": displaced_pax,
+        "critical_connections": critical_connections,
+        "rebooking_pressure": rebooking_pressure,
+    }
+
+
+# ── Diversion Guidance ─────────────────────────────────────────
+DIVERSION_GUIDANCE = {
+    "alternate_selection_criteria": {
+        "fuel_range": "Must be reachable with current fuel minus 45-minute reserve (FAR 91.167)",
+        "runway_length": "Minimum runway length must accommodate aircraft type at landing weight",
+        "weather_minimums": "Ceiling/visibility must meet approach minimums for available approaches",
+        "ground_services": "Adequate ground handling, passenger services, and fuel availability",
+        "arff_category": "Airport Rescue & Firefighting index must match aircraft category",
+        "customs_hours": "For international flights: customs/immigration must be available or arrangeable",
+    },
+    "fuel_planning_factors": {
+        "far_91_167_reserve": "45-minute fuel reserve at normal cruising speed (domestic IFR)",
+        "far_121_619_domestic": "Fuel to destination + fly to alternate + 45 minutes at normal cruise",
+        "far_121_621_flag": "Fuel to destination + alternate + 10% of trip fuel or 90 minutes (whichever less)",
+        "typical_burn_rates": {
+            "regional_jet": "2,500-3,500 lbs/hour",
+            "narrow_body": "5,000-6,500 lbs/hour",
+            "wide_body": "12,000-18,000 lbs/hour",
+        },
+        "descent_fuel_estimate": "Approximately 2-3% of hourly burn rate for descent and approach",
+    },
+    "airport_capability_matrix": {
+        "regional_jet_minimums": {
+            "min_runway_ft": 5000,
+            "arff_index": "A or B",
+            "ground_equipment": "Basic ground power, air stairs acceptable",
+        },
+        "narrow_body_minimums": {
+            "min_runway_ft": 6000,
+            "arff_index": "C or D",
+            "ground_equipment": "Jetbridge preferred, ground power, fuel truck",
+        },
+        "wide_body_minimums": {
+            "min_runway_ft": 8000,
+            "arff_index": "D or E",
+            "ground_equipment": "Dual jetbridge, heavy ground power, fuel hydrant or large trucks",
+        },
+    },
+    "common_considerations": [
+        "ETOPS alternates: must meet ETOPS-specific weather and capability requirements",
+        "Medical diversions: nearest suitable airport with medical facilities",
+        "Hotel availability: for extended ground stops, pax accommodation is a factor",
+        "Maintenance capability: if diversion is mechanical, MRO presence is valuable",
+        "Airline station presence: staffed stations simplify passenger handling",
+    ],
+    "regulatory_refs": {
+        "FAR 91.167": "Fuel requirements for IFR flights — 45-minute reserve",
+        "FAR 121.619": "Domestic operations fuel requirements",
+        "FAR 121.621": "Flag operations fuel requirements",
+        "FAR 139.315": "ARFF index requirements by aircraft length",
+    },
+}
+
+# ── Route Planning Guidance ────────────────────────────────────
+ROUTE_PLANNING_GUIDANCE = {
+    "route_evaluation_criteria": {
+        "distance": "Shorter routes save fuel and reduce crew duty time",
+        "weather_exposure": "Minimize time through known convective areas or jet stream turbulence",
+        "congestion": "Avoid saturated arrival flows; check for ground delay programs (GDP) or ground stops (GS)",
+        "fuel_burn": "Consider wind component — tailwinds can offset longer routing",
+        "connection_reliability": "Prefer connections with buffer > 1.5× MCT to absorb delays",
+    },
+    "connection_planning_factors": {
+        "mct_by_hub_type": {
+            "large_hub_domestic": "45-60 minutes",
+            "large_hub_international": "90-120 minutes",
+            "medium_hub_domestic": "30-45 minutes",
+            "small_airport": "20-30 minutes (if available)",
+        },
+        "buffer_recommendation": "Plan connections with at least 1.5× MCT for disruption resilience",
+        "reprotection_options": "Identify at least 2 backup flights on each connecting segment",
+    },
+    "weather_avoidance_guidelines": {
+        "cumulonimbus_deviation": "Deviate at least 20 nm laterally from CB cells",
+        "squall_line_deviation": "Route around ends of squall lines; do not attempt to fly between gaps",
+        "turbulence_lateral_separation": "5-10 nm lateral offset for moderate turbulence areas",
+        "icing_altitude_change": "Climb above freezing level or descend below icing layer if able",
+        "volcanic_ash": "Avoid by at least 20 nm laterally and 3,000 ft vertically from reported plume",
+    },
+    "typical_route_metrics": {
+        "domestic_short_haul": {"distance_nm": "200-600", "block_time": "1-2 hours", "fuel_factor": "Low"},
+        "domestic_medium_haul": {"distance_nm": "600-1500", "block_time": "2-4 hours", "fuel_factor": "Medium"},
+        "domestic_long_haul": {"distance_nm": "1500-2500", "block_time": "4-6 hours", "fuel_factor": "High"},
+        "transcon": {"distance_nm": "2000-2500", "block_time": "5-6 hours", "fuel_factor": "High"},
+    },
+}
+
+# ── Real-Time Monitoring Guidance ──────────────────────────────
+REAL_TIME_MONITORING_GUIDANCE = {
+    "adsb_interpretation": {
+        "altitude": "FL (flight level) in hundreds of feet; e.g., FL350 = 35,000 ft",
+        "groundspeed": "Speed over ground in knots; differs from airspeed by wind component",
+        "heading": "Magnetic track in degrees; 360° = North, 090° = East",
+        "vertical_rate": "Feet per minute; positive = climbing, negative = descending",
+        "squawk_codes": {
+            "7500": "Hijack",
+            "7600": "Communications failure",
+            "7700": "Emergency",
+            "1200": "VFR (visual flight rules)",
+        },
+        "position_update_rate": "Typically every 1-15 seconds depending on ADS-B coverage",
+    },
+    "notam_priority_framework": {
+        "critical": [
+            "Runway closures affecting primary runway",
+            "ILS/approach system outages at destination",
+            "Airport closures or restricted operations",
+        ],
+        "high": [
+            "Taxiway closures affecting flow",
+            "Navigation aid outages (VOR, DME)",
+            "Temporary flight restrictions (TFR) in approach path",
+        ],
+        "moderate": [
+            "Secondary runway closures",
+            "Lighting system partial outages",
+            "Construction activity near movement areas",
+        ],
+        "advisory": [
+            "Crane activity outside approach paths",
+            "Bird/wildlife activity reports",
+            "Facility hours changes (FBO, customs)",
+        ],
+    },
+    "situational_awareness_template": {
+        "current_positions": "Identify aircraft phase of flight (climb, cruise, descent, approach, ground)",
+        "trend_analysis": "Compare current position/altitude to expected flight plan progress",
+        "anomaly_detection": "Flag unexpected altitude changes, holding patterns, or route deviations",
+        "time_estimates": "Estimate arrival times based on distance remaining and groundspeed",
+    },
+    "typical_flight_parameters": {
+        "regional_jet": {"cruise_altitude_ft": "25000-35000", "cruise_speed_kts": "400-450", "descent_rate_fpm": "1500-2500"},
+        "narrow_body": {"cruise_altitude_ft": "33000-39000", "cruise_speed_kts": "450-490", "descent_rate_fpm": "1800-2500"},
+        "wide_body": {"cruise_altitude_ft": "35000-43000", "cruise_speed_kts": "480-520", "descent_rate_fpm": "1500-2000"},
+    },
+}

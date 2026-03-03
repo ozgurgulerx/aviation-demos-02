@@ -107,6 +107,7 @@ def create_coordinator_workflow(
     coordinator_id: Optional[str] = None,
     autonomous_turn_limits: Optional[Dict[str, int]] = None,
     name: Optional[str] = None,
+    problem: str = "",
 ) -> Workflow:
     """
     Create an LLM-driven handoff workflow.
@@ -169,7 +170,27 @@ After all specialists have reported back:
 2. Score 3-5 recovery options using score_recovery_option
 3. Rank them using rank_options
 4. Generate implementation plan using generate_plan
-5. Output your FINAL recommendation and timeline
+5. End with a JSON block that follows this schema exactly:
+{{{{
+  "criteria": ["delay_reduction", "crew_margin", "safety_score", "cost_impact", "passenger_impact"],
+  "options": [
+    {{{{
+      "optionId": "opt-1",
+      "description": "short description",
+      "rank": 1,
+      "scores": {{{{
+        "delay_reduction": 0,
+        "crew_margin": 0,
+        "safety_score": 0,
+        "cost_impact": 0,
+        "passenger_impact": 0
+      }}}}
+    }}}}
+  ],
+  "selectedOptionId": "opt-1",
+  "summary": "brief recommendation summary",
+  "timeline": [{{{{"time": "T+0", "action": "action text", "agent": "agent_id"}}}}]
+}}}}
 
 You are DONE after Phase 2. Do not delegate again.
 
@@ -182,6 +203,15 @@ State clearly which recommendations are data-backed vs. SOP-based.
 Start now by calling the first handoff tool.
 """
     coordinator.default_options["instructions"] = coordinator_instructions
+    scenario_context = ""
+    if problem:
+        scenario_context = (
+            f"\n## Current Scenario\n{problem}\n\n"
+            "Use these specific details (airports, flight counts, passenger numbers, "
+            "aircraft grounded) when calling your tools and in your analysis. "
+            "Tailor everything to this scenario — do not produce generic assessments.\n\n"
+        )
+
     coordinator_ref = coordinator.name or coordinator.id
     for specialist in specialists:
         specialist_base = specialist.default_options.get("instructions") or ""
@@ -198,7 +228,7 @@ Start now by calling the first handoff tool.
             "Do not hand off to any other specialist.\n\n"
         )
         specialist.default_options["instructions"] = (
-            f"{handoff_protocol}{specialist_base}"
+            f"{handoff_protocol}{scenario_context}{specialist_base}"
         )
 
     # Build handoff workflow
@@ -465,6 +495,7 @@ def create_workflow(
                 coordinator_id=coordinator_id,
                 autonomous_turn_limits=autonomous_turn_limits,
                 name=name or f"handoff_{scenario}",
+                problem=problem,
             )
         if mode == OrchestrationMode.DETERMINISTIC:
             return create_deterministic_coordinator_workflow(

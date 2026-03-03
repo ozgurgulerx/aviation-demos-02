@@ -41,6 +41,11 @@ async def check_sigmets_pireps(
             "pirep_severity_scales": WEATHER_SAFETY_GUIDANCE["pirep_severity_scales"],
         },
         "severity_levels": WEATHER_SAFETY_GUIDANCE["severity_levels"],
+        "scenario_estimates": {
+            "airports_assessed": airports,
+            "window_hours": window_hours,
+            "operational_impact_matrix": WEATHER_SAFETY_GUIDANCE["operational_impact_matrix"],
+        },
     }
 
 

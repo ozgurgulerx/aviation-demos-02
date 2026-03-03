@@ -8,12 +8,16 @@ from agents.tools import RETRIEVER_MODULES
 from agents.tools import (
     crew_tools,
     fatigue_tools,
+    maintenance_tools,
     regulatory_tools,
     diversion_tools,
     fleet_tools,
     network_tools,
     weather_safety_tools,
     passenger_tools,
+    monitor_tools,
+    route_tools,
+    situation_tools,
 )
 
 # ---------- Retriever wiring ----------
@@ -105,6 +109,22 @@ FALLBACK_CASES = [
     # passenger_tools
     (passenger_tools, "assess_connection_risks", {"flight_ids": ["AA100", "AA200"]}),
     (passenger_tools, "estimate_rebooking_load", {"airport": "ORD", "cancelled_flights": 5}),
+    # maintenance_tools
+    (maintenance_tools, "analyze_mel_trends", {"aircraft_type": "B737"}),
+    (maintenance_tools, "search_similar_incidents", {"description": "recurring hydraulic leak"}),
+    # diversion_tools
+    (diversion_tools, "evaluate_alternates", {"current_position": "KORD", "aircraft_type": "B737"}),
+    (diversion_tools, "check_airport_capability", {"airport": "DTW", "aircraft_type": "B737"}),
+    # route_tools
+    (route_tools, "find_route_alternatives", {"origin": "ORD", "destination": "LAX"}),
+    (route_tools, "check_route_weather", {"route": "ORD-LAX"}),
+    # monitor_tools
+    (monitor_tools, "get_live_positions", {"airports": ["ORD"]}),
+    (monitor_tools, "check_active_notams", {"airports": ["ORD"]}),
+    # situation_tools
+    (situation_tools, "map_disruption_scope", {"airports": ["ORD"]}),
+    (situation_tools, "query_flight_schedule", {"airports": ["ORD"]}),
+    (situation_tools, "get_live_positions", {"airports": ["ORD"]}),
 ]
 
 

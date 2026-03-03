@@ -5,6 +5,7 @@ from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
 from agents.tools import retriever_query
+from agents.tools.domain_knowledge import MAINTENANCE_PREDICTION_GUIDANCE
 
 logger = structlog.get_logger()
 _retriever = None
@@ -23,8 +24,23 @@ async def analyze_mel_trends(
     if _retriever:
         query = f"MEL techlog events for {aircraft_type} fleet" + (f" JASC {jasc_code}" if jasc_code else "")
         rows, cits = await retriever_query(_retriever.query_sql(query))
-        return {"mel_events": rows[:20], "trend_count": len(rows), "citations": [c.__dict__ for c in cits]}
-    return {"aircraft_type": aircraft_type, "jasc_code": jasc_code, "mel_events": [], "status": "mock"}
+        if rows:
+            return {"mel_events": rows[:20], "trend_count": len(rows), "citations": [c.__dict__ for c in cits]}
+    # Fallback: provide JASC code families and trend analysis guidance
+    return {
+        "aircraft_type": aircraft_type,
+        "jasc_code": jasc_code,
+        "mel_events": [],
+        "status": "no_data_fallback",
+        "no_data_guidance": (
+            f"No MEL/techlog data found for {aircraft_type} fleet in the database. "
+            "Use the JASC code families, deferral escalation thresholds, and trend analysis "
+            "framework below to produce a predictive maintenance assessment from scenario context."
+        ),
+        "jasc_code_families": MAINTENANCE_PREDICTION_GUIDANCE["jasc_code_families"],
+        "deferral_escalation_thresholds": MAINTENANCE_PREDICTION_GUIDANCE["deferral_escalation_thresholds"],
+        "trend_analysis_framework": MAINTENANCE_PREDICTION_GUIDANCE["trend_analysis_framework"],
+    }
 
 
 @ai_function(approval_mode="never_require")
@@ -35,5 +51,17 @@ async def search_similar_incidents(
     """Search ASRS reports for similar maintenance-related incidents."""
     if _retriever:
         rows, cits = await retriever_query(_retriever.query_semantic(description, top=top, source="VECTOR_OPS"))
-        return {"similar_incidents": rows[:top], "citations": [c.__dict__ for c in cits]}
-    return {"query": description[:80], "similar_incidents": [], "status": "mock"}
+        if rows:
+            return {"similar_incidents": rows[:top], "citations": [c.__dict__ for c in cits]}
+    # Fallback: provide inspection escalation criteria and regulatory refs
+    return {
+        "query": description[:80],
+        "similar_incidents": [],
+        "status": "no_data_fallback",
+        "no_data_guidance": (
+            "No similar ASRS incidents found. Use the inspection escalation criteria "
+            "and regulatory references below to guide maintenance recommendations."
+        ),
+        "inspection_escalation_criteria": MAINTENANCE_PREDICTION_GUIDANCE["inspection_escalation_criteria"],
+        "regulatory_refs": MAINTENANCE_PREDICTION_GUIDANCE["regulatory_refs"],
+    }

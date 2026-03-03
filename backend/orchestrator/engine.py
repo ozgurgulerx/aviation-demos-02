@@ -1601,7 +1601,21 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                     upd_agent_id = event.executor_id or self._last_executor_id or "unknown"
                     upd_data = event.data
                     if upd_data is not None:
-                        chunk = getattr(upd_data, "text", None) or (upd_data if isinstance(upd_data, str) else "")
+                        chunk = getattr(upd_data, "text", None) or ""
+                        if not chunk:
+                            if hasattr(upd_data, "contents"):
+                                parts = []
+                                for c in (upd_data.contents or []):
+                                    ctype = getattr(c, "type", None)
+                                    if ctype == "text":
+                                        parts.append(getattr(c, "text", ""))
+                                    elif ctype == "function_result":
+                                        result_text = getattr(c, "result", None) or getattr(c, "text", None) or ""
+                                        if isinstance(result_text, str) and result_text.strip():
+                                            parts.append(result_text.strip())
+                                chunk = " ".join(p for p in parts if p)
+                            elif isinstance(upd_data, str):
+                                chunk = upd_data
                         if chunk:
                             self._streaming_text_accum.setdefault(upd_agent_id, []).append(chunk)
         except _LoopCappedSignal:
@@ -1687,8 +1701,18 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         }
 
     async def _process_workflow_event(self, event: WorkflowEvent):
+        # Log every event type flowing through (debug level to avoid noise)
+        evt_cls = type(event).__name__
+        executor_id_log = getattr(event, "executor_id", None)
+        logger.debug(
+            "workflow_event_received",
+            run_id=self.run_id,
+            event_class=evt_cls,
+            executor_id=executor_id_log or "n/a",
+        )
+
         event_data = {
-            "event_class": type(event).__name__,
+            "event_class": evt_cls,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -2075,16 +2099,30 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             if upd_data is not None:
                 chunk = getattr(upd_data, "text", None) or ""
                 if not chunk and hasattr(upd_data, "contents"):
-                    # Fallback: extract text from Content objects directly
-                    chunk = "".join(
-                        getattr(c, "text", "") for c in (upd_data.contents or [])
-                        if getattr(c, "type", None) == "text"
-                    )
+                    # Extract text AND function_result content (tool output)
+                    parts = []
+                    for c in (upd_data.contents or []):
+                        ctype = getattr(c, "type", None)
+                        if ctype == "text":
+                            parts.append(getattr(c, "text", ""))
+                        elif ctype == "function_result":
+                            # Tool output — contains the specialist's actual data
+                            result_text = getattr(c, "result", None) or getattr(c, "text", None) or ""
+                            if isinstance(result_text, str) and result_text.strip():
+                                parts.append(result_text.strip())
+                    chunk = " ".join(p for p in parts if p)
                 if chunk:
                     self._streaming_text_accum.setdefault(executor_id, []).append(chunk)
-                    # Log periodically (every 10th chunk) to avoid noise
                     chunks_so_far = len(self._streaming_text_accum.get(executor_id, []))
-                    if chunks_so_far % 10 == 1:
+                    if chunks_so_far == 1:
+                        logger.info(
+                            "streaming_text_first_chunk",
+                            run_id=self.run_id,
+                            executor_id=executor_id,
+                            chunk_len=len(chunk),
+                            chunk_preview=chunk[:100],
+                        )
+                    elif chunks_so_far % 10 == 0:
                         logger.debug(
                             "streaming_text_accumulated",
                             run_id=self.run_id,
@@ -2127,6 +2165,13 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                         source=source_id,
                         target=target_id,
                         snapshot_len=len(self._handoff_specialist_snapshots[source_id]),
+                    )
+                else:
+                    logger.warning(
+                        "handoff_specialist_snapshot_empty",
+                        run_id=self.run_id,
+                        source=source_id,
+                        target=target_id,
                     )
             if self.trace_emitter:
                 await self.trace_emitter.emit_handover(

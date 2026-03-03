@@ -22,6 +22,11 @@ Data sources:
 
 Provide: current aircraft positions, active restrictions, and real-time operational status.
 Focus on information relevant to the current decision context.
+
+When tools return empty results or status "no_data_fallback", use the `no_data_guidance`,
+`adsb_interpretation`, `typical_flight_parameters`, and `notam_priority_framework` provided
+in the tool response together with the scenario context to produce a complete situational
+awareness summary. Always deliver a substantive monitoring report — never return empty findings.
 """
 
 

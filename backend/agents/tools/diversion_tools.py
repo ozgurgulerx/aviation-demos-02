@@ -6,6 +6,7 @@ from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
 from agents.tools import retriever_query
+from agents.tools.domain_knowledge import DIVERSION_GUIDANCE
 
 logger = structlog.get_logger()
 _retriever = None
@@ -35,7 +36,19 @@ async def evaluate_alternates(
             "active_notams": notam_rows[:10],
             "citations": [c.__dict__ for c in sql_cits + kql_cits + notam_cits],
         }
-    return {"position": current_position, "alternates": [], "status": "mock"}
+    return {
+        "position": current_position,
+        "alternates": [],
+        "status": "no_data_fallback",
+        "no_data_guidance": (
+            f"No alternate airport data retrieved for position {current_position}. Use the "
+            "alternate selection criteria, fuel planning factors, and airport capability matrix "
+            "below together with the scenario context to evaluate diversion options."
+        ),
+        "alternate_selection_criteria": DIVERSION_GUIDANCE["alternate_selection_criteria"],
+        "fuel_planning_factors": DIVERSION_GUIDANCE["fuel_planning_factors"],
+        "airport_capability_matrix": DIVERSION_GUIDANCE["airport_capability_matrix"],
+    }
 
 
 @ai_function(approval_mode="never_require")
@@ -48,4 +61,15 @@ async def check_airport_capability(
         query = f"airport {airport} capability for {aircraft_type} runway length services"
         rows, cits = await retriever_query(_retriever.query_semantic(query, source="VECTOR_AIRPORT"))
         return {"capability": rows[:5], "citations": [c.__dict__ for c in cits]}
-    return {"airport": airport, "aircraft": aircraft_type, "suitable": "unknown", "status": "mock"}
+    return {
+        "airport": airport,
+        "aircraft": aircraft_type,
+        "suitable": "unknown",
+        "status": "no_data_fallback",
+        "no_data_guidance": (
+            f"No capability data retrieved for {airport}. Use the airport capability matrix "
+            "and regulatory references below to assess suitability for the aircraft type."
+        ),
+        "airport_capability_matrix": DIVERSION_GUIDANCE["airport_capability_matrix"],
+        "regulatory_refs": DIVERSION_GUIDANCE["regulatory_refs"],
+    }

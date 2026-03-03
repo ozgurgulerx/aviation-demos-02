@@ -6,7 +6,7 @@ from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
 from agents.tools import retriever_query
-from agents.tools.domain_knowledge import PASSENGER_IMPACT_GUIDANCE
+from agents.tools.domain_knowledge import PASSENGER_IMPACT_GUIDANCE, contextualize_passenger_fallback
 
 logger = structlog.get_logger()
 _retriever = None
@@ -89,4 +89,7 @@ async def estimate_rebooking_load(
         "rebooking_benchmarks": PASSENGER_IMPACT_GUIDANCE["rebooking_capacity_benchmarks"],
         "passenger_rights": PASSENGER_IMPACT_GUIDANCE["passenger_rights"],
         "prioritization_tiers": PASSENGER_IMPACT_GUIDANCE["prioritization_tiers"],
+        "scenario_estimates": contextualize_passenger_fallback(
+            hub_airport=airport, cancelled_flights=cancelled_flights,
+        ),
     }
