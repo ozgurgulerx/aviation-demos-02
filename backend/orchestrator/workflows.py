@@ -172,6 +172,8 @@ Call each specialist handoff tool EXACTLY ONCE, in order:
 
 IMPORTANT: Do NOT call the same specialist twice. Once you have heard back from
 ALL {len(specialists)} specialists, move to Phase 2.
+IMPORTANT: Never output `{{"handoff_to":"..."}}` (or any handoff JSON) as plain text.
+To delegate, you must invoke the `handoff_to_<agent>` tool directly.
 
 ## Phase 2 — Synthesize
 After all specialists have reported back:

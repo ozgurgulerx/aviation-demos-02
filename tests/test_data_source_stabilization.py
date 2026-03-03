@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from agents.tools import retriever_query, retriever_query_multi, source_errors_from_citations
+from agents.tools.coordinator_tools import generate_plan, rank_options
 from data_sources.unified_retriever import AsyncUnifiedRetriever, _is_safe_read_only_sql
 from orchestrator.agent_registry import AgentSelectionResult
 from orchestrator.engine import OrchestratorEngine
@@ -228,3 +229,41 @@ def test_readiness_data_source_checks_include_all_sources(monkeypatch):
     }
     assert set(checks.keys()) == expected
     assert checks["SQL"]["reachable"] is False
+
+
+def test_normalize_workflow_event_payload_handles_non_dict():
+    payload = backend_main._normalize_workflow_event_payload(["unexpected", "payload"])
+    assert payload["payload_type"] == "list"
+    assert payload["message"] == "['unexpected', 'payload']"
+    assert payload["raw_payload_preview"] == "['unexpected', 'payload']"
+
+
+@pytest.mark.asyncio
+async def test_rank_options_handles_nested_invalid_shape():
+    ranked = await rank_options([[{"optionId": "opt-2", "overall_score": 73}], "bad", {"optionId": "opt-1", "overall_score": 91}])
+    assert ranked["top_option"]["optionId"] == "opt-1"
+    assert len(ranked["ranked_options"]) == 2
+    assert ranked["ranked_options"][0]["rank"] == 1
+    assert ranked["ranked_options"][1]["rank"] == 2
+
+
+@pytest.mark.asyncio
+async def test_rank_options_returns_structured_error_for_empty_shape():
+    ranked = await rank_options([["bad"], ["still_bad"]])
+    assert ranked["ranked_options"] == []
+    assert ranked["status"] == "invalid_options_shape"
+    assert ranked["errorCode"] == "coordinator_options_invalid_shape"
+
+
+@pytest.mark.asyncio
+async def test_generate_plan_accepts_list_wrapped_selected_option():
+    result = await generate_plan([{"optionId": "opt-1", "description": "Use reserve tail"}])
+    assert result["status"] == "plan_generated"
+    assert result["selected_option"]["optionId"] == "opt-1"
+
+
+@pytest.mark.asyncio
+async def test_generate_plan_returns_structured_error_for_invalid_shape():
+    result = await generate_plan(["bad", ["still_bad"]], timeline_entries=[{"time": "T+0", "action": "noop", "agent": "coordinator"}])
+    assert result["status"] == "invalid_selected_option_shape"
+    assert result["errorCode"] == "coordinator_options_invalid_shape"

@@ -112,6 +112,19 @@ def _build_data_source_checks(postgres_ready: bool) -> Dict[str, Dict[str, Any]]
     }
 
 
+def _normalize_workflow_event_payload(payload: Any) -> Dict[str, Any]:
+    if isinstance(payload, dict):
+        return payload
+    if payload is None:
+        return {}
+    payload_preview = " ".join(str(payload).split())[:300]
+    return {
+        "message": payload_preview,
+        "raw_payload_preview": payload_preview,
+        "payload_type": type(payload).__name__,
+    }
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan - initialize and cleanup resources."""
@@ -664,7 +677,8 @@ async def execute_workflow(
             return EventKind.PROGRESS_UPDATE
 
         # Create event emitter callback
-        async def emit_event(event_type: str, payload: dict):
+        async def emit_event(event_type: str, payload: Any):
+            payload = _normalize_workflow_event_payload(payload)
             event_kind = resolve_event_kind(event_type)
             event_level = EventLevel.ERROR if event_kind == EventKind.RUN_FAILED else EventLevel.INFO
             message = (

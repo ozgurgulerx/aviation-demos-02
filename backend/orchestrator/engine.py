@@ -68,6 +68,12 @@ class _LoopCappedSignal(Exception):
     pass
 
 
+RUNTIME_FAILURE_REASON_CODES = {
+    "coordinator_no_specialist_handoff",
+    "coordinator_options_invalid_shape",
+}
+
+
 class OrchestratorDecision(BaseModel):
     decision_id: str = Field(default_factory=lambda: f"dec-{uuid.uuid4().hex[:8]}")
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -155,6 +161,7 @@ class OrchestratorEngine:
         self._handoff_specialist_snapshots: Dict[str, str] = {}
         self._latest_coordinator_artifacts: Dict[str, Any] = {}
         self._latest_coordinator_response_text: str = ""
+        self._coordinator_control_output_detected: bool = False
 
         if enable_checkpointing:
             self.checkpoint_storage = InMemoryCheckpointStorage()
@@ -198,12 +205,26 @@ class OrchestratorEngine:
         """Compatibility helper for framework versions with renamed update event classes."""
         return isinstance(event, AgentRunUpdateEvent) or type(event).__name__ == "AgentRunUpdateEvent"
 
-    async def emit_event(self, event_type: str, payload: Dict[str, Any]):
+    @staticmethod
+    def _normalize_event_payload(payload: Any) -> Dict[str, Any]:
+        if isinstance(payload, dict):
+            return payload
+        if payload is None:
+            return {}
+        payload_preview = re.sub(r"\s+", " ", str(payload)).strip()[:300]
+        return {
+            "message": payload_preview,
+            "raw_payload_preview": payload_preview,
+            "payload_type": type(payload).__name__,
+        }
+
+    async def emit_event(self, event_type: str, payload: Any):
         if self.event_emitter:
-            actor = payload.get("actor")
+            payload_dict = self._normalize_event_payload(payload)
+            actor = payload_dict.get("actor")
             if not isinstance(actor, dict):
-                agent_id = payload.get("agentId") or payload.get("agent_id") or payload.get("executor_id")
-                agent_name = payload.get("agentName") or payload.get("agent_name") or payload.get("executor_name")
+                agent_id = payload_dict.get("agentId") or payload_dict.get("agent_id") or payload_dict.get("executor_id")
+                agent_name = payload_dict.get("agentName") or payload_dict.get("agent_name") or payload_dict.get("executor_name")
                 if agent_id:
                     actor = {"kind": "agent", "id": agent_id, "name": agent_name or agent_id}
                 else:
@@ -212,7 +233,7 @@ class OrchestratorEngine:
                 "run_id": self.run_id,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "actor": actor,
-                **payload,
+                **payload_dict,
             }
             await self.event_emitter(event_type=event_type, payload=full_payload)
 
@@ -814,6 +835,83 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         return candidate[:1000]
 
     @staticmethod
+    def _is_control_handoff_payload(payload: Dict[str, Any]) -> bool:
+        if not isinstance(payload, dict) or not payload:
+            return False
+        payload_keys = {str(k).strip() for k in payload.keys()}
+        control_keys = {
+            "handoff_to",
+            "handoffTo",
+            "delegate_to",
+            "delegateTo",
+            "target_agent",
+            "targetAgent",
+        }
+        synthesis_keys = {
+            "criteria",
+            "options",
+            "timeline",
+            "selectedOptionId",
+            "summary",
+            "finalAnswer",
+            "answer",
+            "recommendation",
+        }
+        has_control = len(payload_keys & control_keys) > 0
+        has_synthesis = len(payload_keys & synthesis_keys) > 0
+        return has_control and not has_synthesis
+
+    def _has_specialist_participation(self, agent_responses: List[Dict[str, Any]]) -> bool:
+        specialist_ids = {
+            agent.agent_id
+            for agent in self.selected_agents
+            if agent.category != "coordinator"
+        }
+        if not specialist_ids:
+            return False
+
+        executed_specialists = {
+            agent_id
+            for agent_id, count in self._agent_execution_counts.items()
+            if count > 0 and agent_id in specialist_ids
+        }
+        if executed_specialists:
+            return True
+
+        for response in agent_responses:
+            if not isinstance(response, dict):
+                continue
+            if str(response.get("agent") or "") in specialist_ids:
+                return True
+        return False
+
+    def _should_fail_coordinator_no_specialist_handoff(
+        self,
+        artifacts: Dict[str, Any],
+        agent_responses: List[Dict[str, Any]],
+    ) -> bool:
+        if not self._is_bounded_orchestration_mode():
+            return False
+        specialist_ids = {
+            agent.agent_id
+            for agent in self.selected_agents
+            if agent.category != "coordinator"
+        }
+        if not specialist_ids:
+            return False
+
+        coordinator_id = self._coordinator_agent_id or ""
+        coordinator_execution_count = self._agent_execution_counts.get(coordinator_id, 0)
+        if coordinator_execution_count <= 0:
+            return False
+
+        has_coordinator_output = bool(artifacts) or bool(self._latest_coordinator_response_text.strip())
+        if not has_coordinator_output:
+            return False
+
+        return not self._has_specialist_participation(agent_responses)
+
+    @staticmethod
     def _choose_selected_option(artifacts: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         options = artifacts.get("options")
         if not isinstance(options, list) or not options:
@@ -999,6 +1097,18 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         if not isinstance(parsed_json, dict):
             return self._parse_heuristic_artifacts(response_text)
 
+        if self._is_control_handoff_payload(parsed_json):
+            return {
+                "criteria": DEFAULT_RECOVERY_CRITERIA.copy(),
+                "options": [],
+                "timeline": [],
+                "selectedOptionId": "",
+                "summary": "",
+                "finalAnswer": "",
+                "controlOnly": True,
+                "controlPayload": parsed_json,
+            }
+
         criteria_raw = parsed_json.get("criteria")
         criteria = [str(item) for item in criteria_raw if isinstance(item, str)] if isinstance(criteria_raw, list) else []
         criteria = criteria or DEFAULT_RECOVERY_CRITERIA.copy()
@@ -1087,6 +1197,20 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
 
         self._latest_coordinator_artifacts = artifacts
         self._latest_coordinator_response_text = response_text
+        self._coordinator_control_output_detected = bool(artifacts.get("controlOnly"))
+
+        if self._coordinator_control_output_detected:
+            await self.emit_event(
+                "workflow.status",
+                {
+                    "status": "coordinator_control_output_detected",
+                    "workflowState": "RUNNING",
+                    "currentStep": "coordinator_control_output_detected",
+                    "coordinator_control_output_detected": True,
+                    "message": "Coordinator emitted control output without synthesis; awaiting specialist delegation.",
+                },
+            )
+            return
 
         if options:
             for option in options:
@@ -1597,11 +1721,14 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                     raise
             except Exception as exc:
                 if self._is_bounded_orchestration_mode():
-                    failure_reason = (
-                        "llm_directed_execution_error"
-                        if self._is_llm_directed_mode()
-                        else "deterministic_execution_error"
-                    )
+                    if isinstance(exc, RuntimeError) and str(exc) in RUNTIME_FAILURE_REASON_CODES:
+                        failure_reason = str(exc)
+                    else:
+                        failure_reason = (
+                            "llm_directed_execution_error"
+                            if self._is_llm_directed_mode()
+                            else "deterministic_execution_error"
+                        )
                     await self.emit_event(
                         "workflow.failed",
                         {
@@ -1609,6 +1736,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                             "reason": failure_reason,
                             "workflowState": "FAILED",
                             "orchestration_mode": self.orchestration_mode,
+                            "coordinator_control_output_detected": self._coordinator_control_output_detected,
                         },
                     )
                 raise
@@ -1638,6 +1766,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         self._handoff_specialist_snapshots.clear()
         self._latest_coordinator_artifacts.clear()
         self._latest_coordinator_response_text = ""
+        self._coordinator_control_output_detected = False
         logger.info("workflow_state_reset", run_id=self.run_id)
 
     async def _emit_synthetic_agent_completion(self, agent_id: str, reason: str):
@@ -2063,6 +2192,12 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                         "agent": agent_id,
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     })
+
+            if self._should_fail_coordinator_no_specialist_handoff(
+                artifacts=self._latest_coordinator_artifacts,
+                agent_responses=agent_responses,
+            ):
+                raise RuntimeError("coordinator_no_specialist_handoff")
 
             # Guarantee a coordinator.plan event reaches the UI
             if not self._coordinator_artifacts_emitted and self._is_bounded_orchestration_mode():

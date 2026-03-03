@@ -8,6 +8,31 @@ import structlog
 logger = structlog.get_logger()
 
 
+def _flatten_option_candidates(value: Any) -> List[Dict[str, Any]]:
+    flattened: List[Dict[str, Any]] = []
+
+    def _walk(item: Any):
+        if isinstance(item, dict):
+            flattened.append(dict(item))
+            return
+        if isinstance(item, (list, tuple)):
+            for child in item:
+                _walk(child)
+
+    _walk(value)
+    return flattened
+
+
+def _normalize_selected_option(selected_option: Any) -> Dict[str, Any]:
+    if isinstance(selected_option, dict):
+        return dict(selected_option)
+    if isinstance(selected_option, list):
+        for item in selected_option:
+            if isinstance(item, dict):
+                return dict(item)
+    return {}
+
+
 @ai_function(approval_mode="never_require")
 async def score_recovery_option(
     option_id: Annotated[str, Field(description="Unique option identifier")],
@@ -41,7 +66,26 @@ async def rank_options(
     options: Annotated[List[Dict[str, Any]], Field(description="List of scored options")],
 ) -> Dict[str, Any]:
     """Rank recovery options by overall score."""
-    sorted_opts = sorted(options, key=lambda o: o.get("overall_score", 0), reverse=True)
+    candidates = _flatten_option_candidates(options)
+    if not candidates:
+        return {
+            "ranked_options": [],
+            "top_option": None,
+            "status": "invalid_options_shape",
+            "errorCode": "coordinator_options_invalid_shape",
+            "message": "No valid option objects were provided to rank_options.",
+        }
+
+    def _score(option: Dict[str, Any]) -> float:
+        for key in ("overall_score", "overallScore", "score"):
+            try:
+                if key in option and option[key] is not None:
+                    return float(option[key])
+            except (TypeError, ValueError):
+                pass
+        return 0.0
+
+    sorted_opts = sorted(candidates, key=_score, reverse=True)
     for i, opt in enumerate(sorted_opts):
         opt["rank"] = i + 1
     return {"ranked_options": sorted_opts, "top_option": sorted_opts[0] if sorted_opts else None}
@@ -49,13 +93,36 @@ async def rank_options(
 
 @ai_function(approval_mode="never_require")
 async def generate_plan(
-    selected_option: Annotated[Dict[str, Any], Field(description="The selected recovery option")],
+    selected_option: Annotated[Any, Field(description="The selected recovery option")],
     timeline_entries: Annotated[List[Dict[str, str]], Field(description="Timeline entries [{time, action, agent}]")] = None,
 ) -> Dict[str, Any]:
     """Generate an implementation plan for the selected recovery option."""
+    normalized_selected_option = _normalize_selected_option(selected_option)
+    if not normalized_selected_option:
+        return {
+            "selected_option": {},
+            "timeline": [],
+            "status": "invalid_selected_option_shape",
+            "errorCode": "coordinator_options_invalid_shape",
+            "message": "No valid selected option object was provided to generate_plan.",
+        }
+
+    normalized_timeline: List[Dict[str, str]] = []
+    if isinstance(timeline_entries, list):
+        for entry in timeline_entries:
+            if not isinstance(entry, dict):
+                continue
+            normalized_timeline.append(
+                {
+                    "time": str(entry.get("time") or ""),
+                    "action": str(entry.get("action") or ""),
+                    "agent": str(entry.get("agent") or ""),
+                }
+            )
+
     return {
-        "selected_option": selected_option,
-        "timeline": timeline_entries or [
+        "selected_option": normalized_selected_option,
+        "timeline": normalized_timeline or [
             {"time": "T+0", "action": "Initiate recovery plan", "agent": "coordinator"},
             {"time": "T+15min", "action": "Begin aircraft swaps", "agent": "fleet_recovery"},
             {"time": "T+30min", "action": "Reassign crew", "agent": "crew_recovery"},

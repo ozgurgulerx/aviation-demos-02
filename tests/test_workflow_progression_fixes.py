@@ -388,6 +388,76 @@ async def test_coordinator_malformed_output_still_emits_plan():
     assert plan_events[0].get("summary")
 
 
+@pytest.mark.asyncio
+async def test_coordinator_control_json_does_not_emit_plan_or_answer():
+    captured: list[tuple[str, dict]] = []
+
+    async def emit(event_type: str, payload: dict):
+        captured.append((event_type, payload))
+
+    engine = OrchestratorEngine(
+        run_id="test-control-only-artifacts",
+        event_emitter=emit,
+        workflow_type=WorkflowType.HANDOFF,
+        orchestration_mode=OrchestrationMode.DETERMINISTIC,
+        enable_checkpointing=False,
+    )
+
+    await engine._emit_coordinator_artifacts('{"handoff_to":"situation_assessment"}')
+
+    status_events = [payload for event_type, payload in captured if event_type == "workflow.status"]
+    plan_events = [payload for event_type, payload in captured if event_type == "coordinator.plan"]
+    assert status_events
+    assert status_events[-1]["status"] == "coordinator_control_output_detected"
+    assert status_events[-1]["coordinator_control_output_detected"] is True
+    assert plan_events == []
+    assert engine._latest_coordinator_artifacts.get("controlOnly") is True
+    assert engine._latest_coordinator_artifacts.get("finalAnswer") == ""
+
+
+def test_should_fail_when_coordinator_runs_without_specialists():
+    engine = OrchestratorEngine(
+        run_id="test-no-specialist-handoff",
+        workflow_type=WorkflowType.HANDOFF,
+        orchestration_mode=OrchestrationMode.DETERMINISTIC,
+        enable_checkpointing=False,
+    )
+    specialist = _agent("specialist_a", "Specialist A", category="specialist")
+    coordinator = _agent("decision_coordinator", "Decision Coordinator", category="coordinator")
+    engine.selected_agents = [specialist, coordinator]
+    engine._coordinator_agent_id = "decision_coordinator"
+    engine._agent_execution_counts["decision_coordinator"] = 1
+    engine._latest_coordinator_response_text = '{"summary":"premature coordinator summary"}'
+
+    should_fail = engine._should_fail_coordinator_no_specialist_handoff(
+        artifacts={"summary": "premature coordinator summary"},
+        agent_responses=[],
+    )
+    assert should_fail is True
+
+
+def test_should_not_fail_when_specialist_participated():
+    engine = OrchestratorEngine(
+        run_id="test-has-specialist-handoff",
+        workflow_type=WorkflowType.HANDOFF,
+        orchestration_mode=OrchestrationMode.DETERMINISTIC,
+        enable_checkpointing=False,
+    )
+    specialist = _agent("specialist_a", "Specialist A", category="specialist")
+    coordinator = _agent("decision_coordinator", "Decision Coordinator", category="coordinator")
+    engine.selected_agents = [specialist, coordinator]
+    engine._coordinator_agent_id = "decision_coordinator"
+    engine._agent_execution_counts["decision_coordinator"] = 1
+    engine._agent_execution_counts["specialist_a"] = 1
+    engine._latest_coordinator_response_text = '{"summary":"coordinator summary"}'
+
+    should_fail = engine._should_fail_coordinator_no_specialist_handoff(
+        artifacts={"summary": "coordinator summary"},
+        agent_responses=[],
+    )
+    assert should_fail is False
+
+
 def test_parse_coordinator_artifacts_extracts_final_answer_from_json():
     engine = OrchestratorEngine(run_id="test-final-answer-json", enable_checkpointing=False)
     response = """Coordinator synthesis complete.
@@ -473,6 +543,18 @@ def test_resolve_final_answer_synthesizes_from_artifacts_when_missing():
     assert resolved != fused_summary
 
 
+def test_resolve_final_answer_ignores_control_payload_text():
+    engine = OrchestratorEngine(run_id="test-answer-control-json", enable_checkpointing=False)
+    resolved = engine._resolve_final_answer(
+        final_output={"handoff_to": "situation_assessment"},
+        artifacts={"summary": "", "finalAnswer": "", "controlOnly": True},
+        agent_responses=[],
+        fused_summary="Specialist evidence summary",
+    )
+    assert "handoff_to" not in resolved
+    assert resolved
+
+
 @pytest.mark.asyncio
 async def test_deterministic_timeout_emits_failed_reason(monkeypatch):
     captured: list[tuple[str, dict]] = []
@@ -501,6 +583,34 @@ async def test_deterministic_timeout_emits_failed_reason(monkeypatch):
     failed = [payload for event_type, payload in captured if event_type == "workflow.failed"]
     assert failed
     assert failed[-1]["reason"] == "deterministic_execution_timeout"
+
+
+@pytest.mark.asyncio
+async def test_runtime_reason_code_passthrough(monkeypatch):
+    captured: list[tuple[str, dict]] = []
+
+    async def emit(event_type: str, payload: dict):
+        captured.append((event_type, payload))
+
+    engine = OrchestratorEngine(
+        run_id="test-runtime-reason",
+        event_emitter=emit,
+        workflow_type=WorkflowType.HANDOFF,
+        orchestration_mode=OrchestrationMode.DETERMINISTIC,
+        enable_checkpointing=False,
+    )
+
+    async def _fail_with_reason(_input_message: str):
+        raise RuntimeError("coordinator_no_specialist_handoff")
+
+    monkeypatch.setattr(engine, "_stream_workflow", _fail_with_reason)
+
+    with pytest.raises(RuntimeError, match="coordinator_no_specialist_handoff"):
+        await engine._execute_workflow_with_events("test input")
+
+    failed = [payload for event_type, payload in captured if event_type == "workflow.failed"]
+    assert failed
+    assert failed[-1]["reason"] == "coordinator_no_specialist_handoff"
 
 
 class TestEstimateResultCount:
@@ -877,6 +987,7 @@ def test_coordinator_instructions_include_json_schema():
     assert "{{" not in instructions, (
         "Coordinator instructions contain double-braces — JSON schema is malformed"
     )
+    assert "Never output `{\"handoff_to\":\"...\"}`" in instructions
 
 
 @pytest.mark.usefixtures("_set_aoai_endpoint")
