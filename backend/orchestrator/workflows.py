@@ -155,8 +155,17 @@ def create_coordinator_workflow(
         for s in specialists
     )
 
-    coordinator_instructions = f"""You are the Aviation Decision Coordinator for a {scenario.replace('_', ' ')} scenario.
+    scenario_context = ""
+    if problem:
+        scenario_context = (
+            f"\n## Current Scenario\n{problem}\n\n"
+            "Use these specific details (airports, flight counts, passenger numbers, "
+            "aircraft grounded) when calling your tools and in your analysis. "
+            "Tailor everything to this scenario — do not produce generic assessments.\n"
+        )
 
+    coordinator_instructions = f"""You are the Aviation Decision Coordinator for a {scenario.replace('_', ' ')} scenario.
+{scenario_context}
 ## Phase 1 — Delegate (ONE round only)
 Call each specialist handoff tool EXACTLY ONCE, in order:
 {handoff_directives}
@@ -171,26 +180,26 @@ After all specialists have reported back:
 3. Rank them using rank_options
 4. Generate implementation plan using generate_plan
 5. End with a JSON block that follows this schema exactly:
-{{{{
+{{
   "criteria": ["delay_reduction", "crew_margin", "safety_score", "cost_impact", "passenger_impact"],
   "options": [
-    {{{{
+    {{
       "optionId": "opt-1",
       "description": "short description",
       "rank": 1,
-      "scores": {{{{
+      "scores": {{
         "delay_reduction": 0,
         "crew_margin": 0,
         "safety_score": 0,
         "cost_impact": 0,
         "passenger_impact": 0
-      }}}}
-    }}}}
+      }}
+    }}
   ],
   "selectedOptionId": "opt-1",
   "summary": "brief recommendation summary",
-  "timeline": [{{{{"time": "T+0", "action": "action text", "agent": "agent_id"}}}}]
-}}}}
+  "timeline": [{{"time": "T+0", "action": "action text", "agent": "agent_id"}}]
+}}
 
 You are DONE after Phase 2. Do not delegate again.
 
@@ -203,14 +212,6 @@ State clearly which recommendations are data-backed vs. SOP-based.
 Start now by calling the first handoff tool.
 """
     coordinator.default_options["instructions"] = coordinator_instructions
-    scenario_context = ""
-    if problem:
-        scenario_context = (
-            f"\n## Current Scenario\n{problem}\n\n"
-            "Use these specific details (airports, flight counts, passenger numbers, "
-            "aircraft grounded) when calling your tools and in your analysis. "
-            "Tailor everything to this scenario — do not produce generic assessments.\n\n"
-        )
 
     coordinator_ref = coordinator.name or coordinator.id
     for specialist in specialists:

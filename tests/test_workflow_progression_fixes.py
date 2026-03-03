@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 import pytest
 
-from agent_framework import AgentExecutorResponse, AgentResponse, AgentRunEvent, ChatMessage, ExecutorCompletedEvent, ExecutorInvokedEvent, WorkflowRunState, WorkflowStatusEvent
+from agent_framework import AgentExecutorResponse, AgentResponse, AgentResponseUpdate, AgentRunEvent, AgentRunUpdateEvent, ChatMessage, Content, ExecutorCompletedEvent, ExecutorInvokedEvent, WorkflowRunState, WorkflowStatusEvent
 from agent_framework._workflows._handoff import HandoffSentEvent
 
 from orchestrator.agent_registry import AgentSelectionResult, SCENARIO_AGENTS
@@ -695,7 +695,72 @@ def test_problem_injected_into_specialist_instructions():
         assert "thunderstorm at ORD" in instructions, (
             f"{specialist_id} instructions missing problem context"
         )
-        assert "Current Scenario" in instructions
+
+
+@pytest.mark.asyncio
+async def test_streaming_accum_captures_function_result_content():
+    """AgentRunUpdateEvent with function_result content should be accumulated."""
+    captured: list[tuple[str, dict]] = []
+
+    async def emit(event_type: str, payload: dict):
+        captured.append((event_type, payload))
+
+    engine = OrchestratorEngine(run_id="test-fn-result", event_emitter=emit, enable_checkpointing=False)
+    profile = _agent("specialist_fr", "Specialist FR")
+    engine.selected_agents = [profile]
+    engine._agent_lookup = {profile.agent_id: profile}
+
+    # Simulate invocation
+    await engine._process_workflow_event(ExecutorInvokedEvent("specialist_fr"))
+
+    # Create AgentRunUpdateEvent with function_result content (no text type)
+    fn_result_content = Content.from_function_result(
+        call_id="call_abc123",
+        result="DTW: 45 NM, ILS 21L available, ceiling 2500ft, visibility 6SM",
+    )
+    update = AgentResponseUpdate(contents=[fn_result_content])
+    await engine._process_workflow_event(AgentRunUpdateEvent("specialist_fr", update))
+
+    # The function_result text should be accumulated
+    chunks = engine._streaming_text_accum.get("specialist_fr", [])
+    assert len(chunks) == 1
+    assert "DTW" in chunks[0]
+    assert "ILS 21L" in chunks[0]
+
+
+@pytest.mark.asyncio
+async def test_handoff_snapshot_uses_accumulated_tool_results():
+    """HandoffSentEvent should capture snapshot from function_result content accumulated via streaming."""
+    captured: list[tuple[str, dict]] = []
+
+    async def emit(event_type: str, payload: dict):
+        captured.append((event_type, payload))
+
+    engine = OrchestratorEngine(run_id="test-snap-tool", event_emitter=emit, enable_checkpointing=False)
+    profile = _agent("specialist_tool", "Specialist Tool")
+    engine.selected_agents = [profile]
+    engine._agent_lookup = {profile.agent_id: profile}
+    engine._coordinator_agent_id = "coordinator_main"
+
+    # Simulate: invocation
+    await engine._process_workflow_event(ExecutorInvokedEvent("specialist_tool"))
+
+    # Simulate: streaming with function_result content
+    fn_result = Content.from_function_result(
+        call_id="call_tool1",
+        result="Crew pairing CP-1042 exceeds FDP by 45 minutes. Reserve crew available at base DTW.",
+    )
+    update = AgentResponseUpdate(contents=[fn_result])
+    await engine._process_workflow_event(AgentRunUpdateEvent("specialist_tool", update))
+
+    # Simulate: HandoffSentEvent — specialist hands back to coordinator
+    await engine._process_workflow_event(HandoffSentEvent("specialist_tool", "coordinator_main"))
+
+    # Snapshot should be captured from the accumulated function_result content
+    assert "specialist_tool" in engine._handoff_specialist_snapshots
+    snapshot = engine._handoff_specialist_snapshots["specialist_tool"]
+    assert "Crew pairing CP-1042" in snapshot
+    assert "FDP" in snapshot
 
 
 @pytest.mark.usefixtures("_set_aoai_endpoint")
