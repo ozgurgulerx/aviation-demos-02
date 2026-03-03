@@ -186,14 +186,16 @@ Start now by calling the first handoff tool.
     for specialist in specialists:
         specialist_base = specialist.default_options.get("instructions") or ""
         handoff_protocol = (
-            "Workflow protocol:\n"
-            "- Run one focused analysis pass using your tools.\n"
-            "- If tools return data, provide concise, evidence-backed findings.\n"
-            "- If tools return empty results or 'no_data_fallback' status, use the domain\n"
-            "  knowledge guidance and scenario context to produce a substantive analysis.\n"
-            "  Never return empty findings.\n"
-            f"- Immediately call `handoff_to_{coordinator_ref}` after your findings.\n"
-            "- Do not hand off to any other specialist.\n\n"
+            "Workflow protocol — FOLLOW THESE STEPS IN ORDER:\n"
+            "Step 1: Call your analysis tools to gather data.\n"
+            "Step 2: Write a DETAILED analysis (minimum 3 paragraphs) interpreting results.\n"
+            "  - If tools returned data: cite specific numbers, flag risks, give recommendations.\n"
+            "  - If tools returned 'no_data_fallback': apply the domain-knowledge constants and\n"
+            "    scenario context to produce a substantive, scenario-specific assessment.\n"
+            "  IMPORTANT: You MUST write your full analysis as text output BEFORE Step 3.\n"
+            "  Do NOT skip writing — the coordinator needs your written findings.\n"
+            f"Step 3: ONLY after writing your analysis, call `handoff_to_{coordinator_ref}`.\n"
+            "Do not hand off to any other specialist.\n\n"
         )
         specialist.default_options["instructions"] = (
             f"{handoff_protocol}{specialist_base}"
@@ -212,12 +214,12 @@ Start now by calling the first handoff tool.
         builder = builder.add_handoff(specialist, [coordinator])
 
     configured_turn_limits = autonomous_turn_limits or {}
-    default_coordinator_turns = len(specialists) + 4
+    default_coordinator_turns = len(specialists) + 6
     coordinator_turn_limit = configured_turn_limits.get(
         coordinator.name or coordinator.id, default_coordinator_turns
     )
     specialist_turn_limits = {
-        (s.name or s.id): configured_turn_limits.get(s.name or s.id, 2)
+        (s.name or s.id): configured_turn_limits.get(s.name or s.id, 4)
         for s in specialists
     }
     turn_limits = {

@@ -8,6 +8,7 @@ import asyncio
 import pytest
 
 from agent_framework import AgentExecutorResponse, AgentResponse, AgentRunEvent, ChatMessage, ExecutorCompletedEvent, ExecutorInvokedEvent, WorkflowRunState, WorkflowStatusEvent
+from agent_framework._workflows._handoff import HandoffSentEvent
 
 from orchestrator.agent_registry import AgentSelectionResult, SCENARIO_AGENTS
 from orchestrator.engine import OrchestratorEngine, _LoopCappedSignal
@@ -252,13 +253,13 @@ def test_coordinator_workflow_constrains_handoff_targets_and_turn_limits():
 
     coordinator_executor = workflow.executors[coordinator_id]
     assert getattr(coordinator_executor, "_handoff_targets") == specialist_ids
-    # default_coordinator_turns = len(specialists) + 4 = 6 + 4 = 10
-    assert getattr(coordinator_executor, "_autonomous_mode_turn_limit") == 10
+    # default_coordinator_turns = len(specialists) + 6 = 6 + 6 = 12
+    assert getattr(coordinator_executor, "_autonomous_mode_turn_limit") == 12
 
     for specialist_id in specialist_ids:
         specialist_executor = workflow.executors[specialist_id]
         assert getattr(specialist_executor, "_handoff_targets") == {coordinator_id}
-        assert getattr(specialist_executor, "_autonomous_mode_turn_limit") == 2
+        assert getattr(specialist_executor, "_autonomous_mode_turn_limit") == 4
 
 
 @pytest.mark.usefixtures("_set_aoai_endpoint")
@@ -574,3 +575,120 @@ async def test_executor_completed_extracts_from_full_conversation():
     assert len(completed) == 1
     assert completed[0]["message_count"] >= 1
     assert "2500ft" in completed[0]["summary"]
+
+
+@pytest.mark.asyncio
+async def test_handoff_sent_event_captures_specialist_snapshot():
+    """HandoffSentEvent should snapshot streaming text for specialist agents."""
+    captured: list[tuple[str, dict]] = []
+
+    async def emit(event_type: str, payload: dict):
+        captured.append((event_type, payload))
+
+    engine = OrchestratorEngine(run_id="test-handoff-snap", event_emitter=emit, enable_checkpointing=False)
+    profile = _agent("specialist_snap", "Specialist Snap")
+    engine.selected_agents = [profile]
+    engine._agent_lookup = {profile.agent_id: profile}
+    engine._coordinator_agent_id = "coordinator_main"
+
+    # Simulate: specialist was invoked and accumulated streaming text
+    await engine._process_workflow_event(ExecutorInvokedEvent("specialist_snap"))
+    engine._streaming_text_accum["specialist_snap"] = [
+        "Crew fatigue analysis shows 3 pairings at risk. ",
+        "FDP limits will be exceeded within 2 hours for crew on flights 1042, 1055, 1078.",
+    ]
+
+    # Fire HandoffSentEvent — specialist hands back to coordinator
+    await engine._process_workflow_event(HandoffSentEvent("specialist_snap", "coordinator_main"))
+
+    # Snapshot should be captured
+    assert "specialist_snap" in engine._handoff_specialist_snapshots
+    snapshot = engine._handoff_specialist_snapshots["specialist_snap"]
+    assert "Crew fatigue" in snapshot
+    assert "FDP limits" in snapshot
+
+
+@pytest.mark.asyncio
+async def test_handoff_snapshot_not_captured_for_coordinator():
+    """HandoffSentEvent from coordinator should NOT capture a snapshot."""
+    captured: list[tuple[str, dict]] = []
+
+    async def emit(event_type: str, payload: dict):
+        captured.append((event_type, payload))
+
+    engine = OrchestratorEngine(run_id="test-handoff-coord", event_emitter=emit, enable_checkpointing=False)
+    engine._coordinator_agent_id = "coordinator_main"
+    engine._streaming_text_accum["coordinator_main"] = ["Delegating to specialist."]
+
+    await engine._process_workflow_event(HandoffSentEvent("coordinator_main", "specialist_a"))
+
+    assert "coordinator_main" not in engine._handoff_specialist_snapshots
+
+
+@pytest.mark.asyncio
+async def test_handoff_snapshot_used_in_executor_completed_fallback():
+    """ExecutorCompletedEvent should use handoff snapshot when event.data is None."""
+    captured: list[tuple[str, dict]] = []
+
+    async def emit(event_type: str, payload: dict):
+        captured.append((event_type, payload))
+
+    engine = OrchestratorEngine(run_id="test-snap-fallback", event_emitter=emit, enable_checkpointing=False)
+    profile = _agent("specialist_fb", "Specialist FB")
+    engine.selected_agents = [profile]
+    engine._agent_lookup = {profile.agent_id: profile}
+    engine._coordinator_agent_id = "coordinator_main"
+
+    # Simulate: specialist was invoked
+    await engine._process_workflow_event(ExecutorInvokedEvent("specialist_fb"))
+
+    # Pre-populate handoff snapshot (as if HandoffSentEvent had fired)
+    engine._handoff_specialist_snapshots["specialist_fb"] = (
+        "Crew pairing analysis complete. 3 pairings at risk of FDP violation.\n\n"
+        "Recommended: swap reserve crews on flights 1042 and 1055."
+    )
+
+    # Fire ExecutorCompletedEvent with None data (typical for handoff specialists)
+    await engine._process_workflow_event(ExecutorCompletedEvent("specialist_fb"))
+
+    completed = [p for t, p in captured if t == "agent.completed"]
+    assert len(completed) == 1
+    assert "Crew pairing analysis" in completed[0]["summary"]
+    assert completed[0]["message_count"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_reset_workflow_state_clears_handoff_snapshots():
+    """_reset_workflow_state should clear handoff specialist snapshots."""
+    engine = OrchestratorEngine(run_id="test-reset", enable_checkpointing=False)
+    engine._handoff_specialist_snapshots["spec_a"] = "some analysis"
+    engine._reset_workflow_state()
+    assert len(engine._handoff_specialist_snapshots) == 0
+
+
+@pytest.mark.usefixtures("_set_aoai_endpoint")
+def test_specialist_turn_limits_are_four():
+    """Specialist default turn limits should be 4 (not 2) to allow text generation before handoff."""
+    workflow = create_coordinator_workflow(
+        scenario="hub_disruption",
+        active_agent_ids=[
+            "situation_assessment",
+            "fleet_recovery",
+            "crew_recovery",
+            "network_impact",
+            "weather_safety",
+            "passenger_impact",
+            "recovery_coordinator",
+        ],
+    )
+
+    specialist_ids = {
+        "situation_assessment", "fleet_recovery", "crew_recovery",
+        "network_impact", "weather_safety", "passenger_impact",
+    }
+    for specialist_id in specialist_ids:
+        specialist_executor = workflow.executors[specialist_id]
+        assert getattr(specialist_executor, "_autonomous_mode_turn_limit") == 4, (
+            f"{specialist_id} should have turn limit 4, got "
+            f"{getattr(specialist_executor, '_autonomous_mode_turn_limit')}"
+        )

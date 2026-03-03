@@ -32,6 +32,7 @@ from agent_framework import (
     AgentRunUpdateEvent,
     InMemoryCheckpointStorage,
 )
+from agent_framework._workflows._handoff import HandoffSentEvent
 from pydantic import BaseModel, Field
 import structlog
 
@@ -149,6 +150,7 @@ class OrchestratorEngine:
             milliseconds=int(os.getenv("STREAM_THROTTLE_MS", "500"))
         )
         self._streaming_text_accum: Dict[str, List[str]] = {}
+        self._handoff_specialist_snapshots: Dict[str, str] = {}
 
         if enable_checkpointing:
             self.checkpoint_storage = InMemoryCheckpointStorage()
@@ -1240,6 +1242,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         self._agent_stream_last_update_at.clear()
         self._agent_stream_guarded_invocation_keys.clear()
         self._streaming_text_accum.clear()
+        self._handoff_specialist_snapshots.clear()
         logger.info("workflow_state_reset", run_id=self.run_id)
 
     async def _emit_synthetic_agent_completion(self, agent_id: str, reason: str):
@@ -1531,7 +1534,14 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                                                 msg_count = len(parts)
                                                 break
 
-                            # Path B: Accumulated streaming text
+                            # Path B: Handoff snapshot (captured at HandoffSentEvent)
+                            if not resp_text:
+                                snap = self._handoff_specialist_snapshots.get(comp_executor_id, "")
+                                if snap:
+                                    resp_text = snap
+                                    msg_count = max(1, snap.count("\n\n") + 1)
+
+                            # Path C: Accumulated streaming text
                             if not resp_text:
                                 chunks = self._streaming_text_accum.get(comp_executor_id, [])
                                 if chunks:
@@ -1625,13 +1635,17 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                     continue
                 if any(r["agent"] == agent_id for r in agent_responses):
                     continue
-                chunks = self._streaming_text_accum.get(agent_id, [])
-                if chunks:
-                    text = "".join(chunks)[:500]
+                # Priority: handoff snapshot > streaming text
+                text = self._handoff_specialist_snapshots.get(agent_id, "")
+                if not text:
+                    chunks = self._streaming_text_accum.get(agent_id, [])
+                    if chunks:
+                        text = "".join(chunks)[:500]
+                if text:
                     agent_responses.append({
                         "agent": agent_id,
                         "messages": 1,
-                        "result_summary": text,
+                        "result_summary": text[:500],
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     })
                     self.evidence.append({
@@ -1921,7 +1935,11 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                     resp_text = data.strip()[:8000]
                     msg_count = 1
 
-            # Fallback: accumulated streaming text (works for handoff specialists)
+            # Fallback: handoff snapshot > accumulated streaming text
+            if not resp_text:
+                resp_text = self._handoff_specialist_snapshots.get(executor_id, "")
+                if resp_text:
+                    msg_count = max(1, resp_text.count("\n\n") + 1)
             if not resp_text:
                 chunks = self._streaming_text_accum.get(executor_id, [])
                 if chunks:
@@ -2092,6 +2110,29 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                         "currentStep": "streaming_analysis",
                         "executionCount": self._agent_execution_counts.get(executor_id, 0),
                     },
+                )
+            return
+
+        if isinstance(event, HandoffSentEvent):
+            source_id = event.source
+            target_id = event.target
+            # Snapshot streaming text at handoff time for non-coordinator agents
+            if source_id != self._coordinator_agent_id:
+                chunks = self._streaming_text_accum.get(source_id, [])
+                if chunks:
+                    self._handoff_specialist_snapshots[source_id] = "".join(chunks)[:8000]
+                    logger.info(
+                        "handoff_specialist_snapshot_captured",
+                        run_id=self.run_id,
+                        source=source_id,
+                        target=target_id,
+                        snapshot_len=len(self._handoff_specialist_snapshots[source_id]),
+                    )
+            if self.trace_emitter:
+                await self.trace_emitter.emit_handover(
+                    from_agent=source_id,
+                    to_agent=target_id,
+                    reason="Specialist completed analysis, returning to coordinator",
                 )
             return
 
