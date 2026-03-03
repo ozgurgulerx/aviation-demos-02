@@ -65,6 +65,8 @@ class RunStore:
             min_size=2,
             max_size=10,
             ssl=ssl_param,
+            timeout=20,
+            command_timeout=15,
         )
 
         store = cls(pool)

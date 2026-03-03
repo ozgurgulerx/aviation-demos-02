@@ -55,8 +55,8 @@ async def lifespan(app: FastAPI):
     # Warm Azure OpenAI client cache so first workflow doesn't pay credential cost
     try:
         from agents.client import get_shared_chat_client, get_orchestrator_chat_client
-        await asyncio.to_thread(get_shared_chat_client)
-        await asyncio.to_thread(get_orchestrator_chat_client)
+        await asyncio.wait_for(asyncio.to_thread(get_shared_chat_client), timeout=30)
+        await asyncio.wait_for(asyncio.to_thread(get_orchestrator_chat_client), timeout=30)
         logger.info("azure_openai_clients_warmed")
     except Exception as e:
         logger.warning("client_warmup_failed", error=str(e))
@@ -64,9 +64,9 @@ async def lifespan(app: FastAPI):
     # Wire data retriever to all agent tool modules
     retriever = None
     try:
-        run_store = await get_run_store()
+        run_store = await asyncio.wait_for(get_run_store(), timeout=30)
         from data_sources.unified_retriever import get_retriever
-        retriever = await get_retriever(pg_pool=run_store.pool)
+        retriever = await asyncio.wait_for(get_retriever(pg_pool=run_store.pool), timeout=15)
         from agents.tools import RETRIEVER_MODULES
         wired = 0
         for mod in RETRIEVER_MODULES:
