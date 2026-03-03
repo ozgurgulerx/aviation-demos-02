@@ -33,6 +33,7 @@ from data_sources.shared_utils import (
     OPENAI_API_VERSION,
     build_rows_preview,
     env_bool,
+    env_csv,
     env_int,
 )
 from data_sources.schema_provider import AsyncSchemaProvider
@@ -57,6 +58,77 @@ try:
     _HAS_COSMOS = True
 except ImportError:
     logger.info("azure-cosmos not installed, Cosmos DB disabled")
+
+
+READ_ONLY_SQL_DENYLIST = {
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "MERGE",
+    "UPSERT",
+    "TRUNCATE",
+    "DROP",
+    "ALTER",
+    "CREATE",
+    "GRANT",
+    "REVOKE",
+    "COPY",
+    "CALL",
+    "DO",
+    "EXEC",
+    "EXECUTE",
+    "VACUUM",
+    "ANALYZE",
+    "REFRESH",
+}
+
+
+def _strip_sql_comments_and_literals(sql: str) -> str:
+    """Remove comments and string literals to make SQL safety checks robust."""
+    without_block_comments = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
+    without_line_comments = re.sub(r"--[^\n]*", " ", without_block_comments)
+    without_single_quotes = re.sub(r"'(?:''|[^'])*'", "''", without_line_comments)
+    without_double_quotes = re.sub(r'"(?:\\"|[^"])*"', '""', without_single_quotes)
+    return without_double_quotes
+
+
+def _is_safe_read_only_sql(sql: str) -> tuple[bool, str]:
+    """
+    Validate generated SQL is read-only.
+
+    Allows SELECT/CTE forms:
+    - SELECT ...
+    - WITH ... SELECT ...
+    - (SELECT ...)
+    """
+    stripped = (sql or "").strip()
+    if not stripped:
+        return False, "SQL_EMPTY"
+
+    # Remove comments/literals before multi-statement detection.
+    inspection_text = _strip_sql_comments_and_literals(stripped)
+
+    # Reject multi-statements (allow one optional trailing semicolon only).
+    collapsed = inspection_text.rstrip()
+    if collapsed.endswith(";"):
+        collapsed = collapsed[:-1]
+    if ";" in collapsed:
+        return False, "SQL_MULTI_STATEMENT"
+
+    inspection = collapsed.upper()
+
+    # Ensure statement starts with SELECT/WITH after leading parentheses.
+    head = inspection.lstrip()
+    while head.startswith("("):
+        head = head[1:].lstrip()
+    if not (head.startswith("SELECT") or head.startswith("WITH")):
+        return False, "SQL_NON_READ_ONLY"
+
+    for token in READ_ONLY_SQL_DENYLIST:
+        if re.search(rf"\b{re.escape(token)}\b", inspection):
+            return False, f"SQL_BLOCKED_{token}"
+
+    return True, "SQL_OK"
 
 
 def _extract_airports_from_query(query: str) -> List[str]:
@@ -117,6 +189,7 @@ class AsyncUnifiedRetriever:
         self._fabric_sql_endpoint = os.getenv("FABRIC_SQL_ENDPOINT", "")
         self._embedding_deployment = os.getenv("AZURE_TEXT_EMBEDDING_DEPLOYMENT_NAME", "text-embedding-3-small")
         self._query_timeout_seconds = int(os.getenv("UNIFIED_RETRIEVER_QUERY_TIMEOUT_SECONDS", "45"))
+        self._sql_visible_schemas = env_csv("SQL_VISIBLE_SCHEMAS", "public,demo") or ["public", "demo"]
 
     async def _get_http(self) -> httpx.AsyncClient:
         if self._http is None or self._http.is_closed:
@@ -239,11 +312,10 @@ class AsyncUnifiedRetriever:
             if not sql or "NEED_SCHEMA" in sql:
                 return [], [Citation(source_type="SQL", title="Schema insufficient for query")]
 
-            # Safety check — only SELECT
-            sql_upper = sql.strip().upper()
-            if not sql_upper.startswith("SELECT"):
-                logger.warning("Blocked non-SELECT SQL: %s", sql[:100])
-                return [], [Citation(source_type="SQL", title="Only SELECT queries allowed")]
+            is_safe, reason = _is_safe_read_only_sql(sql)
+            if not is_safe:
+                logger.warning("Blocked non-read-only SQL (%s): %s", reason, sql[:160])
+                return [], [Citation(source_type="SQL", title=f"{reason}: Only read-only SQL is allowed")]
 
             async with self._pg_pool.acquire() as conn:
                 records = await self._with_timeout("sql execution", conn.fetch(sql))
@@ -415,28 +487,41 @@ class AsyncUnifiedRetriever:
         return rows, citations
 
     async def _query_graph_pg_fallback(self, query: str, hops: int) -> Tuple[List[Dict[str, Any]], List[Citation]]:
-        """BFS graph traversal using ops_graph_edges in PostgreSQL."""
+        """BFS graph traversal using schema-resolved ops_graph_edges in PostgreSQL."""
         airports = _extract_airports_from_query(query)
         start = airports[0] if airports else "KORD"
-
-        sql = """
-            WITH RECURSIVE graph_walk AS (
-                SELECT source_id, target_id, edge_type, 1 AS depth
-                FROM ops_graph_edges
-                WHERE source_id = $1
-                UNION ALL
-                SELECT e.source_id, e.target_id, e.edge_type, gw.depth + 1
-                FROM ops_graph_edges e
-                JOIN graph_walk gw ON e.source_id = gw.target_id
-                WHERE gw.depth < $2
-            )
-            SELECT DISTINCT source_id, target_id, edge_type, depth
-            FROM graph_walk
-            ORDER BY depth
-            LIMIT 100
-        """
         try:
             async with self._pg_pool.acquire() as conn:
+                relation = await self._with_timeout(
+                    "graph relation resolution",
+                    self._resolve_graph_edges_relation(conn),
+                )
+                if not relation:
+                    return [], [
+                        Citation(
+                            source_type="GRAPH",
+                            title=(
+                                "GRAPH_TABLE_MISSING: ops_graph_edges not found in visible schemas "
+                                f"({', '.join(self._sql_visible_schemas)})"
+                            ),
+                        )
+                    ]
+                sql = f"""
+                    WITH RECURSIVE graph_walk AS (
+                        SELECT source_id, target_id, edge_type, 1 AS depth
+                        FROM {relation}
+                        WHERE source_id = $1
+                        UNION ALL
+                        SELECT e.source_id, e.target_id, e.edge_type, gw.depth + 1
+                        FROM {relation} e
+                        JOIN graph_walk gw ON e.source_id = gw.target_id
+                        WHERE gw.depth < $2
+                    )
+                    SELECT DISTINCT source_id, target_id, edge_type, depth
+                    FROM graph_walk
+                    ORDER BY depth
+                    LIMIT 100
+                """
                 records = await self._with_timeout(
                     "graph pg fallback execution",
                     conn.fetch(sql, start, hops),
@@ -459,6 +544,20 @@ class AsyncUnifiedRetriever:
         except Exception as e:
             logger.error("Graph PG fallback failed: %s", e)
             return [], [Citation(source_type="GRAPH", title=f"Graph error: {str(e)[:100]}")]
+
+    async def _resolve_graph_edges_relation(self, conn) -> Optional[str]:
+        """
+        Resolve ops_graph_edges across visible schemas via to_regclass.
+
+        Returns a fully-qualified relation name (e.g., demo.ops_graph_edges) or None.
+        """
+        for schema in self._sql_visible_schemas:
+            candidate = f"{schema}.ops_graph_edges"
+            relation = await conn.fetchval("SELECT to_regclass($1)::text", candidate)
+            if relation:
+                return str(relation)
+        relation = await conn.fetchval("SELECT to_regclass('ops_graph_edges')::text")
+        return str(relation) if relation else None
 
     # ------------------------------------------------------------------
     # 4-6. Semantic Search (Azure AI Search — 3 indexes)
@@ -803,6 +902,53 @@ class AsyncUnifiedRetriever:
                 results[source] = ([], [Citation(source_type=source, title=f"Error: {str(e)[:80]}")])
 
         return results
+
+    def get_source_diagnostics(self) -> Dict[str, Dict[str, Any]]:
+        """Return lightweight source configuration diagnostics for readiness/probe tooling."""
+        search_endpoint = os.getenv("AZURE_SEARCH_ENDPOINT", "")
+        search_key = os.getenv("AZURE_SEARCH_ADMIN_KEY", "")
+        return {
+            "SQL": {
+                "configured": bool(self._pg_pool),
+                "reachable": bool(self._pg_pool),
+                "detail": "pg_pool_attached" if self._pg_pool else "pg_pool_missing",
+            },
+            "KQL": {
+                "configured": bool(self._fabric_kql_endpoint and self._fabric_kql_database),
+                "reachable": bool(self._fabric_kql_endpoint and self._fabric_kql_database),
+                "detail": "endpoint+database configured" if (self._fabric_kql_endpoint and self._fabric_kql_database) else "missing endpoint/database",
+            },
+            "GRAPH": {
+                "configured": bool(self._fabric_graph_endpoint or self._pg_pool),
+                "reachable": bool(self._fabric_graph_endpoint or self._pg_pool),
+                "detail": "fabric endpoint configured" if self._fabric_graph_endpoint else ("pg_fallback_available" if self._pg_pool else "missing fabric endpoint and pg fallback"),
+            },
+            "VECTOR_OPS": {
+                "configured": bool(search_endpoint and search_key and os.getenv("AZURE_SEARCH_INDEX_OPS_NAME", "")),
+                "reachable": bool(search_endpoint and search_key and os.getenv("AZURE_SEARCH_INDEX_OPS_NAME", "")),
+                "detail": "search endpoint/key/index configured" if (search_endpoint and search_key and os.getenv("AZURE_SEARCH_INDEX_OPS_NAME", "")) else "missing search endpoint/key/index",
+            },
+            "VECTOR_REG": {
+                "configured": bool(search_endpoint and search_key and os.getenv("AZURE_SEARCH_INDEX_REGULATORY_NAME", "")),
+                "reachable": bool(search_endpoint and search_key and os.getenv("AZURE_SEARCH_INDEX_REGULATORY_NAME", "")),
+                "detail": "search endpoint/key/index configured" if (search_endpoint and search_key and os.getenv("AZURE_SEARCH_INDEX_REGULATORY_NAME", "")) else "missing search endpoint/key/index",
+            },
+            "VECTOR_AIRPORT": {
+                "configured": bool(search_endpoint and search_key and os.getenv("AZURE_SEARCH_INDEX_AIRPORT_NAME", "")),
+                "reachable": bool(search_endpoint and search_key and os.getenv("AZURE_SEARCH_INDEX_AIRPORT_NAME", "")),
+                "detail": "search endpoint/key/index configured" if (search_endpoint and search_key and os.getenv("AZURE_SEARCH_INDEX_AIRPORT_NAME", "")) else "missing search endpoint/key/index",
+            },
+            "NOSQL": {
+                "configured": bool(os.getenv("AZURE_COSMOS_ENDPOINT", "")),
+                "reachable": bool(os.getenv("AZURE_COSMOS_ENDPOINT", "")),
+                "detail": "endpoint configured" if os.getenv("AZURE_COSMOS_ENDPOINT", "") else "missing cosmos endpoint",
+            },
+            "FABRIC_SQL": {
+                "configured": bool(self._fabric_sql_endpoint or os.getenv("FABRIC_SQL_CONNECTION_STRING", "")),
+                "reachable": bool(self._fabric_sql_endpoint or os.getenv("FABRIC_SQL_CONNECTION_STRING", "")),
+                "detail": "endpoint or tds connection configured" if (self._fabric_sql_endpoint or os.getenv("FABRIC_SQL_CONNECTION_STRING", "")) else "missing fabric sql endpoint/connection string",
+            },
+        }
 
 
 # ---------------------------------------------------------------------------

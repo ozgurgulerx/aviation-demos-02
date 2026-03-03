@@ -8,6 +8,7 @@ Supports:
 """
 
 import asyncio
+import ast
 import json
 import os
 import re
@@ -112,6 +113,7 @@ class OrchestratorEngine:
         self.scenario: str = "hub_disruption"
         self._agent_lookup: Dict[str, AgentSelectionResult] = {}
         self._active_query_contexts: Dict[str, Dict[str, Any]] = {}
+        self._data_source_trace_mode = os.getenv("DATA_SOURCE_TRACE_MODE", "actual").strip().lower() or "actual"
         self._last_executor_id: Optional[str] = None
         self._run_started_at = datetime.now(timezone.utc)
         self._current_step = "initializing"
@@ -151,6 +153,8 @@ class OrchestratorEngine:
         )
         self._streaming_text_accum: Dict[str, List[str]] = {}
         self._handoff_specialist_snapshots: Dict[str, str] = {}
+        self._latest_coordinator_artifacts: Dict[str, Any] = {}
+        self._latest_coordinator_response_text: str = ""
 
         if enable_checkpointing:
             self.checkpoint_storage = InMemoryCheckpointStorage()
@@ -392,9 +396,11 @@ class OrchestratorEngine:
             )
             await self._emit_stage_completed("synthesize_output", "Synthesize Output", synth_started_at)
 
-            summary = result.get("summary", "") if isinstance(result, dict) else ""
+            summary = str(result.get("summary", "") or "") if isinstance(result, dict) else ""
+            answer = str(result.get("answer", "") or "") if isinstance(result, dict) else ""
             await self.emit_event("orchestrator.run_completed", {
                 "result": result,
+                "answer": answer,
                 "summary": summary,
                 "decision_count": len(self.decisions),
                 "evidence_count": len(self.evidence),
@@ -768,6 +774,139 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                 return parsed
         return None
 
+    def _extract_final_answer_from_text(self, text: str) -> str:
+        """Extract an explicit user-facing final answer from free-form coordinator text."""
+        patterns = [
+            r"(?ims)^final\s*answer\s*[:\-]\s*(.+?)(?:\n\s*\n|```|$)",
+            r"(?ims)^answer\s*[:\-]\s*(.+?)(?:\n\s*\n|```|$)",
+            r"(?ims)^recommendation\s*[:\-]\s*(.+?)(?:\n\s*\n|```|$)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                candidate = re.sub(r"\s+", " ", match.group(1)).strip()
+                if candidate:
+                    return candidate[:1000]
+
+        without_fenced_json = re.sub(
+            r"```(?:json)?\s*.*?```",
+            "",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        ).strip()
+        if not without_fenced_json:
+            return ""
+
+        lines = [line.strip() for line in without_fenced_json.splitlines() if line.strip()]
+        if not lines:
+            return ""
+
+        generic_prefixes = (
+            "coordinator synthesis complete",
+            "synthesis complete",
+            "analysis complete",
+        )
+        filtered_lines = [line for line in lines if not line.lower().startswith(generic_prefixes)]
+        if not filtered_lines:
+            return ""
+        chosen_lines = filtered_lines
+        candidate = re.sub(r"\s+", " ", " ".join(chosen_lines)).strip()
+        return candidate[:1000]
+
+    @staticmethod
+    def _choose_selected_option(artifacts: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        options = artifacts.get("options")
+        if not isinstance(options, list) or not options:
+            return None
+
+        selected_option_id = str(artifacts.get("selectedOptionId") or "").strip()
+        for option in options:
+            if not isinstance(option, dict):
+                continue
+            option_id = str(option.get("optionId") or "").strip()
+            if selected_option_id and option_id == selected_option_id:
+                return option
+
+        ranked_options = [opt for opt in options if isinstance(opt, dict)]
+        def _rank_value(option: Dict[str, Any]) -> int:
+            try:
+                return int(option.get("rank", 9999))
+            except (TypeError, ValueError):
+                return 9999
+        ranked_options.sort(key=_rank_value)
+        return ranked_options[0] if ranked_options else None
+
+    def _synthesize_answer_from_artifacts(
+        self,
+        artifacts: Dict[str, Any],
+        agent_responses: List[Dict[str, Any]],
+    ) -> str:
+        """Create a user-facing answer when the coordinator did not return one explicitly."""
+        summary = str(artifacts.get("summary") or "").strip()
+        selected_option = self._choose_selected_option(artifacts)
+        timeline = artifacts.get("timeline") if isinstance(artifacts.get("timeline"), list) else []
+
+        parts: List[str] = []
+        if selected_option and isinstance(selected_option, dict):
+            description = str(selected_option.get("description") or "").strip()
+            if description:
+                parts.append(f"Recommended response: {description}.")
+
+        if summary:
+            parts.append(summary)
+
+        timeline_actions: List[str] = []
+        for item in timeline[:2]:
+            if isinstance(item, dict):
+                action = str(item.get("action") or "").strip()
+                if action:
+                    timeline_actions.append(action)
+        if timeline_actions:
+            parts.append(f"Immediate steps: {'; '.join(timeline_actions)}.")
+
+        if not parts:
+            for resp in agent_responses:
+                snippet = str(resp.get("result_summary") or "").strip()
+                if snippet:
+                    parts.append(snippet)
+                if len(parts) >= 2:
+                    break
+
+        if not parts:
+            fallback = (
+                "Based on specialist findings, proceed with the safest recovery option "
+                "that minimizes operational disruption and passenger impact."
+            )
+            return fallback
+
+        joined = re.sub(r"\s+", " ", " ".join(parts)).strip()
+        return joined[:1400]
+
+    def _resolve_final_answer(
+        self,
+        final_output: Any,
+        artifacts: Dict[str, Any],
+        agent_responses: List[Dict[str, Any]],
+        fused_summary: str,
+    ) -> str:
+        """Resolve the final user-facing answer with deterministic priority."""
+        answer = ""
+        if isinstance(final_output, dict):
+            answer = str(final_output.get("answer") or "").strip()
+            if not answer:
+                answer = str(final_output.get("finalAnswer") or "").strip()
+            if not answer:
+                answer = str(final_output.get("recommendation") or "").strip()
+
+        if not answer:
+            answer = str(artifacts.get("finalAnswer") or "").strip()
+        if not answer:
+            answer = self._synthesize_answer_from_artifacts(artifacts, agent_responses)
+        if not answer:
+            answer = fused_summary
+
+        return re.sub(r"\s+", " ", answer).strip()[:1600]
+
     def _parse_heuristic_artifacts(self, text: str) -> Dict[str, Any]:
         options: List[Dict[str, Any]] = []
         timeline: List[Dict[str, Any]] = []
@@ -818,12 +957,17 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         else:
             summary = re.sub(r"\s+", " ", text).strip()[:280]
 
+        final_answer = self._extract_final_answer_from_text(text)
+        if not final_answer:
+            final_answer = summary
+
         return {
             "criteria": DEFAULT_RECOVERY_CRITERIA.copy(),
             "options": options,
             "timeline": timeline,
             "selectedOptionId": selected_option_id,
             "summary": summary or "Coordinator synthesized specialist findings.",
+            "finalAnswer": final_answer,
         }
 
     def _build_fused_summary(self, agent_responses: List[Dict[str, Any]]) -> str:
@@ -903,13 +1047,21 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
 
         selected_option_id = str(parsed_json.get("selectedOptionId") or "")
         summary = str(parsed_json.get("summary") or "").strip()
+        final_answer = str(
+            parsed_json.get("finalAnswer")
+            or parsed_json.get("answer")
+            or parsed_json.get("recommendation")
+            or ""
+        ).strip()
 
         if not summary:
             summary = re.sub(r"\s+", " ", response_text).strip()[:280]
+        if not final_answer:
+            final_answer = self._extract_final_answer_from_text(response_text)
         if not selected_option_id and options:
             selected_option_id = options[0]["optionId"]
 
-        if not options and not timeline:
+        if not options and not timeline and not summary and not final_answer:
             return self._parse_heuristic_artifacts(response_text)
 
         return {
@@ -918,6 +1070,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             "timeline": timeline,
             "selectedOptionId": selected_option_id,
             "summary": summary or "Coordinator synthesized specialist findings.",
+            "finalAnswer": final_answer or summary or "Coordinator synthesized specialist findings.",
         }
 
     async def _emit_coordinator_artifacts(self, response_text: str):
@@ -930,6 +1083,10 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         timeline = artifacts.get("timeline", [])
         selected_option_id = artifacts.get("selectedOptionId", "")
         summary = artifacts.get("summary", "Coordinator synthesized specialist findings.")
+        final_answer = str(artifacts.get("finalAnswer") or "").strip()
+
+        self._latest_coordinator_artifacts = artifacts
+        self._latest_coordinator_response_text = response_text
 
         if options:
             for option in options:
@@ -965,6 +1122,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                 selected_option_id=selected_option_id,
                 timeline=timeline,
                 summary=summary,
+                final_answer=final_answer,
             )
         else:
             await self.emit_event(
@@ -973,6 +1131,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                     "selectedOptionId": selected_option_id,
                     "timeline": timeline,
                     "summary": summary,
+                    "finalAnswer": final_answer,
                     "options": options,
                 },
             )
@@ -1001,11 +1160,212 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         """Return 1.0 if real data sources responded, 0.0 otherwise."""
         return 1.0 if source_count > 0 else 0.0
 
+    def _is_actual_data_source_trace_mode(self) -> bool:
+        return self._data_source_trace_mode != "synthetic"
+
+    @staticmethod
+    def _parse_possible_json_payload(raw: Any) -> Optional[Dict[str, Any]]:
+        if isinstance(raw, dict):
+            return raw
+        if not isinstance(raw, str):
+            return None
+        text = raw.strip()
+        if not text:
+            return None
+
+        candidates = [text]
+        fenced = re.findall(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+        candidates.extend(block.strip() for block in fenced if block.strip())
+        brace_start = text.find("{")
+        brace_end = text.rfind("}")
+        if brace_start >= 0 and brace_end > brace_start:
+            candidates.append(text[brace_start:brace_end + 1].strip())
+
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                pass
+            try:
+                parsed = ast.literal_eval(candidate)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
+    def _extract_error_code(message: str) -> str:
+        if not message:
+            return "SOURCE_QUERY_ERROR"
+        explicit = re.match(r"^\s*([A-Z0-9_]{3,})\s*:\s*", message)
+        if explicit:
+            return explicit.group(1)
+        lowered = message.lower()
+        if "timeout" in lowered or "timed out" in lowered:
+            return "SOURCE_TIMEOUT"
+        if "not configured" in lowered or "missing" in lowered:
+            return "SOURCE_NOT_CONFIGURED"
+        if "not installed" in lowered:
+            return "SOURCE_DEPENDENCY_MISSING"
+        if "token" in lowered or "auth" in lowered or "forbidden" in lowered:
+            return "SOURCE_AUTH_ERROR"
+        if "schema" in lowered:
+            return "SOURCE_SCHEMA_ERROR"
+        if "blocked" in lowered:
+            return "SOURCE_QUERY_BLOCKED"
+        return "SOURCE_QUERY_ERROR"
+
+    def _infer_result_count_from_payload(self, payload: Dict[str, Any]) -> int:
+        for key in ("count", "total", "total_analyzed", "trend_count"):
+            value = payload.get(key)
+            if isinstance(value, int) and value >= 0:
+                return value
+        max_len = 0
+        for value in payload.values():
+            if isinstance(value, list):
+                max_len = max(max_len, len(value))
+        return max_len
+
+    async def _emit_real_data_source_events_from_tool_payload(
+        self,
+        agent_id: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        if not self.trace_emitter:
+            return
+        profile = self._get_agent_profile(agent_id)
+        if not profile:
+            return
+        agent_name = profile.agent_name
+        now = datetime.now(timezone.utc)
+
+        citations_raw = payload.get("citations")
+        citations: List[Dict[str, Any]] = []
+        if isinstance(citations_raw, list):
+            for item in citations_raw:
+                if isinstance(item, dict):
+                    citations.append(item)
+
+        source_errors_raw = payload.get("sourceErrors")
+        source_errors: List[Dict[str, Any]] = []
+        if isinstance(source_errors_raw, list):
+            for item in source_errors_raw:
+                if isinstance(item, dict):
+                    source_errors.append(item)
+
+        per_source: Dict[str, Dict[str, Any]] = {}
+        inferred_count = self._infer_result_count_from_payload(payload)
+
+        for citation in citations:
+            source_type = str(
+                citation.get("source_type")
+                or citation.get("sourceType")
+                or citation.get("source")
+                or ""
+            ).strip()
+            if not source_type:
+                continue
+            title = str(citation.get("title") or "")
+            lowered = title.lower()
+            is_error = (
+                "error" in lowered
+                or "failed" in lowered
+                or "not configured" in lowered
+                or "not installed" in lowered
+                or "timeout" in lowered
+                or "timed out" in lowered
+                or "blocked" in lowered
+                or "missing" in lowered
+                or "no " in lowered
+            )
+            entry = per_source.setdefault(
+                source_type,
+                {"status": "complete", "result_count": inferred_count, "error_code": "", "error_message": "", "query_summary": ""},
+            )
+            entry["query_summary"] = title[:200] or entry["query_summary"]
+            if is_error:
+                entry["status"] = "failed"
+                entry["result_count"] = 0
+                entry["error_code"] = self._extract_error_code(title)
+                entry["error_message"] = title[:220]
+
+        for source_err in source_errors:
+            source_type = str(source_err.get("sourceType") or source_err.get("source_type") or "").strip()
+            if not source_type:
+                continue
+            message = str(source_err.get("message") or source_err.get("errorMessage") or "Source query failed")
+            code = str(source_err.get("errorCode") or self._extract_error_code(message))
+            entry = per_source.setdefault(
+                source_type,
+                {"status": "failed", "result_count": 0, "error_code": code, "error_message": message[:220], "query_summary": ""},
+            )
+            entry["status"] = "failed"
+            entry["result_count"] = 0
+            entry["error_code"] = code
+            entry["error_message"] = message[:220]
+
+        for source_type, details in per_source.items():
+            query_id = f"{agent_id}-{source_type}-{uuid.uuid4().hex[:8]}"
+            query_summary = details.get("query_summary") or f"{source_type} query by {agent_name}"
+            await self.trace_emitter.emit_data_source_query_start(
+                agent_id=agent_id,
+                agent_name=agent_name,
+                source_type=source_type,
+                query_summary=query_summary,
+                query_id=query_id,
+                query_type="read",
+            )
+            latency_ms = max(
+                0,
+                int((now - self._agent_started_at.get(agent_id, now)).total_seconds() * 1000),
+            )
+            if details.get("status") == "failed":
+                await self.trace_emitter.emit_data_source_query_failed(
+                    agent_id=agent_id,
+                    agent_name=agent_name,
+                    source_type=source_type,
+                    error_code=str(details.get("error_code") or "SOURCE_QUERY_ERROR"),
+                    error_message=str(details.get("error_message") or "Source query failed"),
+                    latency_ms=latency_ms,
+                    query_id=query_id,
+                    query_summary=query_summary,
+                )
+            else:
+                result_count = int(details.get("result_count") or 0)
+                await self.trace_emitter.emit_data_source_query_complete(
+                    agent_id=agent_id,
+                    agent_name=agent_name,
+                    source_type=source_type,
+                    result_count=result_count,
+                    latency_ms=latency_ms,
+                    query_id=query_id,
+                    query_summary=query_summary,
+                )
+                await self.trace_emitter.emit_agent_evidence(
+                    agent_id=agent_id,
+                    agent_name=agent_name,
+                    source_type=source_type,
+                    summary=f"{source_type} evidence returned {result_count} rows",
+                    result_count=result_count,
+                    confidence=1.0 if result_count > 0 else 0.0,
+                )
+
     async def _emit_query_starts(self, agent_id: str, objective: str):
         if not self.trace_emitter:
             return
         profile = self._get_agent_profile(agent_id)
         if not profile or not profile.data_sources:
+            return
+
+        if self._is_actual_data_source_trace_mode():
+            self._active_query_contexts[agent_id] = {
+                "started_at": datetime.now(timezone.utc),
+                "objective": objective,
+                "queries": [],
+            }
             return
 
         started_at = datetime.now(timezone.utc)
@@ -1055,6 +1415,9 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         message_count: int,
     ):
         if not self.trace_emitter:
+            return
+        if self._is_actual_data_source_trace_mode():
+            self._active_query_contexts.pop(agent_id, None)
             return
         ctx = self._active_query_contexts.get(agent_id)
         if not ctx:
@@ -1243,6 +1606,8 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         self._agent_stream_guarded_invocation_keys.clear()
         self._streaming_text_accum.clear()
         self._handoff_specialist_snapshots.clear()
+        self._latest_coordinator_artifacts.clear()
+        self._latest_coordinator_response_text = ""
         logger.info("workflow_state_reset", run_id=self.run_id)
 
     async def _emit_synthetic_agent_completion(self, agent_id: str, reason: str):
@@ -1672,12 +2037,25 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             # Guarantee a coordinator.plan event reaches the UI
             if not self._coordinator_artifacts_emitted and self._is_bounded_orchestration_mode():
                 summary = self._build_fused_summary(agent_responses)
+                fallback_artifacts = {
+                    "criteria": DEFAULT_RECOVERY_CRITERIA.copy(),
+                    "options": [],
+                    "timeline": [],
+                    "selectedOptionId": "",
+                    "summary": summary,
+                    "finalAnswer": self._synthesize_answer_from_artifacts(
+                        {"summary": summary, "options": [], "timeline": [], "selectedOptionId": ""},
+                        agent_responses,
+                    ),
+                }
                 await self.emit_event("coordinator.plan", {
                     "selectedOptionId": "",
                     "timeline": [],
                     "summary": summary,
+                    "finalAnswer": fallback_artifacts["finalAnswer"],
                     "options": [],
                 })
+                self._latest_coordinator_artifacts = fallback_artifacts
                 self._coordinator_artifacts_emitted = True
                 logger.info(
                     "fallback_coordinator_plan_emitted",
@@ -1686,19 +2064,39 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                 )
 
         fused_summary = self._build_fused_summary(agent_responses)
+        artifacts = self._latest_coordinator_artifacts.copy() if self._latest_coordinator_artifacts else {}
+        if not artifacts and self._latest_coordinator_response_text:
+            artifacts = self._parse_coordinator_artifacts(self._latest_coordinator_response_text)
 
         if isinstance(final_output, dict):
-            if "summary" not in final_output:
-                final_output["summary"] = fused_summary
-            return final_output
+            result: Dict[str, Any] = dict(final_output)
+        else:
+            result = {}
 
-        return {
-            "status": "completed",
-            "scenario": self.scenario,
-            "agent_responses": agent_responses,
-            "evidence_count": len(self.evidence),
-            "summary": fused_summary,
-        }
+        result.setdefault("status", "completed")
+        result.setdefault("scenario", self.scenario)
+        result.setdefault("agent_responses", agent_responses)
+        result.setdefault("evidence_count", len(self.evidence))
+        if "summary" not in result or not str(result.get("summary") or "").strip():
+            result["summary"] = fused_summary
+
+        for key in ("criteria", "options", "timeline", "selectedOptionId", "finalAnswer"):
+            if key not in artifacts:
+                continue
+            current_value = result.get(key)
+            is_empty_string = isinstance(current_value, str) and not current_value.strip()
+            is_empty_list = isinstance(current_value, list) and len(current_value) == 0
+            if key not in result or current_value is None or is_empty_string or is_empty_list:
+                result[key] = artifacts[key]
+
+        result["answer"] = self._resolve_final_answer(
+            final_output=result,
+            artifacts=artifacts,
+            agent_responses=agent_responses,
+            fused_summary=fused_summary,
+        )
+
+        return result
 
     async def _process_workflow_event(self, event: WorkflowEvent):
         # Log every event type flowing through (debug level to avoid noise)
@@ -2106,8 +2504,17 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                         if ctype == "text":
                             parts.append(getattr(c, "text", ""))
                         elif ctype == "function_result":
-                            # Tool output — contains the specialist's actual data
-                            result_text = getattr(c, "result", None) or getattr(c, "text", None) or ""
+                            # Tool output — parse structured payload for real source tracing.
+                            raw_result = getattr(c, "result", None)
+                            if raw_result is None:
+                                raw_result = getattr(c, "text", None)
+                            parsed_payload = self._parse_possible_json_payload(raw_result)
+                            if parsed_payload and self._is_actual_data_source_trace_mode():
+                                await self._emit_real_data_source_events_from_tool_payload(
+                                    agent_id=executor_id,
+                                    payload=parsed_payload,
+                                )
+                            result_text = raw_result if isinstance(raw_result, str) else json.dumps(raw_result, ensure_ascii=True) if raw_result is not None else ""
                             if isinstance(result_text, str) and result_text.strip():
                                 parts.append(result_text.strip())
                     chunk = " ".join(p for p in parts if p)

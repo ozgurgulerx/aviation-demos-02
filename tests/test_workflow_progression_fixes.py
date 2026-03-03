@@ -388,6 +388,91 @@ async def test_coordinator_malformed_output_still_emits_plan():
     assert plan_events[0].get("summary")
 
 
+def test_parse_coordinator_artifacts_extracts_final_answer_from_json():
+    engine = OrchestratorEngine(run_id="test-final-answer-json", enable_checkpointing=False)
+    response = """Coordinator synthesis complete.
+```json
+{
+  "criteria": ["delay_reduction", "crew_margin", "safety_score", "cost_impact", "passenger_impact"],
+  "options": [
+    {
+      "optionId": "opt-1",
+      "description": "Divert to DTW and rebalance connections",
+      "rank": 1,
+      "scores": {"delay_reduction": 82, "crew_margin": 75, "safety_score": 93, "cost_impact": 64, "passenger_impact": 79}
+    }
+  ],
+  "selectedOptionId": "opt-1",
+  "summary": "opt-1 minimizes knock-on delays while maintaining safety margins.",
+  "finalAnswer": "Divert to DTW now, then recover ORD arrivals in two waves to minimize passenger disruption.",
+  "timeline": [{"time": "T+0", "action": "Issue DTW diversion clearance", "agent": "diversion_advisor"}]
+}
+```
+"""
+    artifacts = engine._parse_coordinator_artifacts(response)
+    assert artifacts["finalAnswer"].startswith("Divert to DTW now")
+    assert artifacts["summary"].startswith("opt-1 minimizes")
+
+
+def test_parse_coordinator_artifacts_ignores_generic_preamble_for_final_answer():
+    engine = OrchestratorEngine(run_id="test-final-answer-boilerplate", enable_checkpointing=False)
+    response = """Coordinator synthesis complete.
+```json
+{
+  "criteria": ["delay_reduction", "crew_margin", "safety_score", "cost_impact", "passenger_impact"],
+  "options": [
+    {"optionId": "opt-1", "description": "Divert to DTW and rebalance connections", "rank": 1}
+  ],
+  "selectedOptionId": "opt-1",
+  "summary": "opt-1 minimizes knock-on delays while maintaining safety margins.",
+  "timeline": [{"time": "T+0", "action": "Issue DTW diversion clearance", "agent": "diversion_advisor"}]
+}
+```
+"""
+    artifacts = engine._parse_coordinator_artifacts(response)
+    assert artifacts["summary"].startswith("opt-1 minimizes")
+    assert artifacts["finalAnswer"] == artifacts["summary"]
+
+
+def test_resolve_final_answer_prefers_explicit_output_answer():
+    engine = OrchestratorEngine(run_id="test-answer-priority", enable_checkpointing=False)
+    resolved = engine._resolve_final_answer(
+        final_output={"answer": "Use Option 2 immediately and protect long-haul banks."},
+        artifacts={
+            "summary": "Operational summary",
+            "finalAnswer": "This should not be selected",
+        },
+        agent_responses=[],
+        fused_summary="Fused summary fallback",
+    )
+    assert resolved == "Use Option 2 immediately and protect long-haul banks."
+
+
+def test_resolve_final_answer_synthesizes_from_artifacts_when_missing():
+    engine = OrchestratorEngine(run_id="test-answer-fallback", enable_checkpointing=False)
+    artifacts = {
+        "summary": "Choose DTW diversion to preserve safety and maintain onward connectivity.",
+        "selectedOptionId": "opt-2",
+        "options": [
+            {"optionId": "opt-1", "description": "Hold and reassess", "rank": 2},
+            {"optionId": "opt-2", "description": "Divert to DTW with coordinated crew replan", "rank": 1},
+        ],
+        "timeline": [
+            {"time": "T+0", "action": "Issue diversion clearance"},
+            {"time": "T+15m", "action": "Rebook impacted connections"},
+        ],
+    }
+    fused_summary = "Analysis complete. 4 specialists contributed."
+    resolved = engine._resolve_final_answer(
+        final_output={},
+        artifacts=artifacts,
+        agent_responses=[],
+        fused_summary=fused_summary,
+    )
+    assert "Divert to DTW" in resolved
+    assert resolved != fused_summary
+
+
 @pytest.mark.asyncio
 async def test_deterministic_timeout_emits_failed_reason(monkeypatch):
     captured: list[tuple[str, dict]] = []
