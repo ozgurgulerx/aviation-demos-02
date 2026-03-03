@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 import pytest
 
-from agent_framework import ExecutorCompletedEvent, ExecutorInvokedEvent, WorkflowRunState, WorkflowStatusEvent
+from agent_framework import AgentExecutorResponse, AgentResponse, AgentRunEvent, ChatMessage, ExecutorCompletedEvent, ExecutorInvokedEvent, WorkflowRunState, WorkflowStatusEvent
 
 from orchestrator.agent_registry import AgentSelectionResult, SCENARIO_AGENTS
 from orchestrator.engine import OrchestratorEngine, _LoopCappedSignal
@@ -39,7 +39,7 @@ def _agent(agent_id: str, name: str, category: str = "specialist") -> AgentSelec
 
 @pytest.mark.asyncio
 async def test_executor_completed_uses_streaming_text_accum():
-    """agent.completed should use accumulated streaming text, not hardcoded zeros."""
+    """agent.completed should use accumulated streaming text when no AgentRunEvent fires."""
     captured: list[tuple[str, dict]] = []
 
     async def emit(event_type: str, payload: dict):
@@ -51,6 +51,7 @@ async def test_executor_completed_uses_streaming_text_accum():
     engine._agent_lookup = {profile.agent_id: profile}
 
     # Simulate: agent was invoked, produced streaming text, then completed
+    # (no AgentRunEvent — only ExecutorCompletedEvent with None data)
     await engine._process_workflow_event(ExecutorInvokedEvent("specialist_x"))
     engine._streaming_text_accum["specialist_x"] = [
         "Detroit Metro (DTW) is the nearest suitable alternate. ",
@@ -62,6 +63,66 @@ async def test_executor_completed_uses_streaming_text_accum():
     assert len(completed) == 1
     assert completed[0]["message_count"] == 2
     assert "Detroit Metro" in completed[0]["summary"]
+
+
+@pytest.mark.asyncio
+async def test_agent_run_event_takes_priority_over_executor_completed():
+    """When AgentRunEvent fires first, ExecutorCompletedEvent should NOT re-emit agent.completed."""
+    captured: list[tuple[str, dict]] = []
+
+    async def emit(event_type: str, payload: dict):
+        captured.append((event_type, payload))
+
+    engine = OrchestratorEngine(run_id="test-priority", event_emitter=emit, enable_checkpointing=False)
+    profile = _agent("specialist_y", "Specialist Y")
+    engine.selected_agents = [profile]
+    engine._agent_lookup = {profile.agent_id: profile}
+
+    # Simulate: invoked → AgentRunEvent (with real response) → ExecutorCompletedEvent (None data)
+    await engine._process_workflow_event(ExecutorInvokedEvent("specialist_y"))
+
+    response = AgentResponse(messages=[
+        ChatMessage(role="assistant", text="DTW is 45 NM away with ILS 21L available and clear conditions."),
+    ])
+    await engine._process_workflow_event(AgentRunEvent("specialist_y", response))
+    await engine._process_workflow_event(ExecutorCompletedEvent("specialist_y"))
+
+    completed = [p for t, p in captured if t == "agent.completed"]
+    # Only ONE agent.completed should be emitted (from AgentRunEvent), not two
+    assert len(completed) == 1
+    assert completed[0]["completionReason"] == "analysis_complete"
+    assert completed[0]["message_count"] == 1
+    assert "DTW" in completed[0]["summary"]
+
+
+@pytest.mark.asyncio
+async def test_executor_completed_fallback_when_no_agent_run_event():
+    """When no AgentRunEvent fires, ExecutorCompletedEvent should use accumulated streaming text."""
+    captured: list[tuple[str, dict]] = []
+
+    async def emit(event_type: str, payload: dict):
+        captured.append((event_type, payload))
+
+    engine = OrchestratorEngine(run_id="test-fallback", event_emitter=emit, enable_checkpointing=False)
+    profile = _agent("specialist_z", "Specialist Z")
+    engine.selected_agents = [profile]
+    engine._agent_lookup = {profile.agent_id: profile}
+
+    # Simulate: invoked → streaming chunks accumulated → ExecutorCompletedEvent (no prior AgentRunEvent)
+    await engine._process_workflow_event(ExecutorInvokedEvent("specialist_z"))
+    engine._streaming_text_accum["specialist_z"] = [
+        "Weather analysis complete. ",
+        "METAR shows improving conditions at DTW. ",
+        "Ceiling 2500ft, visibility 6SM.",
+    ]
+    await engine._process_workflow_event(ExecutorCompletedEvent("specialist_z"))
+
+    completed = [p for t, p in captured if t == "agent.completed"]
+    assert len(completed) == 1
+    assert completed[0]["completionReason"] == "executor_completed"
+    assert completed[0]["message_count"] == 3
+    assert "Weather analysis complete" in completed[0]["summary"]
+    assert "Specialist Z completed execution." not in completed[0]["summary"]
 
 
 @pytest.mark.asyncio
@@ -445,3 +506,71 @@ async def test_llm_directed_selection_applies_agent_order(monkeypatch):
     selected_ids = [agent.agent_id for agent in engine.selected_agents]
     assert selected_ids == ["weather_safety", "route_planner", "decision_coordinator"]
     assert engine._coordinator_agent_id == "decision_coordinator"
+
+
+@pytest.mark.asyncio
+async def test_executor_completed_extracts_from_agent_executor_response():
+    """agent.completed should extract text from AgentExecutorResponse in event.data."""
+    captured: list[tuple[str, dict]] = []
+
+    async def emit(event_type: str, payload: dict):
+        captured.append((event_type, payload))
+
+    engine = OrchestratorEngine(run_id="test-aer", event_emitter=emit, enable_checkpointing=False)
+    profile = _agent("specialist_y", "Specialist Y")
+    engine.selected_agents = [profile]
+    engine._agent_lookup = {profile.agent_id: profile}
+
+    # Simulate invocation
+    await engine._process_workflow_event(ExecutorInvokedEvent("specialist_y"))
+
+    # Create a real AgentExecutorResponse with content
+    agent_resp = AgentResponse(messages=[
+        ChatMessage(role="assistant", text="DTW is recommended. Runway 21L ILS available."),
+    ])
+    exec_resp = AgentExecutorResponse(
+        executor_id="specialist_y",
+        agent_response=agent_resp,
+    )
+    # Fire completion with data list containing the executor response
+    completed_event = ExecutorCompletedEvent("specialist_y", [exec_resp])
+    await engine._process_workflow_event(completed_event)
+
+    completed = [p for t, p in captured if t == "agent.completed"]
+    assert len(completed) == 1
+    assert completed[0]["message_count"] >= 1
+    assert "DTW" in completed[0]["summary"]
+
+
+@pytest.mark.asyncio
+async def test_executor_completed_extracts_from_full_conversation():
+    """agent.completed should extract text from full_conversation when agent_response is empty."""
+    captured: list[tuple[str, dict]] = []
+
+    async def emit(event_type: str, payload: dict):
+        captured.append((event_type, payload))
+
+    engine = OrchestratorEngine(run_id="test-fc", event_emitter=emit, enable_checkpointing=False)
+    profile = _agent("specialist_fc", "Specialist FC")
+    engine.selected_agents = [profile]
+    engine._agent_lookup = {profile.agent_id: profile}
+
+    await engine._process_workflow_event(ExecutorInvokedEvent("specialist_fc"))
+
+    # AgentExecutorResponse with empty agent_response but full_conversation
+    agent_resp = AgentResponse(messages=[])
+    exec_resp = AgentExecutorResponse(
+        executor_id="specialist_fc",
+        agent_response=agent_resp,
+        full_conversation=[
+            ChatMessage(role="user", text="Analyze weather at DTW"),
+            ChatMessage(role="assistant", text="Ceiling 2500ft, visibility 6SM, improving trend."),
+        ],
+    )
+    completed_event = ExecutorCompletedEvent("specialist_fc", [exec_resp])
+    await engine._process_workflow_event(completed_event)
+
+    completed = [p for t, p in captured if t == "agent.completed"]
+    assert len(completed) == 1
+    assert completed[0]["message_count"] >= 1
+    assert "2500ft" in completed[0]["summary"]

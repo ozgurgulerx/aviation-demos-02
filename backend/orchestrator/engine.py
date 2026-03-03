@@ -729,6 +729,11 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                 continue
             chunks.append(str(msg))
         merged = " ".join(chunks).strip()
+        # Fallback: try .text property directly (e.g., AgentResponse.text)
+        if not merged:
+            direct_text = getattr(response, "text", None)
+            if isinstance(direct_text, str) and direct_text.strip():
+                merged = direct_text.strip()
         return merged[:8000]
 
     @staticmethod
@@ -1455,8 +1460,28 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                 # --- Capture specialist contributions from ExecutorCompletedEvent ---
                 if isinstance(event, ExecutorCompletedEvent):
                     comp_executor_id = event.executor_id or "unknown"
+                    # --- Diagnostic logging for specialist completion data ---
+                    logger.info(
+                        "executor_completed_data_inspection",
+                        run_id=self.run_id,
+                        executor_id=comp_executor_id,
+                        data_type=type(event.data).__name__ if event.data is not None else "None",
+                        data_len=len(event.data) if isinstance(event.data, list) else -1,
+                        data_item_types=[type(item).__name__ for item in event.data][:5] if isinstance(event.data, list) else [],
+                        has_agent_response=[hasattr(item, "agent_response") for item in event.data][:5] if isinstance(event.data, list) else [],
+                        agent_response_truthy=[bool(getattr(item, "agent_response", None)) for item in event.data][:5] if isinstance(event.data, list) else [],
+                        streaming_accum_len=len(self._streaming_text_accum.get(comp_executor_id, [])),
+                        streaming_accum_preview="".join(self._streaming_text_accum.get(comp_executor_id, []))[:200],
+                    )
 
                     if comp_executor_id == self._coordinator_agent_id:
+                        logger.info(
+                            "coordinator_completed_data_inspection",
+                            run_id=self.run_id,
+                            data_type=type(event.data).__name__ if event.data else "None",
+                            streaming_accum_keys=list(self._streaming_text_accum.keys()),
+                            streaming_accum_lens={k: len(v) for k, v in self._streaming_text_accum.items()},
+                        )
                         # Coordinator: extract artifacts for the plan/scoring UI
                         if not self._coordinator_artifacts_emitted:
                             coord_text = ""
@@ -1477,19 +1502,52 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                         if not already_heard:
                             resp_text = ""
                             msg_count = 0
-                            # Extract from AgentExecutorResponse in completion data
+
+                            # Path A: Extract from AgentExecutorResponse.agent_response in event.data
                             if isinstance(event.data, list):
                                 for item in event.data:
-                                    if hasattr(item, "agent_response") and item.agent_response:
-                                        resp_text = self._extract_response_text(item.agent_response)
-                                        msg_count = len(item.agent_response.messages) if item.agent_response.messages else 0
-                                        break
-                            # Fallback: accumulated streaming text
+                                    ar = getattr(item, "agent_response", None)
+                                    if ar:
+                                        # Try _extract_response_text first (iterates messages)
+                                        resp_text = self._extract_response_text(ar)
+                                        if not resp_text:
+                                            # Try .text property directly
+                                            resp_text = getattr(ar, "text", "") or ""
+                                        msgs = getattr(ar, "messages", None)
+                                        msg_count = len(msgs) if msgs else (1 if resp_text else 0)
+                                        if resp_text:
+                                            break
+                                    # Try full_conversation as fallback
+                                    if not resp_text:
+                                        fc = getattr(item, "full_conversation", None)
+                                        if fc:
+                                            parts = []
+                                            for m in fc:
+                                                t = getattr(m, "text", None)
+                                                if t and isinstance(t, str) and t.strip():
+                                                    parts.append(t.strip())
+                                            if parts:
+                                                resp_text = " ".join(parts)[:8000]
+                                                msg_count = len(parts)
+                                                break
+
+                            # Path B: Accumulated streaming text
                             if not resp_text:
                                 chunks = self._streaming_text_accum.get(comp_executor_id, [])
                                 if chunks:
                                     resp_text = "".join(chunks)[:8000]
-                                    msg_count = 1
+                                    msg_count = len(chunks)
+
+                            # Log extraction outcome
+                            logger.info(
+                                "specialist_extraction_result",
+                                run_id=self.run_id,
+                                executor_id=comp_executor_id,
+                                extracted_len=len(resp_text),
+                                msg_count=msg_count,
+                                extraction_path="event_data" if msg_count > 0 and not self._streaming_text_accum.get(comp_executor_id) else ("streaming" if msg_count > 0 else "none"),
+                            )
+
                             if resp_text or comp_executor_id in self._agent_execution_counts:
                                 agent_responses.append({
                                     "agent": comp_executor_id,
@@ -1703,6 +1761,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                 self._agent_stream_update_counts[executor_id] = 0
                 self._agent_stream_last_update_at[executor_id] = now
             self._active_agent_ids.add(executor_id)
+            self._completed_agent_ids.discard(executor_id)  # Reset completion for re-invocations
             self._agent_progress_pct[executor_id] = max(self._agent_progress_pct.get(executor_id, 0.0), 5.0)
 
             await self.emit_event(
@@ -1759,6 +1818,29 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             if execution_guard_key in self._agent_stream_guarded_invocation_keys:
                 self._active_agent_ids.discard(executor_id)
                 return
+
+            # Skip re-emission if AgentRunEvent already completed this agent
+            if executor_id in self._completed_agent_ids:
+                # AgentRunEvent already emitted agent.completed with real content.
+                # Still emit executor.completed lifecycle event but skip agent.completed.
+                self._active_agent_ids.discard(executor_id)
+                profile = self._get_agent_profile(executor_id)
+                agent_name = profile.agent_name if profile else executor_id
+                await self.emit_event(
+                    "executor.completed",
+                    {
+                        **event_data,
+                        "executor_id": executor_id,
+                        "executor_name": agent_name,
+                        "agentId": executor_id,
+                        "agentName": agent_name,
+                        "status": "completed",
+                        "executionCount": self._agent_execution_counts.get(executor_id, 1),
+                    },
+                )
+                await self._emit_progress(f"executor_completed:{executor_id}")
+                return
+
             profile = self._get_agent_profile(executor_id)
             agent_name = profile.agent_name if profile else executor_id
 
@@ -1784,22 +1866,68 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
 
             self._completed_agent_ids.add(executor_id)
 
-            # Extract real content instead of hardcoded zeros
+            logger.debug(
+                "executor_completed_data_inspection",
+                run_id=self.run_id,
+                executor_id=executor_id,
+                data_type=type(event.data).__name__ if event.data is not None else "None",
+                data_repr=repr(event.data)[:200] if event.data is not None else "None",
+                streaming_chunks=len(self._streaming_text_accum.get(executor_id, [])),
+            )
+
+            # Extract real content from multiple possible data formats
             resp_text = ""
             msg_count = 0
-            # Try event.data first (works for coordinator completions)
-            if isinstance(event.data, list):
-                for item in event.data:
-                    if hasattr(item, "agent_response") and item.agent_response:
-                        resp_text = self._extract_response_text(item.agent_response)
-                        msg_count = len(item.agent_response.messages) if hasattr(item.agent_response, "messages") and item.agent_response.messages else 0
-                        break
+
+            if event.data is not None:
+                data = event.data
+                # Format 1: list of AgentExecutorResponse (coordinator completions)
+                if isinstance(data, list):
+                    for item in data:
+                        ar = getattr(item, "agent_response", None)
+                        if ar:
+                            resp_text = self._extract_response_text(ar)
+                            if not resp_text:
+                                resp_text = getattr(ar, "text", "") or ""
+                            msgs = getattr(ar, "messages", None)
+                            msg_count = len(msgs) if msgs else (1 if resp_text else 0)
+                            if resp_text:
+                                break
+                        # Try full_conversation as fallback
+                        if not resp_text:
+                            fc = getattr(item, "full_conversation", None)
+                            if fc:
+                                parts = []
+                                for m in fc:
+                                    t = getattr(m, "text", None)
+                                    if t and isinstance(t, str) and t.strip():
+                                        parts.append(t.strip())
+                                if parts:
+                                    resp_text = " ".join(parts)[:8000]
+                                    msg_count = len(parts)
+                                    break
+                # Format 2: single AgentExecutorResponse
+                elif hasattr(data, "agent_response") and data.agent_response:
+                    resp_text = self._extract_response_text(data.agent_response)
+                    if not resp_text:
+                        resp_text = getattr(data.agent_response, "text", "") or ""
+                    msg_count = len(data.agent_response.messages) if getattr(data.agent_response, "messages", None) else (1 if resp_text else 0)
+                # Format 3: direct AgentResponse (has .messages)
+                elif hasattr(data, "messages"):
+                    resp_text = self._extract_response_text(data)
+                    msg_count = len(data.messages) if data.messages else 0
+                # Format 4: string
+                elif isinstance(data, str) and data.strip():
+                    resp_text = data.strip()[:8000]
+                    msg_count = 1
+
             # Fallback: accumulated streaming text (works for handoff specialists)
             if not resp_text:
                 chunks = self._streaming_text_accum.get(executor_id, [])
                 if chunks:
                     resp_text = "".join(chunks)[:8000]
                     msg_count = len(chunks)
+
             summary = resp_text[:500] if resp_text else f"{agent_name} completed execution."
 
             await self.emit_event(
@@ -1849,6 +1977,14 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             agent_name = profile.agent_name if profile else agent_id
             response_text = self._extract_response_text(response)
             message_count = len(response.messages) if response.messages else 0
+
+            logger.info(
+                "agent_run_event_captured",
+                run_id=self.run_id,
+                agent_id=agent_id,
+                message_count=message_count,
+                text_length=len(response_text),
+            )
 
             started_at = self._agent_started_at.get(agent_id, datetime.now(timezone.utc))
             ended_at = datetime.now(timezone.utc)
@@ -1915,6 +2051,29 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                 update_count = self._agent_stream_update_counts.get(executor_id, 0) + 1
                 self._agent_stream_update_counts[executor_id] = update_count
                 self._agent_stream_last_update_at[executor_id] = now
+
+            # Accumulate streaming text for later use by completion handlers
+            upd_data = event.data
+            if upd_data is not None:
+                chunk = getattr(upd_data, "text", None) or ""
+                if not chunk and hasattr(upd_data, "contents"):
+                    # Fallback: extract text from Content objects directly
+                    chunk = "".join(
+                        getattr(c, "text", "") for c in (upd_data.contents or [])
+                        if getattr(c, "type", None) == "text"
+                    )
+                if chunk:
+                    self._streaming_text_accum.setdefault(executor_id, []).append(chunk)
+                    # Log periodically (every 10th chunk) to avoid noise
+                    chunks_so_far = len(self._streaming_text_accum.get(executor_id, []))
+                    if chunks_so_far % 10 == 1:
+                        logger.debug(
+                            "streaming_text_accumulated",
+                            run_id=self.run_id,
+                            executor_id=executor_id,
+                            total_chunks=chunks_so_far,
+                            chunk_len=len(chunk),
+                        )
 
             # Throttle: emit at most one consolidated event per _stream_throttle_td per agent
             last_emit = self._agent_stream_throttle_at.get(executor_id)
