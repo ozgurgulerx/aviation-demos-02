@@ -69,6 +69,7 @@ class EventKind(str, Enum):
     # NEW: Data source activity
     DATA_SOURCE_QUERY_START = "data_source.query_start"
     DATA_SOURCE_QUERY_COMPLETE = "data_source.query_complete"
+    DATA_SOURCE_QUERY_FAILED = "data_source.query_failed"
 
     # NEW: Coordinator output
     COORDINATOR_SCORING = "coordinator.scoring"

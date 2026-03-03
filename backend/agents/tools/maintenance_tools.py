@@ -4,7 +4,7 @@ from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
-from agents.tools import retriever_query
+from agents.tools import attach_source_errors, retriever_query
 from agents.tools.domain_knowledge import MAINTENANCE_PREDICTION_GUIDANCE
 
 logger = structlog.get_logger()
@@ -21,13 +21,18 @@ async def analyze_mel_trends(
     jasc_code: Annotated[str, Field(description="JASC code to analyze (e.g., 7200 for engine)")] = "",
 ) -> Dict[str, Any]:
     """Analyze MEL/techlog trends for predictive maintenance indicators."""
+    source_citations: List[Any] = []
     if _retriever:
         query = f"MEL techlog events for {aircraft_type} fleet" + (f" JASC {jasc_code}" if jasc_code else "")
         rows, cits = await retriever_query(_retriever.query_sql(query))
+        source_citations = cits
         if rows:
-            return {"mel_events": rows[:20], "trend_count": len(rows), "citations": [c.__dict__ for c in cits]}
+            return attach_source_errors(
+                {"mel_events": rows[:20], "trend_count": len(rows), "citations": [c.__dict__ for c in cits]},
+                source_citations,
+            )
     # Fallback: provide JASC code families and trend analysis guidance
-    return {
+    return attach_source_errors({
         "aircraft_type": aircraft_type,
         "jasc_code": jasc_code,
         "mel_events": [],
@@ -40,7 +45,7 @@ async def analyze_mel_trends(
         "jasc_code_families": MAINTENANCE_PREDICTION_GUIDANCE["jasc_code_families"],
         "deferral_escalation_thresholds": MAINTENANCE_PREDICTION_GUIDANCE["deferral_escalation_thresholds"],
         "trend_analysis_framework": MAINTENANCE_PREDICTION_GUIDANCE["trend_analysis_framework"],
-    }
+    }, source_citations)
 
 
 @ai_function(approval_mode="never_require")
@@ -49,12 +54,17 @@ async def search_similar_incidents(
     top: Annotated[int, Field(description="Number of results")] = 5,
 ) -> Dict[str, Any]:
     """Search ASRS reports for similar maintenance-related incidents."""
+    source_citations: List[Any] = []
     if _retriever:
         rows, cits = await retriever_query(_retriever.query_semantic(description, top=top, source="VECTOR_OPS"))
+        source_citations = cits
         if rows:
-            return {"similar_incidents": rows[:top], "citations": [c.__dict__ for c in cits]}
+            return attach_source_errors(
+                {"similar_incidents": rows[:top], "citations": [c.__dict__ for c in cits]},
+                source_citations,
+            )
     # Fallback: provide inspection escalation criteria and regulatory refs
-    return {
+    return attach_source_errors({
         "query": description[:80],
         "similar_incidents": [],
         "status": "no_data_fallback",
@@ -64,4 +74,4 @@ async def search_similar_incidents(
         ),
         "inspection_escalation_criteria": MAINTENANCE_PREDICTION_GUIDANCE["inspection_escalation_criteria"],
         "regulatory_refs": MAINTENANCE_PREDICTION_GUIDANCE["regulatory_refs"],
-    }
+    }, source_citations)

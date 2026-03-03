@@ -4,7 +4,7 @@ from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
-from agents.tools import retriever_query
+from agents.tools import attach_source_errors, retriever_query
 from agents.tools.domain_knowledge import NETWORK_IMPACT_GUIDANCE, contextualize_network_fallback
 
 logger = structlog.get_logger()
@@ -22,20 +22,22 @@ async def simulate_delay_propagation(
     cascade_hops: Annotated[int, Field(description="Number of downstream hops to simulate")] = 3,
 ) -> Dict[str, Any]:
     """Simulate how a delay propagates through the network."""
+    source_citations: List[Any] = []
     if _retriever:
         graph_rows, graph_cits = await retriever_query(_retriever.query_graph(
             f"downstream connections from {origin_airport}", hops=cascade_hops
         ))
+        source_citations = graph_cits
         if graph_rows:
-            return {
+            return attach_source_errors({
                 "origin": origin_airport,
                 "initial_delay": delay_minutes,
                 "cascade_paths": graph_rows[:20],
                 "estimated_affected_flights": len(graph_rows),
                 "citations": [c.__dict__ for c in graph_cits],
-            }
+            }, source_citations)
     # Fallback: provide propagation model and cascade rules
-    return {
+    return attach_source_errors({
         "origin": origin_airport,
         "delay": delay_minutes,
         "affected_flights": 0,
@@ -52,7 +54,7 @@ async def simulate_delay_propagation(
             delay_minutes=delay_minutes,
             cascade_hops=cascade_hops,
         ),
-    }
+    }, source_citations)
 
 
 @ai_function(approval_mode="never_require")
@@ -61,15 +63,20 @@ async def query_historical_delays(
     cause: Annotated[str, Field(description="Delay cause: weather, carrier, nas, security")] = "weather",
 ) -> Dict[str, Any]:
     """Query BTS historical delay data for pattern analysis."""
+    source_citations: List[Any] = []
     if _retriever:
         query = f"average {cause} delays at {airport} from BTS on-time performance data"
         rows, cits = await retriever_query(_retriever.query_fabric_sql(query))
+        source_citations = cits
         if rows:
-            return {"historical_delays": rows[:20], "citations": [c.__dict__ for c in cits]}
+            return attach_source_errors(
+                {"historical_delays": rows[:20], "citations": [c.__dict__ for c in cits]},
+                source_citations,
+            )
     # Fallback: provide BTS benchmarks for the requested cause
     benchmarks = NETWORK_IMPACT_GUIDANCE["bts_benchmarks_by_cause"]
     requested_cause_benchmark = benchmarks.get(cause, benchmarks["carrier"])
-    return {
+    return attach_source_errors({
         "airport": airport,
         "cause": cause,
         "historical_delays": [],
@@ -80,4 +87,4 @@ async def query_historical_delays(
         ),
         "bts_benchmarks": benchmarks,
         "requested_cause_benchmark": requested_cause_benchmark,
-    }
+    }, source_citations)

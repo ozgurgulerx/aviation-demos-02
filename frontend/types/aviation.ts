@@ -280,6 +280,7 @@ export const EventKinds = {
   AGENT_PROGRESS: "agent.progress",
   DATA_SOURCE_QUERY_START: "data_source.query_start",
   DATA_SOURCE_QUERY_COMPLETE: "data_source.query_complete",
+  DATA_SOURCE_QUERY_FAILED: "data_source.query_failed",
   EXECUTOR_INVOKED: "executor.invoked",
   EXECUTOR_COMPLETED: "executor.completed",
   AGENT_COMPLETED: "agent.completed",

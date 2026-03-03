@@ -49,6 +49,9 @@ class TestEventKind:
         assert EventKind.TOOL_COMPLETED_DOT == "tool.completed"
         assert EventKind.TOOL_FAILED_DOT == "tool.failed"
 
+    def test_data_source_failure_event_exists(self):
+        assert EventKind.DATA_SOURCE_QUERY_FAILED == "data_source.query_failed"
+
     def test_heartbeat_exists(self):
         assert EventKind.HEARTBEAT == "heartbeat"
 

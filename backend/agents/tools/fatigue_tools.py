@@ -5,7 +5,7 @@ from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
-from agents.tools import retriever_query
+from agents.tools import attach_source_errors, retriever_query
 from agents.tools.domain_knowledge import FAR_117_LIMITS, FATIGUE_RISK_FACTORS
 
 logger = structlog.get_logger()
@@ -21,13 +21,18 @@ async def calculate_fatigue_score(
     crew_ids: Annotated[List[str], Field(description="Crew member IDs to assess")],
 ) -> Dict[str, Any]:
     """Calculate fatigue risk scores based on duty patterns and rest periods."""
+    source_citations: List[Any] = []
     if _retriever:
         query = f"duty hours, rest periods, and cumulative fatigue for crew {', '.join(crew_ids[:5])}"
         rows, cits = await retriever_query(_retriever.query_sql(query))
+        source_citations = cits
         if rows:
-            return {"fatigue_assessments": rows[:10], "citations": [c.__dict__ for c in cits]}
+            return attach_source_errors(
+                {"fatigue_assessments": rows[:10], "citations": [c.__dict__ for c in cits]},
+                source_citations,
+            )
     # Fallback: provide domain knowledge so the agent can still analyze
-    return {
+    return attach_source_errors({
         "crew_ids": crew_ids,
         "fatigue_assessments": [],
         "status": "no_data_fallback",
@@ -37,7 +42,7 @@ async def calculate_fatigue_score(
         ),
         "far_117_limits": FAR_117_LIMITS,
         "risk_factors": FATIGUE_RISK_FACTORS,
-    }
+    }, source_citations)
 
 
 @ai_function(approval_mode="never_require")
@@ -46,6 +51,7 @@ async def check_far117_compliance(
     proposed_duty_hours: Annotated[float, Field(description="Proposed additional duty hours")],
 ) -> Dict[str, Any]:
     """Check if proposed duty extension complies with FAR 117 rest requirements."""
+    source_citations: List[Any] = []
     if _retriever:
         query = f"current duty status for crew {crew_id}"
         (sql_rows, sql_cits), (reg_rows, reg_cits) = await asyncio.gather(
@@ -54,14 +60,15 @@ async def check_far117_compliance(
                 "FAR 117 flight duty period limits rest requirements", source="VECTOR_REG"
             )),
         )
+        source_citations = sql_cits + reg_cits
         if sql_rows or reg_rows:
-            return {
+            return attach_source_errors({
                 "crew_status": sql_rows[:3],
                 "applicable_regulations": reg_rows[:3],
                 "citations": [c.__dict__ for c in sql_cits + reg_cits],
-            }
+            }, source_citations)
     # Fallback: provide compliance check template
-    return {
+    return attach_source_errors({
         "crew_id": crew_id,
         "proposed_hours": proposed_duty_hours,
         "status": "no_data_fallback",
@@ -79,4 +86,4 @@ async def check_far117_compliance(
                 "5. Assess if unforeseen operational extension (max +2h) applies",
             ],
         },
-    }
+    }, source_citations)

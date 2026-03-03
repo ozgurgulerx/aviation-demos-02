@@ -151,6 +151,18 @@ function describeEvent(
         color,
         expandable: querySummary,
       };
+    case EventKinds.DATA_SOURCE_QUERY_FAILED:
+      return {
+        title: `${agentName} query failed (${sourceType})`,
+        body: payloadString(payload, "errorMessage", event.message),
+        details: [
+          provider || "unknown provider",
+          payloadString(payload, "errorCode", "SOURCE_QUERY_ERROR"),
+          `${latency}ms`,
+        ],
+        color: "hsl(var(--av-red))",
+        expandable: querySummary,
+      };
     case EventKinds.AGENT_EVIDENCE:
       return {
         title: `${agentName} evidence`,

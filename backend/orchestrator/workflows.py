@@ -179,7 +179,8 @@ After all specialists have reported back:
 2. Score 3-5 recovery options using score_recovery_option
 3. Rank them using rank_options
 4. Generate implementation plan using generate_plan
-5. End with a JSON block that follows this schema exactly:
+5. Provide a clear "Final Answer" that directly answers the user's original query in plain language.
+6. End with a JSON block that follows this schema exactly:
 {{
   "criteria": ["delay_reduction", "crew_margin", "safety_score", "cost_impact", "passenger_impact"],
   "options": [
@@ -198,6 +199,7 @@ After all specialists have reported back:
   ],
   "selectedOptionId": "opt-1",
   "summary": "brief recommendation summary",
+  "finalAnswer": "plain-language answer to the original user query",
   "timeline": [{{"time": "T+0", "action": "action text", "agent": "agent_id"}}]
 }}
 
@@ -398,7 +400,8 @@ Requirements:
 1) Score recovery/decision options with explicit criteria.
 2) Provide ranked options and select one recommendation.
 3) Provide an implementation timeline.
-4) End with a JSON block that follows this schema exactly:
+4) Provide a clear "Final Answer" that directly answers the user's original query in plain language.
+5) End with a JSON block that follows this schema exactly:
 {{
   "criteria": ["delay_reduction", "crew_margin", "safety_score", "cost_impact", "passenger_impact"],
   "options": [
@@ -417,6 +420,7 @@ Requirements:
   ],
   "selectedOptionId": "opt-1",
   "summary": "brief recommendation summary",
+  "finalAnswer": "plain-language answer to the original user query",
   "timeline": [{{"time": "T+0", "action": "action text", "agent": "agent_id"}}]
 }}
 """

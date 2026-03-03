@@ -147,7 +147,7 @@ function DataSourceActivityViewInner() {
 
       <div className="rounded-xl border border-av-sky/20 bg-av-midnight/70 px-3 py-2 text-[11px] text-muted-foreground flex items-center gap-2">
         <Database className="w-3.5 h-3.5 text-av-sky" />
-        Datastore cards are updated from agent-framework SSE trace events (`data_source.query_start` / `data_source.query_complete`).
+        Datastore cards are updated from agent-framework SSE trace events (`data_source.query_start` / `data_source.query_complete` / `data_source.query_failed`).
       </div>
     </div>
   );

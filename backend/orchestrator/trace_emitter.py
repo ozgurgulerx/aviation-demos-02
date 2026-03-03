@@ -35,7 +35,7 @@ class TraceEmitter:
     - span.started / span.ended: Agent execution lifecycle
     - handover: Control transfer between agents
     - agent.activated / agent.excluded: Agent lifecycle for canvas
-    - data_source.query_start / query_complete: Data source activity
+    - data_source.query_start / query_complete / query_failed: Data source activity
     - agent.recommendation: Agent output
     - coordinator.scoring / coordinator.plan: Decision output
     - recovery.option: Individual recovery options
@@ -341,6 +341,36 @@ class TraceEmitter:
             payload,
         )
 
+    async def emit_data_source_query_failed(
+        self,
+        agent_id: str,
+        agent_name: str,
+        source_type: str,
+        error_code: str,
+        error_message: str,
+        latency_ms: int = 0,
+        query_id: Optional[str] = None,
+        query_summary: Optional[str] = None,
+    ):
+        provider = SOURCE_PROVIDER_MAP.get(source_type, "Unknown")
+        payload = {
+            "agentId": agent_id,
+            "agentName": agent_name,
+            "sourceType": source_type,
+            "errorCode": error_code,
+            "errorMessage": error_message[:220],
+            "latencyMs": latency_ms,
+            "resultCount": 0,
+            "queryId": query_id,
+            "querySummary": (query_summary or f"Attempted query against {source_type}")[:200],
+            "sourceProvider": provider,
+        }
+        await self._emit(
+            "data_source.query_failed",
+            f"{source_type} query failed ({error_code})",
+            payload,
+        )
+
     async def emit_agent_evidence(
         self,
         agent_id: str,
@@ -400,10 +430,13 @@ class TraceEmitter:
         selected_option_id: str,
         timeline: List[Dict[str, Any]],
         summary: str,
+        final_answer: str = "",
     ):
         payload = {
             "selectedOptionId": selected_option_id,
-            "timeline": timeline, "summary": summary,
+            "timeline": timeline,
+            "summary": summary,
+            "finalAnswer": final_answer,
         }
         await self._emit("coordinator.plan", summary[:100], payload)
 

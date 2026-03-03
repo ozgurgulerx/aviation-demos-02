@@ -32,6 +32,7 @@ const EVENT_ICONS: Record<string, { icon: typeof Info; color: string }> = {
   [EventKinds.HANDOVER]: { icon: Plane, color: "text-av-fabric" },
   [EventKinds.DATA_SOURCE_QUERY_START]: { icon: Wrench, color: "text-av-azure" },
   [EventKinds.DATA_SOURCE_QUERY_COMPLETE]: { icon: Database, color: "text-av-azure" },
+  [EventKinds.DATA_SOURCE_QUERY_FAILED]: { icon: XCircle, color: "text-av-red" },
   [EventKinds.COORDINATOR_SCORING]: { icon: BarChart3, color: "text-av-gold" },
   [EventKinds.COORDINATOR_PLAN]: { icon: Shield, color: "text-av-green" },
   [EventKinds.ORCHESTRATOR_PLAN]: { icon: Shield, color: "text-av-gold" },
@@ -97,7 +98,12 @@ function shouldInclude(event: WorkflowEvent, filter: TimelineFilter): boolean {
     );
   }
   if (filter === "datastore") {
-    return kind === EventKinds.DATA_SOURCE_QUERY_START || kind === EventKinds.DATA_SOURCE_QUERY_COMPLETE || kind === EventKinds.AGENT_EVIDENCE;
+    return (
+      kind === EventKinds.DATA_SOURCE_QUERY_START
+      || kind === EventKinds.DATA_SOURCE_QUERY_COMPLETE
+      || kind === EventKinds.DATA_SOURCE_QUERY_FAILED
+      || kind === EventKinds.AGENT_EVIDENCE
+    );
   }
   if (filter === "tools") {
     return (
@@ -115,6 +121,7 @@ function shouldInclude(event: WorkflowEvent, filter: TimelineFilter): boolean {
       kind === EventKinds.RUN_FAILED ||
       kind === EventKinds.STAGE_FAILED ||
       kind === EventKinds.TOOL_FAILED ||
+      kind === EventKinds.DATA_SOURCE_QUERY_FAILED ||
       kind === EventKinds.TOOL_FAILED_LEGACY
     );
   }

@@ -9,7 +9,7 @@ from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
-from agents.tools import retriever_query, retriever_query_multi
+from agents.tools import attach_source_errors, retriever_query, retriever_query_multi
 
 logger = structlog.get_logger()
 _retriever = None
@@ -39,7 +39,10 @@ async def analyze_flight_data(
     if _retriever:
         query = f"flight data for {', '.join(flight_ids[:10])} analysis type {analysis_type}"
         rows, cits = await retriever_query(_retriever.query_sql(query))
-        return {"flights": rows[:20], "analysis_type": analysis_type, "total_analyzed": len(rows), "citations": [c.__dict__ for c in cits]}
+        return attach_source_errors(
+            {"flights": rows[:20], "analysis_type": analysis_type, "total_analyzed": len(rows), "citations": [c.__dict__ for c in cits]},
+            cits,
+        )
 
     results = {}
     for flight_id in flight_ids:
@@ -81,12 +84,13 @@ async def check_weather_impact(
         results = await retriever_query_multi(_retriever.query_multiple(query, ["KQL", "NOSQL"]))
         kql_rows, kql_cits = results.get("KQL", ([], []))
         nosql_rows, nosql_cits = results.get("NOSQL", ([], []))
-        return {
+        citations = kql_cits + nosql_cits
+        return attach_source_errors({
             "weather_hazards": kql_rows[:15],
             "notams": nosql_rows[:10],
             "timeframe_hours": timeframe_hours,
-            "citations": [c.__dict__ for c in kql_cits + nosql_cits],
-        }
+            "citations": [c.__dict__ for c in citations],
+        }, citations)
 
     weather = {}
     for airport in airports:
@@ -124,11 +128,12 @@ async def query_route_status(
         results = await retriever_query_multi(_retriever.query_multiple(query, ["SQL", "GRAPH"]))
         sql_rows, sql_cits = results.get("SQL", ([], []))
         graph_rows, graph_cits = results.get("GRAPH", ([], []))
-        return {
+        citations = sql_cits + graph_cits
+        return attach_source_errors({
             "routes": sql_rows[:15],
             "connectivity": graph_rows[:10],
-            "citations": [c.__dict__ for c in sql_cits + graph_cits],
-        }
+            "citations": [c.__dict__ for c in citations],
+        }, citations)
 
     statuses = {}
     for route in routes:

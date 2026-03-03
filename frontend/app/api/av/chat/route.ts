@@ -55,12 +55,12 @@ function buildWorkflowSummary(scenario: string, agents: AgentPayload[]): string 
 
   // Execution plan
   lines.push("");
-  lines.push("Execution plan:");
+  lines.push("Run started:");
   lines.push(
     `  ${coordinator?.name || "Coordinator"} will delegate to each specialist via handoff, collect their findings, then synthesize a scored recovery plan with implementation timeline.`
   );
   lines.push("");
-  lines.push("Streaming results now...");
+  lines.push("Streaming traces now. Final answer will appear when the run completes.");
 
   return lines.join("\n");
 }

@@ -4,7 +4,7 @@ from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
-from agents.tools import retriever_query
+from agents.tools import attach_source_errors, retriever_query
 from agents.tools.domain_knowledge import REAL_TIME_MONITORING_GUIDANCE
 
 logger = structlog.get_logger()
@@ -21,12 +21,17 @@ async def get_live_positions(
     airports: Annotated[List[str], Field(description="Airports to monitor")] = None,
 ) -> Dict[str, Any]:
     """Get real-time ADS-B positions for specified flights or near airports."""
+    source_citations: List[Any] = []
     if _retriever:
         targets = callsigns or airports or ["ORD"]
         query = f"live ADS-B positions for {', '.join(targets[:5])}"
         rows, cits = await retriever_query(_retriever.query_kql(query, window_minutes=15))
-        return {"positions": rows[:50], "count": len(rows), "citations": [c.__dict__ for c in cits]}
-    return {
+        source_citations = cits
+        return attach_source_errors(
+            {"positions": rows[:50], "count": len(rows), "citations": [c.__dict__ for c in cits]},
+            source_citations,
+        )
+    return attach_source_errors({
         "callsigns": callsigns,
         "airports": airports,
         "positions": [],
@@ -38,7 +43,7 @@ async def get_live_positions(
         ),
         "adsb_interpretation": REAL_TIME_MONITORING_GUIDANCE["adsb_interpretation"],
         "typical_flight_parameters": REAL_TIME_MONITORING_GUIDANCE["typical_flight_parameters"],
-    }
+    }, source_citations)
 
 
 @ai_function(approval_mode="never_require")
@@ -46,11 +51,16 @@ async def check_active_notams(
     airports: Annotated[List[str], Field(description="Airport codes to check NOTAMs")],
 ) -> Dict[str, Any]:
     """Check currently active NOTAMs for specified airports."""
+    source_citations: List[Any] = []
     if _retriever:
         query = f"active NOTAMs at {', '.join(airports)}"
         rows, cits = await retriever_query(_retriever.query_nosql(query))
-        return {"notams": rows[:20], "count": len(rows), "citations": [c.__dict__ for c in cits]}
-    return {
+        source_citations = cits
+        return attach_source_errors(
+            {"notams": rows[:20], "count": len(rows), "citations": [c.__dict__ for c in cits]},
+            source_citations,
+        )
+    return attach_source_errors({
         "airports": airports,
         "notams": [],
         "status": "no_data_fallback",
@@ -61,4 +71,4 @@ async def check_active_notams(
         ),
         "notam_priority_framework": REAL_TIME_MONITORING_GUIDANCE["notam_priority_framework"],
         "situational_awareness_template": REAL_TIME_MONITORING_GUIDANCE["situational_awareness_template"],
-    }
+    }, source_citations)

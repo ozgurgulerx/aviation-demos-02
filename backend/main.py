@@ -7,7 +7,7 @@ import os
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Dict, Optional
 from dotenv import load_dotenv
 import logging
 import structlog
@@ -48,6 +48,70 @@ structlog.configure(
 logger = structlog.get_logger()
 
 
+def _env_enabled(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, "")
+    if not raw:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _build_data_source_checks(postgres_ready: bool) -> Dict[str, Dict[str, Any]]:
+    search_endpoint = os.getenv("AZURE_SEARCH_ENDPOINT", "")
+    search_key = os.getenv("AZURE_SEARCH_ADMIN_KEY", "")
+    fabric_token_configured = bool(
+        os.getenv("FABRIC_BEARER_TOKEN", "").strip()
+        or (
+            os.getenv("FABRIC_CLIENT_ID", "").strip()
+            and os.getenv("FABRIC_CLIENT_SECRET", "").strip()
+            and os.getenv("FABRIC_TENANT_ID", "").strip()
+        )
+    )
+    graph_endpoint = os.getenv("FABRIC_GRAPH_ENDPOINT", "").strip()
+
+    return {
+        "SQL": {
+            "configured": bool(os.getenv("PGHOST", "").strip()),
+            "reachable": postgres_ready,
+            "detail": "postgres ready" if postgres_ready else "postgres check failed",
+        },
+        "KQL": {
+            "configured": bool(os.getenv("FABRIC_KQL_ENDPOINT", "").strip() and os.getenv("FABRIC_KQL_DATABASE", "").strip()),
+            "reachable": bool(os.getenv("FABRIC_KQL_ENDPOINT", "").strip() and os.getenv("FABRIC_KQL_DATABASE", "").strip()),
+            "detail": "endpoint+database configured; runtime token resolved per request" if fabric_token_configured else "endpoint/database configured but no explicit fabric auth env set",
+        },
+        "GRAPH": {
+            "configured": bool(graph_endpoint or os.getenv("PGHOST", "").strip()),
+            "reachable": bool(graph_endpoint) or postgres_ready,
+            "detail": "fabric endpoint configured" if graph_endpoint else "using postgres fallback",
+        },
+        "VECTOR_OPS": {
+            "configured": bool(search_endpoint and search_key and os.getenv("AZURE_SEARCH_INDEX_OPS_NAME", "").strip()),
+            "reachable": bool(search_endpoint and search_key and os.getenv("AZURE_SEARCH_INDEX_OPS_NAME", "").strip()),
+            "detail": "search endpoint/key/index configured",
+        },
+        "VECTOR_REG": {
+            "configured": bool(search_endpoint and search_key and os.getenv("AZURE_SEARCH_INDEX_REGULATORY_NAME", "").strip()),
+            "reachable": bool(search_endpoint and search_key and os.getenv("AZURE_SEARCH_INDEX_REGULATORY_NAME", "").strip()),
+            "detail": "search endpoint/key/index configured",
+        },
+        "VECTOR_AIRPORT": {
+            "configured": bool(search_endpoint and search_key and os.getenv("AZURE_SEARCH_INDEX_AIRPORT_NAME", "").strip()),
+            "reachable": bool(search_endpoint and search_key and os.getenv("AZURE_SEARCH_INDEX_AIRPORT_NAME", "").strip()),
+            "detail": "search endpoint/key/index configured",
+        },
+        "NOSQL": {
+            "configured": bool(os.getenv("AZURE_COSMOS_ENDPOINT", "").strip()),
+            "reachable": bool(os.getenv("AZURE_COSMOS_ENDPOINT", "").strip()),
+            "detail": "cosmos endpoint configured" if os.getenv("AZURE_COSMOS_ENDPOINT", "").strip() else "cosmos endpoint missing",
+        },
+        "FABRIC_SQL": {
+            "configured": bool(os.getenv("FABRIC_SQL_ENDPOINT", "").strip() or os.getenv("FABRIC_SQL_CONNECTION_STRING", "").strip()),
+            "reachable": bool(os.getenv("FABRIC_SQL_ENDPOINT", "").strip() or os.getenv("FABRIC_SQL_CONNECTION_STRING", "").strip()),
+            "detail": "fabric sql endpoint/connection configured" if (os.getenv("FABRIC_SQL_ENDPOINT", "").strip() or os.getenv("FABRIC_SQL_CONNECTION_STRING", "").strip()) else "fabric sql endpoint/connection missing",
+        },
+    }
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan - initialize and cleanup resources."""
@@ -74,6 +138,10 @@ async def lifespan(app: FastAPI):
                 mod.set_retriever(retriever)
                 wired += 1
         logger.info("retriever_wired_to_tools", modules_wired=wired)
+        try:
+            logger.info("data_source_startup_diagnostics", checks=retriever.get_source_diagnostics())
+        except Exception as diag_err:
+            logger.warning("data_source_startup_diagnostics_failed", error=str(diag_err))
     except Exception as e:
         logger.warning("retriever_wiring_failed", error=str(e))
 
@@ -237,10 +305,27 @@ async def readiness_check():
         checks["postgres"] = False
         logger.error("postgres_health_check_failed", error=str(e))
 
-    all_healthy = all(checks.values())
+    data_source_checks = _build_data_source_checks(postgres_ready=bool(checks.get("postgres")))
+    checks["data_sources"] = data_source_checks
+
+    base_ready = bool(checks.get("api")) and bool(checks.get("redis")) and bool(checks.get("postgres"))
+    strict_data_source_readiness = _env_enabled("STRICT_DATA_SOURCE_READINESS", False)
+    if strict_data_source_readiness:
+        sources_ready = all(
+            bool(status.get("configured")) and bool(status.get("reachable"))
+            for status in data_source_checks.values()
+        )
+    else:
+        sources_ready = True
+
+    all_healthy = base_ready and sources_ready
     return JSONResponse(
         status_code=200 if all_healthy else 503,
-        content={"ready": all_healthy, "checks": checks},
+        content={
+            "ready": all_healthy,
+            "checks": checks,
+            "strict_data_source_readiness": strict_data_source_readiness,
+        },
     )
 
 
@@ -561,7 +646,7 @@ async def execute_workflow(
                 "executor.completed": EventKind.EXECUTOR_COMPLETED,
                 "orchestrator.workflow_created": EventKind.WORKFLOW_STATUS,
                 "orchestrator.run_started": EventKind.RUN_STARTED,
-                "orchestrator.run_completed": EventKind.RUN_COMPLETED,
+                "orchestrator.run_completed": EventKind.WORKFLOW_STATUS,
                 "orchestrator.run_failed": EventKind.RUN_FAILED,
                 "coordinator.scoring": EventKind.COORDINATOR_SCORING,
                 "coordinator.plan": EventKind.COORDINATOR_PLAN,
@@ -649,18 +734,25 @@ async def execute_workflow(
         await run_store.update_run_status(run_id, RunStatus.COMPLETED)
 
         # Emit completion with summary for the UI
+        answer = ""
         summary = ""
         if isinstance(result, dict):
-            summary = result.get("summary", "")
+            answer = str(result.get("answer", "") or "").strip()
+            summary = str(result.get("summary", "") or "").strip()
             if not summary:
                 summary = f"Analysis complete. {result.get('evidence_count', 0)} evidence items collected."
+            if not answer:
+                answer = summary
+        if not answer:
+            answer = f"Aviation solver completed using {workflow_type} workflow."
 
         await event_bus.publish(WorkflowEvent(
             run_id=run_id,
             kind=EventKind.RUN_COMPLETED,
-            message=summary or f"Aviation solver completed using {workflow_type} workflow",
+            message=answer,
             payload={
                 "result": result,
+                "answer": answer,
                 "summary": summary,
                 "workflow_type": workflow_type,
                 "orchestration_mode": orchestration_mode,

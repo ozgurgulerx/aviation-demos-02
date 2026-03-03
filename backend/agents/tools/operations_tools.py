@@ -9,7 +9,7 @@ from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
-from agents.tools import retriever_query, retriever_query_multi
+from agents.tools import attach_source_errors, retriever_query, retriever_query_multi
 
 logger = structlog.get_logger()
 _retriever = None
@@ -44,13 +44,14 @@ async def evaluate_alternatives(
         sql_rows, sql_cits = results.get("SQL", ([], []))
         fabric_rows, fabric_cits = results.get("FABRIC_SQL", ([], []))
         vector_rows, vector_cits = results.get("VECTOR_OPS", ([], []))
-        return {
+        citations = sql_cits + fabric_cits + vector_cits
+        return attach_source_errors({
             "problem": problem_description[:100],
             "operational_data": sql_rows[:10],
             "historical_delays": fabric_rows[:10],
             "similar_precedents": vector_rows[:5],
-            "citations": [c.__dict__ for c in sql_cits + fabric_cits + vector_cits],
-        }
+            "citations": [c.__dict__ for c in citations],
+        }, citations)
 
     alternatives = []
     for i in range(num_alternatives):
@@ -95,11 +96,11 @@ async def optimize_resources(
     if _retriever:
         query = f"resource availability {resource_type} next {constraint_window_hours} hours"
         rows, cits = await retriever_query(_retriever.query_sql(query))
-        return {
+        return attach_source_errors({
             "optimization": rows[:20],
             "constraint_window_hours": constraint_window_hours,
             "citations": [c.__dict__ for c in cits],
-        }
+        }, cits)
 
     resources = {
         "crew": {
@@ -154,13 +155,14 @@ async def calculate_impact(
         results = await retriever_query_multi(_retriever.query_multiple(query, ["SQL", "FABRIC_SQL"]))
         sql_rows, sql_cits = results.get("SQL", ([], []))
         fabric_rows, fabric_cits = results.get("FABRIC_SQL", ([], []))
-        return {
+        citations = sql_cits + fabric_cits
+        return attach_source_errors({
             "change": change_description[:100],
             "affected_flights": affected_flights,
             "operational_impact": sql_rows[:10],
             "historical_impact": fabric_rows[:10],
-            "citations": [c.__dict__ for c in sql_cits + fabric_cits],
-        }
+            "citations": [c.__dict__ for c in citations],
+        }, citations)
 
     impact = {
         "change": change_description[:100],

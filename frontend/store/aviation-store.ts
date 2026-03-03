@@ -65,6 +65,42 @@ function createDefaultDataSources(): Record<string, DataSourceActivity> {
   return sources;
 }
 
+function synthesizeCompletionAnswer(payload: Record<string, unknown>, eventMessage: string): string {
+  const result = payload.result as Record<string, unknown> | undefined;
+  const summary =
+    payloadString(payload, "summary") ||
+    payloadString(result ?? {}, "summary") ||
+    eventMessage ||
+    "";
+  const selectedOptionId =
+    payloadString(payload, "selectedOptionId") ||
+    payloadString(result ?? {}, "selectedOptionId");
+  const options = payloadArray<Record<string, unknown>>(result ?? {}, "options");
+  const selectedOption =
+    options.find((opt) => payloadString(opt, "optionId") === selectedOptionId) ||
+    [...options].sort((a, b) => payloadNumber(a, "rank", 9999) - payloadNumber(b, "rank", 9999))[0];
+  const selectedDescription = selectedOption ? payloadString(selectedOption, "description") : "";
+  const timeline = payloadArray<Record<string, unknown>>(result ?? {}, "timeline");
+  const nextActions = timeline
+    .slice(0, 2)
+    .map((entry) => payloadString(entry, "action"))
+    .filter((value) => !!value);
+
+  const parts: string[] = [];
+  if (selectedDescription) {
+    parts.push(`Recommended response: ${selectedDescription}.`);
+  }
+  if (summary) {
+    parts.push(summary);
+  }
+  if (nextActions.length > 0) {
+    parts.push(`Immediate steps: ${nextActions.join("; ")}.`);
+  }
+
+  const answer = parts.join(" ").trim();
+  return answer || "Analysis complete. A recommended recovery response is ready.";
+}
+
 function incrementAgentTrace(agent: AgentNode, ts: string): AgentNode {
   return {
     ...agent,
@@ -166,6 +202,7 @@ interface AviationStore {
 
   // NEW: Chat messages (persisted across sidebar collapse/expand)
   chatMessages: ChatMessage[];
+  finalAnswerRunIds: string[];
 
   // NEW: UI layout state
   sidebarCollapsed: boolean;
@@ -238,6 +275,7 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
         "Describe an airline operations issue. I will launch an agent-framework run, stream traces over SSE, and show which Azure/Fabric datastores each agent used.",
     },
   ],
+  finalAnswerRunIds: [],
   sidebarCollapsed: false,
   bottomDrawerTab: "timeline",
   bottomDrawerOpen: true,
@@ -507,6 +545,7 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
       dataSources: createDefaultDataSources(),
       recoveryPlan: null,
       recoveryOptions: [],
+      finalAnswerRunIds: [],
       chatMessages: [
         {
           id: "welcome",
@@ -574,6 +613,7 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
       activeAgentIds: [],
       completedAgentIds: [],
       failedAgentIds: [],
+      finalAnswerRunIds: [],
       runProgress: {
         ...state.runProgress,
         status: "running",
@@ -948,6 +988,66 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
         break;
       }
 
+      case EventKinds.DATA_SOURCE_QUERY_FAILED: {
+        const sourceType = payloadString(payload, "sourceType");
+        const latencyMs = payloadNumber(payload, "latencyMs");
+        const sourceProvider = payloadString(payload, "sourceProvider");
+        const errorMessage = payloadString(payload, "errorMessage", event.message);
+        const querySummary = payloadString(payload, "querySummary", `${sourceType} query failed`);
+
+        set((state) => {
+          const ds = state.dataSources[sourceType];
+          const newDs = ds
+            ? {
+                ...ds,
+                queryCount: ds.queryCount + 1,
+                avgLatencyMs: Math.round(
+                  (ds.avgLatencyMs * ds.queryCount + latencyMs) / (ds.queryCount + 1)
+                ),
+                isActive: false,
+                lastQueryTime: event.ts,
+                lastQuerySummary: `${querySummary} (${errorMessage})`,
+                lastAgentId: agentId || ds.lastAgentId,
+                provider: sourceProvider === "Fabric" || sourceProvider === "Azure"
+                  ? sourceProvider
+                  : ds.provider,
+                sparkline: [...ds.sparkline.slice(-19), latencyMs],
+              }
+            : undefined;
+
+          const agent = agentId ? state.agents[agentId] : undefined;
+          const newAgent = agent
+            ? {
+                ...incrementAgentTrace(agent, event.ts),
+                status: "thinking" as const,
+                activeQuery: undefined,
+                activeQuerySummary: undefined,
+                currentStep: payloadString(payload, "currentStep", `query_failed:${sourceType}`),
+                lastAction: "query_failed",
+                percentComplete: Math.max(agent.percentComplete ?? 0, payloadNumber(payload, "percentComplete", 45)),
+                lastEvidencePreview: `${sourceType} query failed: ${errorMessage}`,
+              }
+            : undefined;
+
+          return {
+            dataSources: newDs
+              ? { ...state.dataSources, [sourceType]: newDs }
+              : state.dataSources,
+            agents: newAgent
+              ? { ...state.agents, [agentId]: newAgent }
+              : state.agents,
+            runProgress: {
+              ...state.runProgress,
+              currentStep: reportedCurrentStep || `query_failed:${sourceType}`,
+              overallPct: reportedRunPct >= 0 ? reportedRunPct : state.runProgress.overallPct,
+              lastEventKind: event.kind,
+              lastUpdateAt: event.ts,
+            },
+          };
+        });
+        break;
+      }
+
       case EventKinds.TOOL_CALLED:
       case EventKinds.TOOL_CALLED_LEGACY: {
         const toolName = payloadString(payload, "toolName", event.tool_name || "tool");
@@ -1247,14 +1347,6 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
           bottomDrawerTab: "plan",
           bottomDrawerOpen: true,
         });
-        const planSummary = payloadString(payload, "summary");
-        if (planSummary) {
-          get().addChatMessage({
-            id: `plan-${event.event_id}`,
-            role: "assistant",
-            content: planSummary,
-          });
-        }
         break;
       }
 
@@ -1347,20 +1439,13 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
       }
 
       case EventKinds.RUN_COMPLETED: {
-        const completionSummary =
-          payloadString(payload, "summary") ||
-          ((payload.result as Record<string, unknown>)?.summary as string) || "";
-        // Add fused-answer chat message so the user sees a final answer
-        if (completionSummary) {
-          get().addChatMessage({
-            id: `completion-${event.event_id}`,
-            role: "assistant",
-            content: completionSummary,
-          });
-        }
+        const result = payload.result as Record<string, unknown> | undefined;
+        const completionAnswer =
+          payloadString(payload, "answer") ||
+          payloadString(result ?? {}, "answer") ||
+          synthesizeCompletionAnswer(payload, event.message);
         // If recovery plan is still empty, try to populate from result
         if (!get().recoveryPlan) {
-          const result = payload.result as Record<string, unknown> | undefined;
           if (result?.summary) {
             set({
               recoveryPlan: {
@@ -1376,6 +1461,20 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
           }
         }
         set((state) => ({
+          chatMessages:
+            completionAnswer && !state.finalAnswerRunIds.includes(event.run_id)
+              ? [
+                  ...state.chatMessages,
+                  {
+                    id: `completion-${event.event_id}`,
+                    role: "assistant",
+                    content: completionAnswer,
+                  },
+                ]
+              : state.chatMessages,
+          finalAnswerRunIds: state.finalAnswerRunIds.includes(event.run_id)
+            ? state.finalAnswerRunIds
+            : [...state.finalAnswerRunIds, event.run_id],
           runProgress: {
             ...state.runProgress,
             status: "completed",

@@ -9,7 +9,7 @@ from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
-from agents.tools import retriever_query, retriever_query_multi
+from agents.tools import attach_source_errors, retriever_query, retriever_query_multi
 
 logger = structlog.get_logger()
 _retriever = None
@@ -39,12 +39,12 @@ async def check_compliance(
     if _retriever:
         query = f"regulatory compliance check: {solution_description} against {', '.join(regulations)}"
         reg_rows, reg_cits = await retriever_query(_retriever.query_semantic(query, source="VECTOR_REG"))
-        return {
+        return attach_source_errors({
             "solution": solution_description[:100],
             "regulatory_findings": reg_rows[:10],
             "regulations_checked": regulations,
             "citations": [c.__dict__ for c in reg_cits],
-        }
+        }, reg_cits)
 
     results = {}
     all_compliant = True
@@ -115,13 +115,14 @@ async def assess_risk_factors(
         ops_rows, ops_cits = results.get("VECTOR_OPS", ([], []))
         reg_rows, reg_cits = results.get("VECTOR_REG", ([], []))
         kql_rows, kql_cits = results.get("KQL", ([], []))
-        return {
+        citations = ops_cits + reg_cits + kql_cits
+        return attach_source_errors({
             "scenario": scenario_description[:100],
             "similar_incidents": ops_rows[:5],
             "regulatory_guidance": reg_rows[:5],
             "current_hazards": kql_rows[:10],
-            "citations": [c.__dict__ for c in ops_cits + reg_cits + kql_cits],
-        }
+            "citations": [c.__dict__ for c in citations],
+        }, citations)
 
     risks = {}
     for category in risk_categories:
@@ -186,13 +187,14 @@ async def validate_solution(
         ))
         reg_rows, reg_cits = results.get("VECTOR_REG", ([], []))
         ops_rows, ops_cits = results.get("VECTOR_OPS", ([], []))
-        return {
+        citations = reg_cits + ops_cits
+        return attach_source_errors({
             "solution": solution_description[:100],
             "validation_criteria": validation_criteria,
             "regulatory_validation": reg_rows[:5],
             "operational_precedents": ops_rows[:5],
-            "citations": [c.__dict__ for c in reg_cits + ops_cits],
-        }
+            "citations": [c.__dict__ for c in citations],
+        }, citations)
 
     validations = {}
     all_passed = True

@@ -5,7 +5,7 @@ from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
-from agents.tools import retriever_query
+from agents.tools import attach_source_errors, retriever_query
 from agents.tools.domain_knowledge import FLEET_RECOVERY_GUIDANCE
 
 logger = structlog.get_logger()
@@ -22,15 +22,20 @@ async def find_available_tails(
     base_airport: Annotated[str, Field(description="Airport IATA code where aircraft is needed")],
 ) -> Dict[str, Any]:
     """Find available aircraft tails of the specified type at or near the base airport."""
+    source_citations: List[Any] = []
     if _retriever:
         query = f"available {aircraft_type} aircraft at {base_airport} not assigned to active flights"
         rows, cits = await retriever_query(_retriever.query_sql(query))
+        source_citations = cits
         if rows:
-            return {"available_tails": rows[:10], "citations": [c.__dict__ for c in cits]}
+            return attach_source_errors(
+                {"available_tails": rows[:10], "citations": [c.__dict__ for c in cits]},
+                source_citations,
+            )
     # Fallback: provide fleet availability estimation guidance
     is_wide_body = aircraft_type.upper().startswith(("B77", "B78", "A33", "A35", "A38"))
     spare_ratio = "3-5%" if is_wide_body else "5-8%"
-    return {
+    return attach_source_errors({
         "aircraft_type": aircraft_type,
         "base": base_airport,
         "available_tails": [],
@@ -51,7 +56,7 @@ async def find_available_tails(
                 "45-60 minutes",
             ),
         },
-    }
+    }, source_citations)
 
 
 @ai_function(approval_mode="never_require")
@@ -60,13 +65,18 @@ async def check_range_compatibility(
     route: Annotated[str, Field(description="Route pair (e.g., ORD-LAX)")],
 ) -> Dict[str, Any]:
     """Check if an aircraft has range/payload capability for a specific route."""
+    source_citations: List[Any] = []
     if _retriever:
         query = f"aircraft {tailnum} range capability for route {route} distance"
         rows, cits = await retriever_query(_retriever.query_sql(query))
+        source_citations = cits
         if rows:
-            return {"details": rows[:5], "citations": [c.__dict__ for c in cits]}
+            return attach_source_errors(
+                {"details": rows[:5], "citations": [c.__dict__ for c in cits]},
+                source_citations,
+            )
     # Fallback: provide evaluation criteria (keep compatible=unknown for safety)
-    return {
+    return attach_source_errors({
         "tailnum": tailnum,
         "route": route,
         "compatible": "unknown",
@@ -78,7 +88,7 @@ async def check_range_compatibility(
         ),
         "swap_evaluation_criteria": FLEET_RECOVERY_GUIDANCE["tail_swap_evaluation_criteria"],
         "regulatory_refs": FLEET_RECOVERY_GUIDANCE["regulatory_refs"],
-    }
+    }, source_citations)
 
 
 @ai_function(approval_mode="never_require")
@@ -88,21 +98,23 @@ async def evaluate_tail_swap(
     flight_id: Annotated[str, Field(description="Flight identifier")],
 ) -> Dict[str, Any]:
     """Evaluate a tail swap — MEL status, downstream impact, crew compatibility."""
+    source_citations: List[Any] = []
     if _retriever:
         query = f"MEL status and downstream flights for aircraft {swap_tail}"
         (sql_rows, sql_cits), (graph_rows, graph_cits) = await asyncio.gather(
             retriever_query(_retriever.query_sql(query)),
             retriever_query(_retriever.query_graph(f"downstream flights from {swap_tail}")),
         )
+        source_citations = sql_cits + graph_cits
         mel_items = [r for r in sql_rows if "mel" in str(r).lower()][:5]
         if sql_rows or graph_rows:
-            return {
+            return attach_source_errors({
                 "mel_items": mel_items,
                 "downstream_impact": graph_rows[:10],
                 "citations": [c.__dict__ for c in sql_cits + graph_cits],
-            }
+            }, source_citations)
     # Fallback: provide MEL assessment guidance (keep feasible=unknown for safety)
-    return {
+    return attach_source_errors({
         "original": original_tail,
         "swap": swap_tail,
         "flight": flight_id,
@@ -115,4 +127,4 @@ async def evaluate_tail_swap(
         ),
         "mel_assessment_guidance": FLEET_RECOVERY_GUIDANCE["mel_categories"],
         "swap_evaluation_criteria": FLEET_RECOVERY_GUIDANCE["tail_swap_evaluation_criteria"],
-    }
+    }, source_citations)

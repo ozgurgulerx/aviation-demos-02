@@ -506,15 +506,31 @@ class AsyncUnifiedRetriever:
                             ),
                         )
                     ]
+                source_col, target_col, edge_type_col = await self._with_timeout(
+                    "graph column resolution",
+                    self._resolve_graph_columns(conn, relation),
+                )
+                if not source_col or not target_col:
+                    return [], [
+                        Citation(
+                            source_type="GRAPH",
+                            title=(
+                                "GRAPH_SCHEMA_MISMATCH: could not resolve source/target columns in "
+                                f"{relation}"
+                            ),
+                        )
+                    ]
+                edge_type_seed = edge_type_col if edge_type_col else "'link'"
+                edge_type_recursive = f"e.{edge_type_col}" if edge_type_col else "'link'"
                 sql = f"""
                     WITH RECURSIVE graph_walk AS (
-                        SELECT source_id, target_id, edge_type, 1 AS depth
+                        SELECT {source_col} AS source_id, {target_col} AS target_id, {edge_type_seed} AS edge_type, 1 AS depth
                         FROM {relation}
-                        WHERE source_id = $1
+                        WHERE {source_col} = $1
                         UNION ALL
-                        SELECT e.source_id, e.target_id, e.edge_type, gw.depth + 1
+                        SELECT e.{source_col} AS source_id, e.{target_col} AS target_id, {edge_type_recursive} AS edge_type, gw.depth + 1
                         FROM {relation} e
-                        JOIN graph_walk gw ON e.source_id = gw.target_id
+                        JOIN graph_walk gw ON e.{source_col} = gw.target_id
                         WHERE gw.depth < $2
                     )
                     SELECT DISTINCT source_id, target_id, edge_type, depth
@@ -558,6 +574,39 @@ class AsyncUnifiedRetriever:
                 return str(relation)
         relation = await conn.fetchval("SELECT to_regclass('ops_graph_edges')::text")
         return str(relation) if relation else None
+
+    async def _resolve_graph_columns(self, conn, relation: str) -> tuple[str, str, str]:
+        """
+        Resolve source/target/edge-type columns for graph table schema variants.
+
+        Supports both canonical names (source_id/target_id/edge_type) and common alternates.
+        """
+        clean_relation = relation.replace('"', "")
+        if "." in clean_relation:
+            table_schema, table_name = clean_relation.split(".", 1)
+        else:
+            table_schema, table_name = "public", clean_relation
+        rows = await conn.fetch(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = $1 AND table_name = $2
+            """,
+            table_schema,
+            table_name,
+        )
+        columns = {str(r["column_name"]) for r in rows}
+
+        def pick(candidates: List[str]) -> str:
+            for candidate in candidates:
+                if candidate in columns:
+                    return candidate
+            return ""
+
+        source_col = pick(["source_id", "src_id", "source", "from_id", "origin_id"])
+        target_col = pick(["target_id", "dst_id", "target", "to_id", "dest_id"])
+        edge_type_col = pick(["edge_type", "relation_type", "type", "edge_label"])
+        return source_col, target_col, edge_type_col
 
     # ------------------------------------------------------------------
     # 4-6. Semantic Search (Azure AI Search — 3 indexes)
