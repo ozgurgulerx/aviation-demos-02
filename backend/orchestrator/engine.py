@@ -138,6 +138,9 @@ class OrchestratorEngine:
         self._deterministic_stream_timeout_seconds = int(
             os.getenv("DETERMINISTIC_AGENT_STREAM_TIMEOUT_SECONDS", "180")
         )
+        self._llm_directed_stream_timeout_seconds = int(
+            os.getenv("LLM_DIRECTED_AGENT_STREAM_TIMEOUT_SECONDS", "120")
+        )
         self._agent_stream_update_counts: Dict[str, int] = {}
         self._agent_stream_last_update_at: Dict[str, datetime] = {}
         self._agent_stream_guarded_invocation_keys: set[str] = set()
@@ -1238,10 +1241,14 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         await self._emit_synthetic_agent_completion(agent_id=agent_id, reason=reason)
 
     async def _check_stalled_streaming_agents(self, now: Optional[datetime] = None):
-        if not self._is_deterministic_mode():
-            return
         if not self._active_agent_ids:
             return
+
+        # Use mode-specific timeout
+        if self._is_deterministic_mode():
+            stall_timeout = self._deterministic_stream_timeout_seconds
+        else:
+            stall_timeout = self._llm_directed_stream_timeout_seconds
 
         now = now or datetime.now(timezone.utc)
         for agent_id in list(self._active_agent_ids):
@@ -1255,7 +1262,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             if not last_update_at:
                 continue
             inactivity_seconds = (now - last_update_at).total_seconds()
-            if inactivity_seconds >= self._deterministic_stream_timeout_seconds:
+            if inactivity_seconds >= stall_timeout:
                 update_count = self._agent_stream_update_counts.get(agent_id, 0)
                 if update_count >= self._deterministic_stream_update_limit:
                     logger.warning(
@@ -1265,15 +1272,17 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                         updates=update_count,
                         limit=self._deterministic_stream_update_limit,
                     )
-                    reason = "deterministic_stream_update_limit"
+                    reason = "stream_update_limit"
                 else:
-                    reason = "deterministic_stream_timeout"
+                    reason = "stream_timeout"
 
+                mode_label = "deterministic" if self._is_deterministic_mode() else "llm_directed"
                 logger.warning(
                     "agent_stream_update_timeout",
                     run_id=self.run_id,
                     agent_id=agent_id,
-                    timeout_seconds=self._deterministic_stream_timeout_seconds,
+                    timeout_seconds=stall_timeout,
+                    mode=mode_label,
                 )
                 await self._emit_synthetic_completion_if_stalled(
                     agent_id=agent_id,

@@ -1,5 +1,6 @@
 """Situation Assessment tools — disruption scope mapping via GRAPH + SQL + KQL."""
 
+import asyncio
 from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
@@ -24,8 +25,10 @@ async def map_disruption_scope(
     """Map the scope of an operational disruption — affected flights, gates, and connections."""
     if _retriever:
         query = f"flights affected at {', '.join(airports)} within {time_window_hours} hours"
-        sql_rows, sql_cit = await retriever_query(_retriever.query_sql(query))
-        graph_rows, graph_cit = await retriever_query(_retriever.query_graph(query, hops=2))
+        (sql_rows, sql_cit), (graph_rows, graph_cit) = await asyncio.gather(
+            retriever_query(_retriever.query_sql(query)),
+            retriever_query(_retriever.query_graph(query, hops=2)),
+        )
         return {
             "affected_flights": sql_rows[:20],
             "network_connections": graph_rows[:15],

@@ -1,5 +1,6 @@
 """Passenger Impact tools — connection risks, rebooking via SQL + GRAPH."""
 
+import asyncio
 from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
@@ -21,10 +22,12 @@ async def assess_connection_risks(
     """Assess passenger connection risks for delayed/cancelled flights."""
     if _retriever:
         query = f"passengers with connections on flights {', '.join(flight_ids[:5])}"
-        sql_rows, sql_cits = await retriever_query(_retriever.query_sql(query))
-        graph_rows, graph_cits = await retriever_query(_retriever.query_graph(
-            f"connection paths from flights {', '.join(flight_ids[:3])}"
-        ))
+        (sql_rows, sql_cits), (graph_rows, graph_cits) = await asyncio.gather(
+            retriever_query(_retriever.query_sql(query)),
+            retriever_query(_retriever.query_graph(
+                f"connection paths from flights {', '.join(flight_ids[:3])}"
+            )),
+        )
         return {
             "at_risk_connections": sql_rows[:20],
             "connection_graph": graph_rows[:15],

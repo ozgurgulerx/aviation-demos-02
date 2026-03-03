@@ -173,7 +173,7 @@ def test_coordinator_workflow_constrains_handoff_targets_and_turn_limits():
 
 
 @pytest.mark.usefixtures("_set_aoai_endpoint")
-def test_deterministic_workflow_orders_specialists_then_coordinator():
+def test_deterministic_workflow_has_parallel_specialists_and_coordinator():
     scenario = "diversion"
     scenario_config = SCENARIO_AGENTS[scenario]
     workflow = create_deterministic_coordinator_workflow(
@@ -181,16 +181,21 @@ def test_deterministic_workflow_orders_specialists_then_coordinator():
         active_agent_ids=scenario_config["agents"] + [scenario_config["coordinator"]],
     )
 
-    expected_order = scenario_config["agents"] + [scenario_config["coordinator"]]
-    execution_order = [
-        executor_id
-        for executor_id in workflow.executors.keys()
-        if executor_id not in {"input-conversation", "output-conversation", "end"}
-    ]
-    assert execution_order == expected_order
+    executor_ids = set(workflow.executors.keys())
+    coordinator_id = scenario_config["coordinator"]
+    # All specialists should be present as executors
+    for specialist_id in scenario_config["agents"]:
+        assert specialist_id in executor_ids, f"Specialist {specialist_id} missing from workflow executors"
+    # Coordinator should be present under its real ID
+    assert coordinator_id in executor_ids, f"Coordinator {coordinator_id} missing from workflow executors"
+    # Aggregator should be present
+    assert "specialist_aggregator" in executor_ids, "Specialist aggregator missing"
 
-    for executor in workflow.executors.values():
-        assert getattr(executor, "_handoff_targets", set()) in (set(), None)
+    # No handoff targets in deterministic mode
+    for eid, executor in workflow.executors.items():
+        assert getattr(executor, "_handoff_targets", set()) in (set(), None), (
+            f"Executor {eid} has unexpected handoff targets"
+        )
 
 
 @pytest.mark.usefixtures("_set_aoai_endpoint")
@@ -213,7 +218,7 @@ def test_workflow_factory_routes_handoff_modes():
     coordinator_id = scenario_config["coordinator"]
     assert len(getattr(llm_directed_workflow.executors[coordinator_id], "_handoff_targets")) >= 1
 
-    # Deterministic uses SequentialBuilder — no handoff targets
+    # Deterministic uses parallel WorkflowBuilder — no handoff targets
     assert getattr(deterministic_workflow.executors[coordinator_id], "_handoff_targets", set()) in (set(), None)
 
 

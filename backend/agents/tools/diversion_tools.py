@@ -1,5 +1,6 @@
 """Diversion Advisor tools — alternate evaluation via KQL + SQL + Cosmos."""
 
+import asyncio
 from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
@@ -23,9 +24,11 @@ async def evaluate_alternates(
     """Evaluate alternate airports for diversion based on weather, distance, and capability."""
     if _retriever:
         query = f"airports within {fuel_remaining_minutes} minutes flying time from {current_position}"
-        sql_rows, sql_cits = await retriever_query(_retriever.query_sql(query))
-        kql_rows, kql_cits = await retriever_query(_retriever.query_kql(f"weather at airports near {current_position}"))
-        notam_rows, notam_cits = await retriever_query(_retriever.query_nosql(f"NOTAMs for airports near {current_position}"))
+        (sql_rows, sql_cits), (kql_rows, kql_cits), (notam_rows, notam_cits) = await asyncio.gather(
+            retriever_query(_retriever.query_sql(query)),
+            retriever_query(_retriever.query_kql(f"weather at airports near {current_position}")),
+            retriever_query(_retriever.query_nosql(f"NOTAMs for airports near {current_position}")),
+        )
         return {
             "alternates": sql_rows[:10],
             "weather_conditions": kql_rows[:10],
@@ -44,5 +47,5 @@ async def check_airport_capability(
     if _retriever:
         query = f"airport {airport} capability for {aircraft_type} runway length services"
         rows, cits = await retriever_query(_retriever.query_semantic(query, source="VECTOR_AIRPORT"))
-        return {"capability": rows[:5], "suitable": True, "citations": [c.__dict__ for c in cits]}
-    return {"airport": airport, "aircraft": aircraft_type, "suitable": True, "status": "mock"}
+        return {"capability": rows[:5], "citations": [c.__dict__ for c in cits]}
+    return {"airport": airport, "aircraft": aircraft_type, "suitable": "unknown", "status": "mock"}

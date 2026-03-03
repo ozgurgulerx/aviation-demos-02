@@ -1,5 +1,6 @@
 """Route Planner tools — route alternatives via GRAPH + SQL + KQL."""
 
+import asyncio
 from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
@@ -22,12 +23,14 @@ async def find_route_alternatives(
 ) -> Dict[str, Any]:
     """Find alternative routes between two airports."""
     if _retriever:
-        graph_rows, graph_cits = await retriever_query(_retriever.query_graph(
-            f"routes from {origin} to {destination}", hops=max_stops + 1
-        ))
-        sql_rows, sql_cits = await retriever_query(_retriever.query_sql(
-            f"flights from {origin} with connections to {destination}"
-        ))
+        (graph_rows, graph_cits), (sql_rows, sql_cits) = await asyncio.gather(
+            retriever_query(_retriever.query_graph(
+                f"routes from {origin} to {destination}", hops=max_stops + 1
+            )),
+            retriever_query(_retriever.query_sql(
+                f"flights from {origin} with connections to {destination}"
+            )),
+        )
         return {
             "route_alternatives": graph_rows[:10],
             "available_flights": sql_rows[:15],

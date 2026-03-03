@@ -1,5 +1,6 @@
 """Crew Fatigue tools — FAR 117 compliance via SQL + AI Search."""
 
+import asyncio
 from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
@@ -34,14 +35,15 @@ async def check_far117_compliance(
     """Check if proposed duty extension complies with FAR 117 rest requirements."""
     if _retriever:
         query = f"current duty status for crew {crew_id}"
-        sql_rows, sql_cits = await retriever_query(_retriever.query_sql(query))
-        reg_rows, reg_cits = await retriever_query(_retriever.query_semantic(
-            "FAR 117 flight duty period limits rest requirements", source="VECTOR_REG"
-        ))
+        (sql_rows, sql_cits), (reg_rows, reg_cits) = await asyncio.gather(
+            retriever_query(_retriever.query_sql(query)),
+            retriever_query(_retriever.query_semantic(
+                "FAR 117 flight duty period limits rest requirements", source="VECTOR_REG"
+            )),
+        )
         return {
             "crew_status": sql_rows[:3],
             "applicable_regulations": reg_rows[:3],
-            "compliant": True,
             "citations": [c.__dict__ for c in sql_cits + reg_cits],
         }
-    return {"crew_id": crew_id, "proposed_hours": proposed_duty_hours, "compliant": True, "status": "mock"}
+    return {"crew_id": crew_id, "proposed_hours": proposed_duty_hours, "compliant": "unknown", "status": "mock"}

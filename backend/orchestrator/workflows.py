@@ -7,9 +7,15 @@ from typing import Dict, List, Optional
 
 from agent_framework import (
     ChatAgent,
+    ChatMessage,
     Workflow,
     SequentialBuilder,
     HandoffBuilder,
+    WorkflowBuilder,
+    Executor,
+    handler,
+    WorkflowContext,
+    AgentExecutorResponse,
 )
 import structlog
 
@@ -20,6 +26,15 @@ from orchestrator.agent_registry import (
 )
 
 logger = structlog.get_logger()
+
+TERMINATION_RECOMMENDATION_KEYWORDS = {
+    "recommend", "final", "suggest", "propose", "conclusion",
+    "decision", "advise", "our plan",
+}
+TERMINATION_TIMELINE_KEYWORDS = {
+    "timeline", "implementation", "summary", "plan", "schedule",
+    "next steps", "action items",
+}
 
 
 class WorkflowType:
@@ -156,13 +171,15 @@ Start now by calling the first handoff tool.
     coordinator_ref = coordinator.name or coordinator.id
     for specialist in specialists:
         specialist_base = specialist.default_options.get("instructions") or ""
-        specialist.default_options["instructions"] = (
-            f"{specialist_base}\n\n"
+        handoff_protocol = (
             "Workflow protocol:\n"
             "- Run one focused analysis pass using your tools.\n"
             "- Return concise, evidence-backed findings.\n"
             f"- Immediately call `handoff_to_{coordinator_ref}` after your findings.\n"
-            "- Do not hand off to any other specialist.\n"
+            "- Do not hand off to any other specialist.\n\n"
+        )
+        specialist.default_options["instructions"] = (
+            f"{handoff_protocol}{specialist_base}"
         )
 
     # Build handoff workflow
@@ -196,16 +213,15 @@ Start now by calling the first handoff tool.
         if n_msgs < 4:
             return False
         recent = " ".join(getattr(m, "text", "") or "" for m in conversation[-12:]).lower()
-        has_recommendation = "recommend" in recent or "final" in recent
-        has_timeline = "timeline" in recent or "implementation" in recent
+        has_recommendation = any(kw in recent for kw in TERMINATION_RECOMMENDATION_KEYWORDS)
+        has_timeline = any(kw in recent for kw in TERMINATION_TIMELINE_KEYWORDS)
         has_final_tool_signal = (
             "generate_plan" in recent
             or "rank_options" in recent
             or "score_recovery_option" in recent
         )
-        # Safety: terminate if conversation is long enough that all specialists
-        # should have reported back (prevents infinite cycling)
-        conversation_long_enough = n_msgs > (n_specialists * 6 + 10)
+        # Safety valve: reduced threshold so workflows don't run too long
+        conversation_long_enough = n_msgs > (n_specialists * 3 + 8)
         should_stop = (
             (has_recommendation and has_timeline)
             or has_final_tool_signal
@@ -234,6 +250,37 @@ Start now by calling the first handoff tool.
     return workflow
 
 
+class _SpecialistAggregator(Executor):
+    """Dispatches input to parallel specialists, then aggregates their responses for the coordinator."""
+
+    def __init__(self, coordinator_executor_id: str, specialist_ids: List[str], **kwargs):
+        super().__init__(**kwargs)
+        self._coordinator_executor_id = coordinator_executor_id
+        self._specialist_ids = specialist_ids
+
+    @handler
+    async def dispatch(self, message: str, ctx: WorkflowContext) -> None:
+        """Handle initial string input — fan-out to all specialists."""
+        for sid in self._specialist_ids:
+            await ctx.send_message(message, target_id=sid)
+
+    @handler
+    async def aggregate(self, results: List[AgentExecutorResponse], ctx: WorkflowContext) -> None:
+        """Handle fan-in specialist results — format and forward to coordinator."""
+        parts = []
+        for r in results:
+            msgs = r.agent_response.messages if r.agent_response and r.agent_response.messages else []
+            text = "\n".join(getattr(m, "text", "") or "" for m in msgs)
+            parts.append(f"=== {r.executor_id} findings ===\n{text or '(No findings returned)'}")
+        summary = (
+            "All specialist analyses are complete. Here are the specialist findings:\n\n"
+            + "\n\n".join(parts)
+            + "\n\nPlease synthesize a final decision."
+        )
+        msg = ChatMessage(role="user", text=summary)
+        await ctx.send_message([msg], target_id=self._coordinator_executor_id)
+
+
 def create_deterministic_coordinator_workflow(
     scenario: str,
     active_agent_ids: List[str],
@@ -242,7 +289,7 @@ def create_deterministic_coordinator_workflow(
 ) -> Workflow:
     """
     Create a deterministic coordinator workflow.
-    Specialists execute once in scenario order, then coordinator synthesizes final output.
+    Specialists execute concurrently in parallel, then coordinator synthesizes final output.
     """
     workflow_name = name or f"{scenario}_deterministic_workflow"
     logger.info(
@@ -321,13 +368,45 @@ Requirements:
 }}
 """
 
-    participants = [*specialists, coordinator]
-    workflow = SequentialBuilder().participants(participants).build()
+    # Build parallel specialist → coordinator workflow
+    coordinator_exec_id = resolved_coordinator_id
+    aggregator_id = "specialist_aggregator"
+    builder = WorkflowBuilder(name=workflow_name)
+
+    specialist_refs = []
+    for specialist in specialists:
+        sid = specialist.name or specialist.id
+        s = specialist  # capture for lambda
+        builder.register_agent(lambda _s=s: _s, name=sid)
+        specialist_refs.append(sid)
+    builder.register_agent(lambda: coordinator, name=coordinator_exec_id, output_response=True)
+    # Capture specialist_refs for the lambda
+    _srefs = list(specialist_refs)
+    builder.register_executor(
+        lambda: _SpecialistAggregator(
+            id=aggregator_id,
+            coordinator_executor_id=coordinator_exec_id,
+            specialist_ids=_srefs,
+        ),
+        name=aggregator_id,
+    )
+    builder.set_start_executor(aggregator_id)
+
+    # Fan-out: aggregator dispatches to all specialists in parallel
+    builder.add_fan_out_edges(aggregator_id, specialist_refs)
+    # Fan-in: specialist results flow back to aggregator for formatting
+    builder.add_fan_in_edges(specialist_refs, aggregator_id)
+    # Chain: aggregator sends formatted summary to coordinator
+    builder.add_edge(aggregator_id, coordinator_exec_id)
+
+    workflow = builder.build()
+
     logger.info(
         "deterministic_coordinator_workflow_created",
         name=workflow_name,
         coordinator=resolved_coordinator_id,
         specialist_count=len(specialists),
+        parallel=True,
     )
     return workflow
 

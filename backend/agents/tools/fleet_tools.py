@@ -1,5 +1,6 @@
 """Fleet Recovery tools — aircraft availability, tail swaps via SQL + GRAPH."""
 
+import asyncio
 from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
@@ -36,8 +37,8 @@ async def check_range_compatibility(
     if _retriever:
         query = f"aircraft {tailnum} range capability for route {route} distance"
         rows, cits = await retriever_query(_retriever.query_sql(query))
-        return {"compatible": True, "details": rows[:5], "citations": [c.__dict__ for c in cits]}
-    return {"tailnum": tailnum, "route": route, "compatible": True, "status": "mock"}
+        return {"details": rows[:5], "citations": [c.__dict__ for c in cits]}
+    return {"tailnum": tailnum, "route": route, "compatible": "unknown", "status": "mock"}
 
 
 @ai_function(approval_mode="never_require")
@@ -49,12 +50,14 @@ async def evaluate_tail_swap(
     """Evaluate a tail swap — MEL status, downstream impact, crew compatibility."""
     if _retriever:
         query = f"MEL status and downstream flights for aircraft {swap_tail}"
-        sql_rows, sql_cits = await retriever_query(_retriever.query_sql(query))
-        graph_rows, graph_cits = await retriever_query(_retriever.query_graph(f"downstream flights from {swap_tail}"))
+        (sql_rows, sql_cits), (graph_rows, graph_cits) = await asyncio.gather(
+            retriever_query(_retriever.query_sql(query)),
+            retriever_query(_retriever.query_graph(f"downstream flights from {swap_tail}")),
+        )
+        mel_items = [r for r in sql_rows if "mel" in str(r).lower()][:5]
         return {
-            "mel_items": [r for r in sql_rows if "mel" in str(r).lower()][:5],
+            "mel_items": mel_items,
             "downstream_impact": graph_rows[:10],
-            "swap_feasible": True,
             "citations": [c.__dict__ for c in sql_cits + graph_cits],
         }
-    return {"original": original_tail, "swap": swap_tail, "flight": flight_id, "feasible": True, "status": "mock"}
+    return {"original": original_tail, "swap": swap_tail, "flight": flight_id, "feasible": "unknown", "status": "mock"}

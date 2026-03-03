@@ -1,5 +1,6 @@
 """Regulatory Compliance tools — regulation search via AI Search."""
 
+import asyncio
 from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
@@ -22,15 +23,16 @@ async def check_compliance(
     """Check if a proposed action complies with relevant regulations."""
     if _retriever:
         query = f"{regulation_area} regulations applicable to: {action_description}"
-        reg_rows, reg_cits = await retriever_query(_retriever.query_semantic(query, source="VECTOR_REG"))
-        ops_rows, ops_cits = await retriever_query(_retriever.query_semantic(query, source="VECTOR_OPS"))
+        (reg_rows, reg_cits), (ops_rows, ops_cits) = await asyncio.gather(
+            retriever_query(_retriever.query_semantic(query, source="VECTOR_REG")),
+            retriever_query(_retriever.query_semantic(query, source="VECTOR_OPS")),
+        )
         return {
             "regulations": reg_rows[:5],
             "operational_precedents": ops_rows[:3],
-            "compliant": True,
             "citations": [c.__dict__ for c in reg_cits + ops_cits],
         }
-    return {"action": action_description[:80], "area": regulation_area, "compliant": True, "status": "mock"}
+    return {"action": action_description[:80], "area": regulation_area, "compliant": "unknown", "status": "mock"}
 
 
 @ai_function(approval_mode="never_require")

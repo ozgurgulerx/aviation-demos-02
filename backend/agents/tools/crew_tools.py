@@ -1,5 +1,6 @@
 """Crew Recovery tools — availability, duty limits via SQL + AI Search."""
 
+import asyncio
 from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
@@ -34,14 +35,16 @@ async def check_duty_limits(
     """Check FAR 117 duty and rest limits for specified crew members."""
     if _retriever:
         query = f"duty hours and rest periods for crew {', '.join(crew_ids[:5])}"
-        sql_rows, sql_cits = await retriever_query(_retriever.query_sql(query))
-        reg_rows, reg_cits = await retriever_query(_retriever.query_semantic("FAR 117 duty time limitations", source="VECTOR_REG"))
+        (sql_rows, sql_cits), (reg_rows, reg_cits) = await asyncio.gather(
+            retriever_query(_retriever.query_sql(query)),
+            retriever_query(_retriever.query_semantic("FAR 117 duty time limitations", source="VECTOR_REG")),
+        )
         return {
             "crew_status": sql_rows[:10],
             "regulations": reg_rows[:3],
             "citations": [c.__dict__ for c in sql_cits + reg_cits],
         }
-    return {"crew_ids": crew_ids, "all_within_limits": True, "status": "mock"}
+    return {"crew_ids": crew_ids, "all_within_limits": "unknown", "status": "mock"}
 
 
 @ai_function(approval_mode="never_require")

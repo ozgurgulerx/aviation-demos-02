@@ -3,7 +3,7 @@ Shared test fixtures for Aviation Multi-Agent Solver tests.
 """
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 
 @pytest.fixture
@@ -71,7 +71,7 @@ def wire_retriever(mock_retriever):
         mod.set_retriever(mock_retriever)
     yield mock_retriever
     for mod, orig in originals.items():
-        mod._retriever = orig
+        mod.set_retriever(orig)
 
 
 @pytest.fixture
