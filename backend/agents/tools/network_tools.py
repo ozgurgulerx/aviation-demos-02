@@ -4,6 +4,7 @@ from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
+from agents.tools import retriever_query
 
 logger = structlog.get_logger()
 _retriever = None
@@ -21,9 +22,9 @@ async def simulate_delay_propagation(
 ) -> Dict[str, Any]:
     """Simulate how a delay propagates through the network."""
     if _retriever:
-        graph_rows, graph_cits = await _retriever.query_graph(
+        graph_rows, graph_cits = await retriever_query(_retriever.query_graph(
             f"downstream connections from {origin_airport}", hops=cascade_hops
-        )
+        ))
         return {
             "origin": origin_airport,
             "initial_delay": delay_minutes,
@@ -42,6 +43,6 @@ async def query_historical_delays(
     """Query BTS historical delay data for pattern analysis."""
     if _retriever:
         query = f"average {cause} delays at {airport} from BTS on-time performance data"
-        rows, cits = await _retriever.query_fabric_sql(query)
+        rows, cits = await retriever_query(_retriever.query_fabric_sql(query))
         return {"historical_delays": rows[:20], "citations": [c.__dict__ for c in cits]}
     return {"airport": airport, "cause": cause, "historical_delays": [], "status": "mock"}

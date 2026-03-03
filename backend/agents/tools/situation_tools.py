@@ -4,6 +4,7 @@ from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
+from agents.tools import retriever_query
 
 logger = structlog.get_logger()
 
@@ -23,8 +24,8 @@ async def map_disruption_scope(
     """Map the scope of an operational disruption — affected flights, gates, and connections."""
     if _retriever:
         query = f"flights affected at {', '.join(airports)} within {time_window_hours} hours"
-        sql_rows, sql_cit = await _retriever.query_sql(query)
-        graph_rows, graph_cit = await _retriever.query_graph(query, hops=2)
+        sql_rows, sql_cit = await retriever_query(_retriever.query_sql(query))
+        graph_rows, graph_cit = await retriever_query(_retriever.query_graph(query, hops=2))
         return {
             "affected_flights": sql_rows[:20],
             "network_connections": graph_rows[:15],
@@ -42,7 +43,7 @@ async def query_flight_schedule(
     """Query flight schedule data for specified airports."""
     if _retriever:
         query = f"flight schedule at {', '.join(airports)} status {status_filter}"
-        rows, cits = await _retriever.query_sql(query)
+        rows, cits = await retriever_query(_retriever.query_sql(query))
         return {"flights": rows[:30], "total": len(rows), "citations": [c.__dict__ for c in cits]}
     return {"airports": airports, "filter": status_filter, "flights": [], "status": "mock"}
 
@@ -54,6 +55,6 @@ async def get_live_positions(
     """Get real-time ADS-B flight positions near specified airports."""
     if _retriever:
         query = f"live aircraft positions near {', '.join(airports)}"
-        rows, cits = await _retriever.query_kql(query, window_minutes=30)
+        rows, cits = await retriever_query(_retriever.query_kql(query, window_minutes=30))
         return {"positions": rows[:50], "count": len(rows), "citations": [c.__dict__ for c in cits]}
     return {"airports": airports, "positions": [], "status": "mock"}

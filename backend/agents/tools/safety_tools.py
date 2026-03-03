@@ -9,6 +9,7 @@ from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
+from agents.tools import retriever_query, retriever_query_multi
 
 logger = structlog.get_logger()
 _retriever = None
@@ -37,7 +38,7 @@ async def check_compliance(
     """
     if _retriever:
         query = f"regulatory compliance check: {solution_description} against {', '.join(regulations)}"
-        reg_rows, reg_cits = await _retriever.query_semantic(query, source="VECTOR_REG")
+        reg_rows, reg_cits = await retriever_query(_retriever.query_semantic(query, source="VECTOR_REG"))
         return {
             "solution": solution_description[:100],
             "regulatory_findings": reg_rows[:10],
@@ -107,10 +108,10 @@ async def assess_risk_factors(
     impact severity, and overall risk scores.
     """
     if _retriever:
-        results = await _retriever.query_multiple(
+        results = await retriever_query_multi(_retriever.query_multiple(
             scenario_description,
             ["VECTOR_OPS", "VECTOR_REG", "KQL"],
-        )
+        ))
         ops_rows, ops_cits = results.get("VECTOR_OPS", ([], []))
         reg_rows, reg_cits = results.get("VECTOR_REG", ([], []))
         kql_rows, kql_cits = results.get("KQL", ([], []))
@@ -179,10 +180,10 @@ async def validate_solution(
     overall recommendation, and any conditions for approval.
     """
     if _retriever:
-        results = await _retriever.query_multiple(
+        results = await retriever_query_multi(_retriever.query_multiple(
             solution_description,
             ["VECTOR_REG", "VECTOR_OPS"],
-        )
+        ))
         reg_rows, reg_cits = results.get("VECTOR_REG", ([], []))
         ops_rows, ops_cits = results.get("VECTOR_OPS", ([], []))
         return {

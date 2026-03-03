@@ -4,6 +4,7 @@ from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
+from agents.tools import retriever_query
 
 logger = structlog.get_logger()
 _retriever = None
@@ -21,7 +22,7 @@ async def query_crew_availability(
     """Query available crew members at a base airport who are within duty limits."""
     if _retriever:
         query = f"crew members at {base_airport} role {role} with remaining duty hours"
-        rows, cits = await _retriever.query_sql(query)
+        rows, cits = await retriever_query(_retriever.query_sql(query))
         return {"available_crew": rows[:15], "citations": [c.__dict__ for c in cits]}
     return {"base": base_airport, "role": role, "available_crew": [], "status": "mock"}
 
@@ -33,8 +34,8 @@ async def check_duty_limits(
     """Check FAR 117 duty and rest limits for specified crew members."""
     if _retriever:
         query = f"duty hours and rest periods for crew {', '.join(crew_ids[:5])}"
-        sql_rows, sql_cits = await _retriever.query_sql(query)
-        reg_rows, reg_cits = await _retriever.query_semantic("FAR 117 duty time limitations", source="VECTOR_REG")
+        sql_rows, sql_cits = await retriever_query(_retriever.query_sql(query))
+        reg_rows, reg_cits = await retriever_query(_retriever.query_semantic("FAR 117 duty time limitations", source="VECTOR_REG"))
         return {
             "crew_status": sql_rows[:10],
             "regulations": reg_rows[:3],
@@ -51,6 +52,6 @@ async def propose_crew_pairing(
     """Propose a crew pairing for a flight based on availability and qualifications."""
     if _retriever:
         query = f"crew pairing options for flight {flight_id}"
-        rows, cits = await _retriever.query_sql(query)
+        rows, cits = await retriever_query(_retriever.query_sql(query))
         return {"proposed_pairing": rows[:5], "citations": [c.__dict__ for c in cits]}
     return {"flight_id": flight_id, "roles": required_roles or ["captain", "first_officer"], "status": "mock"}

@@ -4,6 +4,7 @@ from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
+from agents.tools import retriever_query
 
 logger = structlog.get_logger()
 _retriever = None
@@ -21,8 +22,8 @@ async def check_compliance(
     """Check if a proposed action complies with relevant regulations."""
     if _retriever:
         query = f"{regulation_area} regulations applicable to: {action_description}"
-        reg_rows, reg_cits = await _retriever.query_semantic(query, source="VECTOR_REG")
-        ops_rows, ops_cits = await _retriever.query_semantic(query, source="VECTOR_OPS")
+        reg_rows, reg_cits = await retriever_query(_retriever.query_semantic(query, source="VECTOR_REG"))
+        ops_rows, ops_cits = await retriever_query(_retriever.query_semantic(query, source="VECTOR_OPS"))
         return {
             "regulations": reg_rows[:5],
             "operational_precedents": ops_rows[:3],
@@ -39,6 +40,6 @@ async def search_regulations(
 ) -> Dict[str, Any]:
     """Search FAA/EASA regulatory documents."""
     if _retriever:
-        rows, cits = await _retriever.query_semantic(query, top=top, source="VECTOR_REG")
+        rows, cits = await retriever_query(_retriever.query_semantic(query, top=top, source="VECTOR_REG"))
         return {"regulations": rows[:top], "citations": [c.__dict__ for c in cits]}
     return {"query": query[:80], "regulations": [], "status": "mock"}

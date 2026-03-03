@@ -4,6 +4,7 @@ from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
+from agents.tools import retriever_query
 
 logger = structlog.get_logger()
 _retriever = None
@@ -21,7 +22,7 @@ async def check_sigmets_pireps(
     """Check active SIGMETs and PIREPs near specified airports."""
     if _retriever:
         query = f"active SIGMETs and PIREPs near {', '.join(airports)} next {window_hours} hours"
-        rows, cits = await _retriever.query_kql(query, window_minutes=window_hours * 60)
+        rows, cits = await retriever_query(_retriever.query_kql(query, window_minutes=window_hours * 60))
         return {"hazards": rows[:20], "count": len(rows), "citations": [c.__dict__ for c in cits]}
     return {"airports": airports, "hazards": [], "status": "mock"}
 
@@ -33,7 +34,7 @@ async def query_notams(
     """Query active NOTAMs for specified airports from Cosmos DB."""
     if _retriever:
         query = f"active NOTAMs for {', '.join(airports)}"
-        rows, cits = await _retriever.query_nosql(query)
+        rows, cits = await retriever_query(_retriever.query_nosql(query))
         return {"notams": rows[:20], "count": len(rows), "citations": [c.__dict__ for c in cits]}
     return {"airports": airports, "notams": [], "status": "mock"}
 
@@ -45,6 +46,6 @@ async def search_asrs_precedent(
 ) -> Dict[str, Any]:
     """Search ASRS safety reports for similar historical incidents and lessons learned."""
     if _retriever:
-        rows, cits = await _retriever.query_semantic(incident_description, top=top, source="VECTOR_OPS")
+        rows, cits = await retriever_query(_retriever.query_semantic(incident_description, top=top, source="VECTOR_OPS"))
         return {"similar_incidents": rows[:top], "citations": [c.__dict__ for c in cits]}
     return {"query": incident_description[:100], "similar_incidents": [], "status": "mock"}

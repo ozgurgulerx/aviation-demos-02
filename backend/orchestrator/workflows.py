@@ -41,9 +41,14 @@ def _create_agent_by_id(agent_id: str) -> Optional[ChatAgent]:
     """Create a ChatAgent instance from the agent registry."""
     from agents import agent_factories
     factory = agent_factories.get(agent_id)
-    if factory:
+    if not factory:
+        logger.warning("agent_factory_not_found", agent_id=agent_id)
+        return None
+    try:
         return factory(name=agent_id)
-    return None
+    except Exception as e:
+        logger.error("agent_factory_failed", agent_id=agent_id, error=str(e))
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════

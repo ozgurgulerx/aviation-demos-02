@@ -656,9 +656,9 @@ async def execute_workflow(
                     run_id=run_id,
                     kind=EventKind.RUN_FAILED,
                     level="error",
-                    message=f"Solver run failed: {str(e)}",
+                    message=f"Solver run failed: {type(e).__name__}: {str(e)}",
                     payload={
-                        "error": str(e),
+                        "error": f"{type(e).__name__}: {str(e)}",
                         "workflow_type": workflow_type,
                         "orchestration_mode": orchestration_mode,
                     },

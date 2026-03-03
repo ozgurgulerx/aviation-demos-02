@@ -4,6 +4,7 @@ from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
+from agents.tools import retriever_query
 
 logger = structlog.get_logger()
 _retriever = None
@@ -21,12 +22,12 @@ async def find_route_alternatives(
 ) -> Dict[str, Any]:
     """Find alternative routes between two airports."""
     if _retriever:
-        graph_rows, graph_cits = await _retriever.query_graph(
+        graph_rows, graph_cits = await retriever_query(_retriever.query_graph(
             f"routes from {origin} to {destination}", hops=max_stops + 1
-        )
-        sql_rows, sql_cits = await _retriever.query_sql(
+        ))
+        sql_rows, sql_cits = await retriever_query(_retriever.query_sql(
             f"flights from {origin} with connections to {destination}"
-        )
+        ))
         return {
             "route_alternatives": graph_rows[:10],
             "available_flights": sql_rows[:15],
@@ -42,6 +43,6 @@ async def check_route_weather(
     """Check weather conditions along a route."""
     if _retriever:
         query = f"weather hazards along route {route}"
-        rows, cits = await _retriever.query_kql(query)
+        rows, cits = await retriever_query(_retriever.query_kql(query))
         return {"route_weather": rows[:15], "citations": [c.__dict__ for c in cits]}
     return {"route": route, "route_weather": [], "status": "mock"}

@@ -4,6 +4,7 @@ from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
+from agents.tools import retriever_query
 
 logger = structlog.get_logger()
 _retriever = None
@@ -20,7 +21,7 @@ async def calculate_fatigue_score(
     """Calculate fatigue risk scores based on duty patterns and rest periods."""
     if _retriever:
         query = f"duty hours, rest periods, and cumulative fatigue for crew {', '.join(crew_ids[:5])}"
-        rows, cits = await _retriever.query_sql(query)
+        rows, cits = await retriever_query(_retriever.query_sql(query))
         return {"fatigue_assessments": rows[:10], "citations": [c.__dict__ for c in cits]}
     return {"crew_ids": crew_ids, "fatigue_assessments": [], "status": "mock"}
 
@@ -33,10 +34,10 @@ async def check_far117_compliance(
     """Check if proposed duty extension complies with FAR 117 rest requirements."""
     if _retriever:
         query = f"current duty status for crew {crew_id}"
-        sql_rows, sql_cits = await _retriever.query_sql(query)
-        reg_rows, reg_cits = await _retriever.query_semantic(
+        sql_rows, sql_cits = await retriever_query(_retriever.query_sql(query))
+        reg_rows, reg_cits = await retriever_query(_retriever.query_semantic(
             "FAR 117 flight duty period limits rest requirements", source="VECTOR_REG"
-        )
+        ))
         return {
             "crew_status": sql_rows[:3],
             "applicable_regulations": reg_rows[:3],

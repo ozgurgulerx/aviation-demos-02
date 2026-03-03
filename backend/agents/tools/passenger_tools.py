@@ -4,6 +4,7 @@ from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
+from agents.tools import retriever_query
 
 logger = structlog.get_logger()
 _retriever = None
@@ -20,10 +21,10 @@ async def assess_connection_risks(
     """Assess passenger connection risks for delayed/cancelled flights."""
     if _retriever:
         query = f"passengers with connections on flights {', '.join(flight_ids[:5])}"
-        sql_rows, sql_cits = await _retriever.query_sql(query)
-        graph_rows, graph_cits = await _retriever.query_graph(
+        sql_rows, sql_cits = await retriever_query(_retriever.query_sql(query))
+        graph_rows, graph_cits = await retriever_query(_retriever.query_graph(
             f"connection paths from flights {', '.join(flight_ids[:3])}"
-        )
+        ))
         return {
             "at_risk_connections": sql_rows[:20],
             "connection_graph": graph_rows[:15],
@@ -41,7 +42,7 @@ async def estimate_rebooking_load(
     """Estimate rebooking load and available seat capacity."""
     if _retriever:
         query = f"available seats on upcoming flights from {airport}"
-        rows, cits = await _retriever.query_sql(query)
+        rows, cits = await retriever_query(_retriever.query_sql(query))
         return {
             "available_capacity": rows[:15],
             "estimated_pax_needing_rebooking": cancelled_flights * 150,

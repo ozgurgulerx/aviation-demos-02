@@ -5,7 +5,7 @@ import { motion } from "framer-motion";
 import { ChevronRight, Database, Blend } from "lucide-react";
 import { useAviationStore } from "@/store/aviation-store";
 import type { WorkflowEvent } from "@/types/aviation";
-import { EventKinds, payloadNumber, payloadString } from "@/types/aviation";
+import { EventKinds, payloadNumber, payloadString, payloadArray } from "@/types/aviation";
 
 function formatTimestamp(ts: string): string {
   try {
@@ -166,6 +166,22 @@ function describeEvent(
         details: [`confidence ${Math.round(confidence * 100)}%`],
         color,
         expandable: recommendation,
+      };
+    case EventKinds.AGENT_ACTIVATED: {
+      const sources = payloadArray<string>(payload, "dataSources").slice(0, 4);
+      return {
+        title: `${agentName} selected`,
+        body: payloadString(payload, "reason", "Selected for scenario"),
+        details: sources.length > 0 ? sources : ["selected"],
+        color,
+      };
+    }
+    case EventKinds.AGENT_EXCLUDED:
+      return {
+        title: `${agentName} excluded`,
+        body: payloadString(payload, "reason", "Not needed for scenario"),
+        details: ["excluded"],
+        color: "hsl(var(--av-silver))",
       };
     case EventKinds.HANDOVER:
       return {

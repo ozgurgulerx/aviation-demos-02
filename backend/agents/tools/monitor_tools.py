@@ -4,6 +4,7 @@ from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
+from agents.tools import retriever_query
 
 logger = structlog.get_logger()
 _retriever = None
@@ -22,7 +23,7 @@ async def get_live_positions(
     if _retriever:
         targets = callsigns or airports or ["ORD"]
         query = f"live ADS-B positions for {', '.join(targets[:5])}"
-        rows, cits = await _retriever.query_kql(query, window_minutes=15)
+        rows, cits = await retriever_query(_retriever.query_kql(query, window_minutes=15))
         return {"positions": rows[:50], "count": len(rows), "citations": [c.__dict__ for c in cits]}
     return {"callsigns": callsigns, "airports": airports, "positions": [], "status": "mock"}
 
@@ -34,6 +35,6 @@ async def check_active_notams(
     """Check currently active NOTAMs for specified airports."""
     if _retriever:
         query = f"active NOTAMs at {', '.join(airports)}"
-        rows, cits = await _retriever.query_nosql(query)
+        rows, cits = await retriever_query(_retriever.query_nosql(query))
         return {"notams": rows[:20], "count": len(rows), "citations": [c.__dict__ for c in cits]}
     return {"airports": airports, "notams": [], "status": "mock"}

@@ -4,6 +4,7 @@ from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
+from agents.tools import retriever_query
 
 logger = structlog.get_logger()
 _retriever = None
@@ -21,7 +22,7 @@ async def analyze_mel_trends(
     """Analyze MEL/techlog trends for predictive maintenance indicators."""
     if _retriever:
         query = f"MEL techlog events for {aircraft_type} fleet" + (f" JASC {jasc_code}" if jasc_code else "")
-        rows, cits = await _retriever.query_sql(query)
+        rows, cits = await retriever_query(_retriever.query_sql(query))
         return {"mel_events": rows[:20], "trend_count": len(rows), "citations": [c.__dict__ for c in cits]}
     return {"aircraft_type": aircraft_type, "jasc_code": jasc_code, "mel_events": [], "status": "mock"}
 
@@ -33,6 +34,6 @@ async def search_similar_incidents(
 ) -> Dict[str, Any]:
     """Search ASRS reports for similar maintenance-related incidents."""
     if _retriever:
-        rows, cits = await _retriever.query_semantic(description, top=top, source="VECTOR_OPS")
+        rows, cits = await retriever_query(_retriever.query_semantic(description, top=top, source="VECTOR_OPS"))
         return {"similar_incidents": rows[:top], "citations": [c.__dict__ for c in cits]}
     return {"query": description[:80], "similar_incidents": [], "status": "mock"}

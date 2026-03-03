@@ -9,6 +9,7 @@ from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
+from agents.tools import retriever_query, retriever_query_multi
 
 logger = structlog.get_logger()
 _retriever = None
@@ -37,7 +38,7 @@ async def analyze_flight_data(
     """
     if _retriever:
         query = f"flight data for {', '.join(flight_ids[:10])} analysis type {analysis_type}"
-        rows, cits = await _retriever.query_sql(query)
+        rows, cits = await retriever_query(_retriever.query_sql(query))
         return {"flights": rows[:20], "analysis_type": analysis_type, "total_analyzed": len(rows), "citations": [c.__dict__ for c in cits]}
 
     results = {}
@@ -77,7 +78,7 @@ async def check_weather_impact(
     """
     if _retriever:
         query = f"weather impact at {', '.join(airports)} next {timeframe_hours} hours"
-        results = await _retriever.query_multiple(query, ["KQL", "NOSQL"])
+        results = await retriever_query_multi(_retriever.query_multiple(query, ["KQL", "NOSQL"]))
         kql_rows, kql_cits = results.get("KQL", ([], []))
         nosql_rows, nosql_cits = results.get("NOSQL", ([], []))
         return {
@@ -120,7 +121,7 @@ async def query_route_status(
     """
     if _retriever:
         query = f"route status for {', '.join(routes[:10])}"
-        results = await _retriever.query_multiple(query, ["SQL", "GRAPH"])
+        results = await retriever_query_multi(_retriever.query_multiple(query, ["SQL", "GRAPH"]))
         sql_rows, sql_cits = results.get("SQL", ([], []))
         graph_rows, graph_cits = results.get("GRAPH", ([], []))
         return {

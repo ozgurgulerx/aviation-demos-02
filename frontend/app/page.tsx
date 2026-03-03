@@ -36,7 +36,13 @@ export default function Home() {
                   </ErrorBoundary>
                 </Panel>
 
-                <PanelResizeHandle className="h-px bg-av-sky/14 hover:bg-av-sky/45 transition-colors" />
+                <PanelResizeHandle className="group/resize relative h-1.5 cursor-row-resize bg-av-sky/14 hover:bg-av-sky/45 transition-colors">
+                  <span className="pointer-events-none absolute inset-x-0 top-1/2 flex -translate-y-1/2 justify-center gap-1 opacity-0 transition-opacity group-hover/resize:opacity-100">
+                    <span className="h-0.5 w-0.5 rounded-full bg-av-sky/60" />
+                    <span className="h-0.5 w-0.5 rounded-full bg-av-sky/60" />
+                    <span className="h-0.5 w-0.5 rounded-full bg-av-sky/60" />
+                  </span>
+                </PanelResizeHandle>
 
                 <Panel defaultSize={30} minSize={8} maxSize={62}>
                   <BottomDrawer

@@ -9,6 +9,7 @@ from typing import Annotated, Any, Dict, List
 from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
+from agents.tools import retriever_query, retriever_query_multi
 
 logger = structlog.get_logger()
 _retriever = None
@@ -36,10 +37,10 @@ async def evaluate_alternatives(
     time requirements, and feasibility scores.
     """
     if _retriever:
-        results = await _retriever.query_multiple(
+        results = await retriever_query_multi(_retriever.query_multiple(
             problem_description,
             ["SQL", "FABRIC_SQL", "VECTOR_OPS"],
-        )
+        ))
         sql_rows, sql_cits = results.get("SQL", ([], []))
         fabric_rows, fabric_cits = results.get("FABRIC_SQL", ([], []))
         vector_rows, vector_cits = results.get("VECTOR_OPS", ([], []))
@@ -93,7 +94,7 @@ async def optimize_resources(
     """
     if _retriever:
         query = f"resource availability {resource_type} next {constraint_window_hours} hours"
-        rows, cits = await _retriever.query_sql(query)
+        rows, cits = await retriever_query(_retriever.query_sql(query))
         return {
             "optimization": rows[:20],
             "constraint_window_hours": constraint_window_hours,
@@ -150,7 +151,7 @@ async def calculate_impact(
     """
     if _retriever:
         query = f"impact assessment for: {change_description} affecting {affected_flights} flights"
-        results = await _retriever.query_multiple(query, ["SQL", "FABRIC_SQL"])
+        results = await retriever_query_multi(_retriever.query_multiple(query, ["SQL", "FABRIC_SQL"]))
         sql_rows, sql_cits = results.get("SQL", ([], []))
         fabric_rows, fabric_cits = results.get("FABRIC_SQL", ([], []))
         return {
