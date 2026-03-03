@@ -973,8 +973,22 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         self._coordinator_artifacts_emitted = True
 
     def _estimate_result_count(self, agent_id: str, source_type: str, response_text: str, index: int) -> int:
-        """Return 0 — actual result counts come from tool responses, not string heuristics."""
-        return 0
+        """Estimate result count from response text structure.
+
+        Returns a conservative positive count when the agent produced
+        substantive output so the UI displays meaningful data-source
+        activity.  Returns 0 only when there is no real response text.
+        """
+        if not response_text or not response_text.strip():
+            return 0
+        text = response_text.strip()
+        if len(text) < 50:
+            return 0
+        segments = [
+            s for s in re.split(r'\n\n+|\n\s*[-*]\s|\n\s*\d+[.)]\s', text)
+            if s.strip()
+        ]
+        return min(max(1, len(segments)), 25)
 
     def _estimate_confidence(self, source_count: int, message_count: int, response_text: str) -> float:
         """Return 1.0 if real data sources responded, 0.0 otherwise."""
@@ -1769,6 +1783,25 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             )
 
             self._completed_agent_ids.add(executor_id)
+
+            # Extract real content instead of hardcoded zeros
+            resp_text = ""
+            msg_count = 0
+            # Try event.data first (works for coordinator completions)
+            if isinstance(event.data, list):
+                for item in event.data:
+                    if hasattr(item, "agent_response") and item.agent_response:
+                        resp_text = self._extract_response_text(item.agent_response)
+                        msg_count = len(item.agent_response.messages) if hasattr(item.agent_response, "messages") and item.agent_response.messages else 0
+                        break
+            # Fallback: accumulated streaming text (works for handoff specialists)
+            if not resp_text:
+                chunks = self._streaming_text_accum.get(executor_id, [])
+                if chunks:
+                    resp_text = "".join(chunks)[:8000]
+                    msg_count = len(chunks)
+            summary = resp_text[:500] if resp_text else f"{agent_name} completed execution."
+
             await self.emit_event(
                 "agent.completed",
                 {
@@ -1776,8 +1809,8 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                     "agentId": executor_id,
                     "agentName": agent_name,
                     "agent_name": agent_name,
-                    "message_count": 0,
-                    "summary": f"{agent_name} completed execution.",
+                    "message_count": msg_count,
+                    "summary": summary,
                     "status": "completed",
                     "completionReason": "executor_completed",
                     "startedAt": started_at.isoformat(),
@@ -1791,12 +1824,12 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                     agent_id=executor_id,
                     agent_name=agent_name,
                     success=True,
-                    result_summary=f"{agent_name} completed execution.",
+                    result_summary=summary,
                 )
             await self._emit_query_completions_and_evidence(
                 agent_id=executor_id,
-                response_text=f"{agent_name} completed execution.",
-                message_count=0,
+                response_text=summary,
+                message_count=msg_count,
             )
 
             await self._emit_progress(f"executor_completed:{executor_id}")

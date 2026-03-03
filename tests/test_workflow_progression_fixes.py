@@ -38,6 +38,33 @@ def _agent(agent_id: str, name: str, category: str = "specialist") -> AgentSelec
 
 
 @pytest.mark.asyncio
+async def test_executor_completed_uses_streaming_text_accum():
+    """agent.completed should use accumulated streaming text, not hardcoded zeros."""
+    captured: list[tuple[str, dict]] = []
+
+    async def emit(event_type: str, payload: dict):
+        captured.append((event_type, payload))
+
+    engine = OrchestratorEngine(run_id="test-accum", event_emitter=emit, enable_checkpointing=False)
+    profile = _agent("specialist_x", "Specialist X")
+    engine.selected_agents = [profile]
+    engine._agent_lookup = {profile.agent_id: profile}
+
+    # Simulate: agent was invoked, produced streaming text, then completed
+    await engine._process_workflow_event(ExecutorInvokedEvent("specialist_x"))
+    engine._streaming_text_accum["specialist_x"] = [
+        "Detroit Metro (DTW) is the nearest suitable alternate. ",
+        "Runway 21L is active with ILS approach available.",
+    ]
+    await engine._process_workflow_event(ExecutorCompletedEvent("specialist_x"))
+
+    completed = [p for t, p in captured if t == "agent.completed"]
+    assert len(completed) == 1
+    assert completed[0]["message_count"] == 2
+    assert "Detroit Metro" in completed[0]["summary"]
+
+
+@pytest.mark.asyncio
 async def test_executor_completed_emits_agent_completed_on_repeated_runs():
     captured: list[tuple[str, dict]] = []
 
