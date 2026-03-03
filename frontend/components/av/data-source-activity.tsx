@@ -49,7 +49,7 @@ function SourceCard({ source }: { source: DataSourceActivity }) {
           <p className="text-[10px] text-muted-foreground">{source.platformLabel}</p>
         </div>
         {source.isActive && (
-          <div className="w-2 h-2 rounded-full animate-pulse" style={{ backgroundColor: cfg.color }} />
+          <div className="w-2 h-2 rounded-full" style={{ backgroundColor: cfg.color }} />
         )}
       </div>
 

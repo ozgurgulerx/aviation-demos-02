@@ -59,21 +59,8 @@ const config: Config = {
         md: "calc(var(--radius) - 2px)",
         sm: "calc(var(--radius) - 4px)",
       },
-      keyframes: {
-        "av-glow-pulse": {
-          "0%, 100%": { opacity: "0.4", transform: "scale(1)" },
-          "50%": { opacity: "0.8", transform: "scale(1.05)" },
-        },
-        "av-particle": {
-          "0%": { opacity: "0", transform: "translateY(0)" },
-          "20%": { opacity: "1" },
-          "100%": { opacity: "0", transform: "translateY(-20px)" },
-        },
-      },
-      animation: {
-        "av-glow-pulse": "av-glow-pulse 2s ease-in-out infinite",
-        "av-particle": "av-particle 1.5s ease-out infinite",
-      },
+      keyframes: {},
+      animation: {},
     },
   },
   plugins: [require("tailwindcss-animate")],

@@ -53,8 +53,8 @@ function CoordinatorNodeInner({ data }: NodeProps & { data: CoordinatorData }) {
             background: "radial-gradient(circle, hsl(var(--av-gold) / 0.15) 0%, transparent 70%)",
             border: "2px solid hsl(var(--av-gold) / 0.3)",
           }}
-          animate={{ scale: [1, 1.12, 1], opacity: [0.5, 0.8, 0.5] }}
-          transition={{ duration: 2, repeat: Infinity }}
+          animate={{ scale: [1, 1.04, 1], opacity: [0.25, 0.45, 0.25] }}
+          transition={{ duration: 3, repeat: Infinity }}
         />
       )}
 
@@ -95,28 +95,6 @@ function CoordinatorNodeInner({ data }: NodeProps & { data: CoordinatorData }) {
               strokeLinecap="round"
               className="transition-all duration-700 ease-out"
             />
-          )}
-          {/* Rotating sweep when active */}
-          {isActive && (
-            <circle
-              cx="50"
-              cy="50"
-              r={radius}
-              fill="none"
-              stroke="hsl(var(--av-gold))"
-              strokeWidth="2"
-              strokeDasharray={`${circumference * 0.15} ${circumference * 0.85}`}
-              opacity={0.3}
-            >
-              <animateTransform
-                attributeName="transform"
-                type="rotate"
-                from="0 50 50"
-                to="360 50 50"
-                dur="2s"
-                repeatCount="indefinite"
-              />
-            </circle>
           )}
         </svg>
 

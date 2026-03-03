@@ -420,10 +420,9 @@ function OrchestrationCanvasInner() {
     <div className="h-full w-full relative">
       <div className="pointer-events-none absolute inset-0 z-[1] flex items-center justify-center">
         <div className="relative h-[560px] w-[560px]">
-          <div className="absolute inset-[18%] rounded-full border border-av-gold/14 av-pulse-ring" />
+          <div className="absolute inset-[18%] rounded-full border border-av-gold/14" />
           <div className="absolute inset-[7%] rounded-full border border-av-sky/18" />
           <div className="absolute inset-[29%] rounded-full border border-av-fabric/20" />
-          <div className="absolute inset-0 rounded-full bg-[conic-gradient(from_0deg,transparent_0deg,hsl(var(--av-sky)/0.08)_70deg,transparent_130deg)] av-radar-sweep" />
           <div className="absolute inset-[44%] rounded-full bg-av-sky/16 blur-md" />
         </div>
       </div>
@@ -486,7 +485,7 @@ function OrchestrationCanvasInner() {
               key={`running-${agent.id}`}
               className="rounded-full border border-av-sky/30 bg-av-midnight/78 px-2.5 py-1 text-[11px] text-av-sky inline-flex items-center gap-1.5"
             >
-              <span className="h-1.5 w-1.5 rounded-full animate-pulse" style={{ backgroundColor: agent.color }} />
+              <span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: agent.color }} />
               <span className="font-semibold">{agent.name}</span>
               <span className="text-muted-foreground">{agent.currentStep || agent.status}</span>
             </div>

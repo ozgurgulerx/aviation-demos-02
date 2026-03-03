@@ -79,8 +79,8 @@ function AgentNodeInner({ data }: NodeProps & { data: AgentData }) {
             background: `radial-gradient(ellipse at center, ${data.color}18 0%, transparent 70%)`,
             border: `1.5px solid ${data.color}30`,
           }}
-          animate={{ opacity: [0.4, 0.8, 0.4] }}
-          transition={{ duration: 2, repeat: Infinity }}
+          animate={{ opacity: [0.25, 0.5, 0.25] }}
+          transition={{ duration: 3, repeat: Infinity }}
         />
       )}
 
@@ -99,18 +99,6 @@ function AgentNodeInner({ data }: NodeProps & { data: AgentData }) {
             : `${data.color}40`,
         }}
       >
-        {/* Scan-line overlay when thinking */}
-        {isThinking && (
-          <div className="absolute inset-0 pointer-events-none z-20 overflow-hidden rounded-xl">
-            <div
-              className="absolute left-0 right-0 h-8 av-scan-line"
-              style={{
-                background: `linear-gradient(180deg, transparent, ${data.color}10, transparent)`,
-              }}
-            />
-          </div>
-        )}
-
         {/* 1. Header row */}
         <div className="flex items-center gap-2.5 p-3 pb-2">
           <div

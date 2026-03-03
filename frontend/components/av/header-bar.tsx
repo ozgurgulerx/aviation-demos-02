@@ -81,10 +81,7 @@ function HeaderBarInner() {
                     style={isActive ? { color: agent.color, borderColor: `${agent.color}40` } : undefined}
                   >
                     <span
-                      className={cn(
-                        "w-1.5 h-1.5 rounded-full",
-                        isActive && "animate-pulse"
-                      )}
+                      className="w-1.5 h-1.5 rounded-full"
                       style={{
                         backgroundColor: isDone
                           ? "hsl(var(--av-green))"

@@ -1,7 +1,6 @@
 "use client";
 
 import { memo, useRef, useEffect, useState } from "react";
-import { motion } from "framer-motion";
 import {
   CheckCircle2,
   XCircle,
@@ -134,12 +133,9 @@ function EventRow({ event }: { event: WorkflowEvent }) {
   const lane = laneForEvent(event);
 
   return (
-    <motion.div
-      initial={{ opacity: 0, x: -8 }}
-      animate={{ opacity: 1, x: 0 }}
-      transition={{ duration: 0.16 }}
+    <div
       className={cn(
-        "flex items-start gap-2 rounded-md border border-transparent px-2 py-1.5",
+        "animate-in fade-in duration-150 flex items-start gap-2 rounded-md border border-transparent px-2 py-1.5",
         event.level === "error" ? "border-av-red/25 bg-av-red/10" : "bg-av-midnight/32"
       )}
     >
@@ -163,7 +159,7 @@ function EventRow({ event }: { event: WorkflowEvent }) {
       {event.duration_ms != null && (
         <span className="mt-0.5 shrink-0 text-[10px] text-muted-foreground">{event.duration_ms}ms</span>
       )}
-    </motion.div>
+    </div>
   );
 }
 

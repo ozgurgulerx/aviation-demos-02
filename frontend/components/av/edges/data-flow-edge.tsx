@@ -27,22 +27,14 @@ function DataFlowEdgeInner({
 
   return (
     <>
-      {/* SVG filter for particle glow */}
-      <defs>
-        <filter id={`glow-${id}`} x="-50%" y="-50%" width="200%" height="200%">
-          <feGaussianBlur stdDeviation="2" result="blur" />
-          <feComposite in="SourceGraphic" in2="blur" operator="over" />
-        </filter>
-      </defs>
-
       {/* Glow background path when active */}
       {isActive && (
         <path
           d={edgePath}
           fill="none"
           stroke={color}
-          strokeWidth={6}
-          opacity={0.1}
+          strokeWidth={4}
+          opacity={0.06}
           style={{ filter: "blur(3px)" }}
         />
       )}
@@ -70,32 +62,16 @@ function DataFlowEdgeInner({
           attributeName="stroke-dashoffset"
           from="20"
           to="0"
-          dur={isActive ? "0.6s" : "2s"}
+          dur={isActive ? "1.2s" : "2s"}
           repeatCount="indefinite"
         />
-        {isActive && (
-          <animate
-            attributeName="opacity"
-            values="0.45;0.9;0.45"
-            dur="1.2s"
-            repeatCount="indefinite"
-          />
-        )}
       </path>
 
-      {/* Staggered particles — data stream effect */}
+      {/* Single traveling particle */}
       {isActive && (
-        <>
-          <circle r="3.5" fill={color} opacity={0.9} filter={`url(#glow-${id})`}>
-            <animateMotion dur="1.4s" repeatCount="indefinite" path={edgePath} />
-          </circle>
-          <circle r="2.5" fill={color} opacity={0.6} filter={`url(#glow-${id})`}>
-            <animateMotion dur="1.4s" repeatCount="indefinite" path={edgePath} begin="0.7s" />
-          </circle>
-          <circle r="1.5" fill={color} opacity={0.35}>
-            <animateMotion dur="1.4s" repeatCount="indefinite" path={edgePath} begin="1.4s" />
-          </circle>
-        </>
+        <circle r="3" fill={color} opacity={0.7}>
+          <animateMotion dur="1.8s" repeatCount="indefinite" path={edgePath} />
+        </circle>
       )}
     </>
   );

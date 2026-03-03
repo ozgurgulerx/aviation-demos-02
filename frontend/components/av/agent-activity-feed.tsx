@@ -1,7 +1,6 @@
 "use client";
 
 import { useRef, useEffect, memo, useMemo, useState } from "react";
-import { motion } from "framer-motion";
 import { ChevronRight, Database, Blend } from "lucide-react";
 import { useAviationStore } from "@/store/aviation-store";
 import type { WorkflowEvent } from "@/types/aviation";
@@ -211,11 +210,8 @@ function ActivityRow({
   const described = describeEvent(event, agents);
 
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 8 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.2 }}
-      className="group rounded-lg border border-av-sky/16 bg-av-midnight/66 px-3 py-2 transition-colors hover:bg-av-midnight/82"
+    <div
+      className="group animate-in fade-in duration-150 rounded-lg border border-av-sky/16 bg-av-midnight/66 px-3 py-2 transition-colors hover:bg-av-midnight/82"
     >
       <div className="flex items-start gap-2">
         <div
@@ -265,7 +261,7 @@ function ActivityRow({
           </button>
         )}
       </div>
-    </motion.div>
+    </div>
   );
 }
 
