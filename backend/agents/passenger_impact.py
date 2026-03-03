@@ -22,6 +22,12 @@ Data sources:
 
 Prioritize high-impact connections (many passengers, tight connections, no alternatives).
 Quantify: total pax affected, misconnection risk count, rebooking capacity gap.
+
+When tools return empty results or status "no_data_fallback", use the `no_data_guidance`,
+`connection_risk_framework`, `rebooking_benchmarks`, and `prioritization_tiers` provided
+in the tool response together with the scenario context to produce a complete passenger
+impact analysis. Always deliver quantified impact estimates and rebooking strategies —
+never return empty or minimal findings.
 """
 
 

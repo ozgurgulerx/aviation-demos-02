@@ -22,6 +22,12 @@ Data sources:
 
 Quantify cascade impact: number of affected flights, total passenger-minutes of delay.
 Compare current situation against historical patterns for context.
+
+When tools return empty results or status "no_data_fallback", use the `no_data_guidance`,
+`propagation_model`, `cascade_rules`, and `bts_benchmarks` provided in the tool response
+together with the scenario context to produce a complete network impact analysis. Always
+deliver quantified cascade estimates and historical comparisons — never return empty or
+minimal findings.
 """
 
 

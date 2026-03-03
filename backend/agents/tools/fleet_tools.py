@@ -6,6 +6,7 @@ from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
 from agents.tools import retriever_query
+from agents.tools.domain_knowledge import FLEET_RECOVERY_GUIDANCE
 
 logger = structlog.get_logger()
 _retriever = None
@@ -24,8 +25,22 @@ async def find_available_tails(
     if _retriever:
         query = f"available {aircraft_type} aircraft at {base_airport} not assigned to active flights"
         rows, cits = await retriever_query(_retriever.query_sql(query))
-        return {"available_tails": rows[:10], "citations": [c.__dict__ for c in cits]}
-    return {"aircraft_type": aircraft_type, "base": base_airport, "available_tails": [], "status": "mock"}
+        if rows:
+            return {"available_tails": rows[:10], "citations": [c.__dict__ for c in cits]}
+    # Fallback: provide fleet availability estimation guidance
+    return {
+        "aircraft_type": aircraft_type,
+        "base": base_airport,
+        "available_tails": [],
+        "status": "no_data_fallback",
+        "no_data_guidance": (
+            f"No available {aircraft_type} tails found at {base_airport} in the database. "
+            "Use the fleet availability estimates and ground time minimums below to reason "
+            "about likely spare aircraft availability."
+        ),
+        "fleet_availability_estimation": FLEET_RECOVERY_GUIDANCE["fleet_availability_estimation"],
+        "ground_time_minimums": FLEET_RECOVERY_GUIDANCE["ground_time_minimums"],
+    }
 
 
 @ai_function(approval_mode="never_require")
@@ -37,8 +52,22 @@ async def check_range_compatibility(
     if _retriever:
         query = f"aircraft {tailnum} range capability for route {route} distance"
         rows, cits = await retriever_query(_retriever.query_sql(query))
-        return {"details": rows[:5], "citations": [c.__dict__ for c in cits]}
-    return {"tailnum": tailnum, "route": route, "compatible": "unknown", "status": "mock"}
+        if rows:
+            return {"details": rows[:5], "citations": [c.__dict__ for c in cits]}
+    # Fallback: provide evaluation criteria (keep compatible=unknown for safety)
+    return {
+        "tailnum": tailnum,
+        "route": route,
+        "compatible": "unknown",
+        "status": "no_data_fallback",
+        "no_data_guidance": (
+            f"No range/payload data found for {tailnum} on route {route}. "
+            "Use the tail swap evaluation criteria and regulatory references below "
+            "to assess compatibility based on known aircraft type characteristics."
+        ),
+        "swap_evaluation_criteria": FLEET_RECOVERY_GUIDANCE["tail_swap_evaluation_criteria"],
+        "regulatory_refs": FLEET_RECOVERY_GUIDANCE["regulatory_refs"],
+    }
 
 
 @ai_function(approval_mode="never_require")
@@ -55,9 +84,24 @@ async def evaluate_tail_swap(
             retriever_query(_retriever.query_graph(f"downstream flights from {swap_tail}")),
         )
         mel_items = [r for r in sql_rows if "mel" in str(r).lower()][:5]
-        return {
-            "mel_items": mel_items,
-            "downstream_impact": graph_rows[:10],
-            "citations": [c.__dict__ for c in sql_cits + graph_cits],
-        }
-    return {"original": original_tail, "swap": swap_tail, "flight": flight_id, "feasible": "unknown", "status": "mock"}
+        if sql_rows or graph_rows:
+            return {
+                "mel_items": mel_items,
+                "downstream_impact": graph_rows[:10],
+                "citations": [c.__dict__ for c in sql_cits + graph_cits],
+            }
+    # Fallback: provide MEL assessment guidance (keep feasible=unknown for safety)
+    return {
+        "original": original_tail,
+        "swap": swap_tail,
+        "flight": flight_id,
+        "feasible": "unknown",
+        "status": "no_data_fallback",
+        "no_data_guidance": (
+            f"No MEL or schedule data found for swap aircraft {swap_tail}. "
+            "Use the MEL category definitions and swap evaluation criteria below "
+            "to assess feasibility based on scenario context."
+        ),
+        "mel_assessment_guidance": FLEET_RECOVERY_GUIDANCE["mel_categories"],
+        "swap_evaluation_criteria": FLEET_RECOVERY_GUIDANCE["tail_swap_evaluation_criteria"],
+    }

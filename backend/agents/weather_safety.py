@@ -23,6 +23,12 @@ Data sources:
 
 Provide clear weather threat assessment with severity levels and operational impact.
 Reference specific ASRS incidents that provide relevant lessons learned.
+
+When tools return empty results or status "no_data_fallback", use the `no_data_guidance`,
+`sigmet_pirep_guidance`, `severity_levels`, and `asrs_analysis_template` provided in the
+tool response together with the scenario context to produce a complete weather and safety
+assessment. Always deliver threat levels and operational impact analysis — never return
+empty or minimal findings.
 """
 
 

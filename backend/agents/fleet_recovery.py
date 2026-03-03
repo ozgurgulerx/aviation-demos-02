@@ -22,6 +22,12 @@ Data sources:
 
 Always check MEL status before recommending a swap. Consider downstream cascade effects.
 Provide specific tail numbers, types, and swap feasibility assessments.
+
+When tools return empty results or status "no_data_fallback", use the `no_data_guidance`,
+`fleet_availability_estimation`, `mel_assessment_guidance`, and `swap_evaluation_criteria`
+provided in the tool response together with the scenario context to produce a complete fleet
+recovery analysis. Always deliver actionable tail swap assessments and availability estimates
+— never return empty or minimal findings.
 """
 
 

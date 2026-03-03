@@ -11,6 +11,9 @@ from agents.tools import (
     regulatory_tools,
     diversion_tools,
     fleet_tools,
+    network_tools,
+    weather_safety_tools,
+    passenger_tools,
 )
 
 # ---------- Retriever wiring ----------
@@ -82,4 +85,43 @@ async def test_mock_returns_include_status_mock(mod, func_name, kwargs, critical
     result = await func(**kwargs)
     assert result.get("status") in ("mock", "no_data_fallback"), (
         f"{mod.__name__}.{func_name} mock return missing status indicator, got: {result.get('status')!r}"
+    )
+
+
+# ---------- Fallback validation: no_data_fallback + non-empty guidance ----------
+
+FALLBACK_CASES = [
+    # fleet_tools
+    (fleet_tools, "find_available_tails", {"aircraft_type": "B737", "base_airport": "ORD"}),
+    (fleet_tools, "check_range_compatibility", {"tailnum": "N12345", "route": "ORD-LAX"}),
+    (fleet_tools, "evaluate_tail_swap", {"original_tail": "N111", "swap_tail": "N222", "flight_id": "AA100"}),
+    # network_tools
+    (network_tools, "simulate_delay_propagation", {"origin_airport": "ORD", "delay_minutes": 60}),
+    (network_tools, "query_historical_delays", {"airport": "ORD", "cause": "weather"}),
+    # weather_safety_tools
+    (weather_safety_tools, "check_sigmets_pireps", {"airports": ["ORD", "DFW"]}),
+    (weather_safety_tools, "query_notams", {"airports": ["ORD"]}),
+    (weather_safety_tools, "search_asrs_precedent", {"incident_description": "hub disruption due to weather"}),
+    # passenger_tools
+    (passenger_tools, "assess_connection_risks", {"flight_ids": ["AA100", "AA200"]}),
+    (passenger_tools, "estimate_rebooking_load", {"airport": "ORD", "cancelled_flights": 5}),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mod,func_name,kwargs",
+    FALLBACK_CASES,
+    ids=[f"{m.__name__}.{f}" for m, f, _ in FALLBACK_CASES],
+)
+async def test_fallback_returns_no_data_status(mod, func_name, kwargs):
+    """Fallback returns must have status='no_data_fallback' and non-empty no_data_guidance."""
+    func = getattr(mod, func_name)
+    result = await func(**kwargs)
+    assert result.get("status") == "no_data_fallback", (
+        f"{mod.__name__}.{func_name} expected status='no_data_fallback', got: {result.get('status')!r}"
+    )
+    guidance = result.get("no_data_guidance", "")
+    assert guidance and len(guidance) > 10, (
+        f"{mod.__name__}.{func_name} no_data_guidance is missing or too short: {guidance!r}"
     )
