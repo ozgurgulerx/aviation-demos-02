@@ -112,7 +112,12 @@ function HeaderBarInner() {
           )}
 
           <button
-            onClick={() => clearEvents()}
+            onClick={() => {
+              if (hasActiveRun) {
+                if (!window.confirm("A run is still active. Discard it and start fresh?")) return;
+              }
+              clearEvents();
+            }}
             className="rounded-lg border border-av-sky/35 bg-av-sky px-3 py-1 text-xs font-semibold text-av-navy transition hover:bg-av-sky/90"
           >
             New Problem

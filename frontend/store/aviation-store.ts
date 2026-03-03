@@ -8,6 +8,7 @@ import type {
   AgentNode,
   AgentEdge,
   AgentInfo,
+  ChatMessage,
   DataSourceActivity,
   RecoveryPlan,
   RecoveryOption,
@@ -94,6 +95,16 @@ function isMeaningfulEvent(kind: string): boolean {
 
 const MAX_STORED_EVENTS = 1500;
 
+// Counter-based unique ID generator to avoid Date.now() collisions
+let _idCounter = 0;
+function uniqueId(prefix: string): string {
+  _idCounter += 1;
+  return `${prefix}-${Date.now()}-${_idCounter}`;
+}
+
+// Event deduplication set
+const _seenEventIds = new Set<string>();
+
 // ═══════════════════════════════════════════════════════════════════
 // Store interface
 // ═══════════════════════════════════════════════════════════════════
@@ -129,6 +140,9 @@ interface AviationStore {
   recoveryPlan: RecoveryPlan | null;
   recoveryOptions: RecoveryOption[];
 
+  // NEW: Chat messages (persisted across sidebar collapse/expand)
+  chatMessages: ChatMessage[];
+
   // NEW: UI layout state
   sidebarCollapsed: boolean;
   bottomDrawerTab: "activity" | "timeline" | "plan" | "sources";
@@ -148,6 +162,10 @@ interface AviationStore {
   initializeAgents: (agentInfos: AgentInfo[], scenario: string) => void;
   setSelectedAgent: (agentId: string | null) => void;
   processAgentEvent: (event: WorkflowEvent) => void;
+
+  // NEW: Chat actions
+  addChatMessage: (message: ChatMessage) => void;
+  clearChatMessages: () => void;
 
   // NEW: UI actions
   setSidebarCollapsed: (collapsed: boolean) => void;
@@ -188,6 +206,14 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
   dataSources: createDefaultDataSources(),
   recoveryPlan: null,
   recoveryOptions: [],
+  chatMessages: [
+    {
+      id: "welcome",
+      role: "assistant",
+      content:
+        "Describe an airline operations issue. I will launch an agent-framework run, stream traces over SSE, and show which Azure/Fabric datastores each agent used.",
+    },
+  ],
   sidebarCollapsed: false,
   bottomDrawerTab: "timeline",
   bottomDrawerOpen: true,
@@ -207,25 +233,35 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
     if (!state.currentRun) return;
     const run = { ...state.currentRun };
 
+    // Produce new stage objects via .map() instead of mutating in place
+    const updateStage = (
+      stageId: string,
+      updater: (s: Stage) => Stage
+    ) => {
+      run.stages = run.stages.map((s) =>
+        s.stage_id === stageId ? updater({ ...s }) : s
+      );
+    };
+
     switch (event.kind) {
       case EventKinds.STAGE_STARTED:
         if (event.stage_id) {
           run.current_stage = event.stage_id;
-          const stage = run.stages.find((s) => s.stage_id === event.stage_id);
-          if (stage) {
-            stage.status = "running";
-            stage.started_at = event.ts;
-          }
+          updateStage(event.stage_id, (s) => ({
+            ...s,
+            status: "running",
+            started_at: event.ts,
+          }));
         }
         break;
       case EventKinds.STAGE_COMPLETED:
         if (event.stage_id) {
-          const stage = run.stages.find((s) => s.stage_id === event.stage_id);
-          if (stage) {
-            stage.status = "succeeded";
-            stage.completed_at = event.ts;
-            stage.duration_ms = event.duration_ms;
-          }
+          updateStage(event.stage_id, (s) => ({
+            ...s,
+            status: "succeeded",
+            completed_at: event.ts,
+            duration_ms: event.duration_ms,
+          }));
           run.stages_completed = run.stages.filter(
             (s) => s.status === "succeeded" || s.status === "skipped"
           ).length;
@@ -234,11 +270,11 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
         break;
       case EventKinds.STAGE_FAILED:
         if (event.stage_id) {
-          const stage = run.stages.find((s) => s.stage_id === event.stage_id);
-          if (stage) {
-            stage.status = "failed";
-            stage.error_message = event.message;
-          }
+          updateStage(event.stage_id, (s) => ({
+            ...s,
+            status: "failed",
+            error_message: event.message,
+          }));
         }
         break;
       case EventKinds.RUN_COMPLETED:
@@ -256,6 +292,19 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
   },
 
   addEvent: (event) => {
+    // Event deduplication — skip events already processed
+    const dedupKey = event.stream_id || event.event_id;
+    if (dedupKey && _seenEventIds.has(dedupKey)) return;
+    if (dedupKey) {
+      _seenEventIds.add(dedupKey);
+      // Trim dedup set when it grows too large
+      if (_seenEventIds.size > MAX_STORED_EVENTS * 2) {
+        const entries = Array.from(_seenEventIds);
+        const toRemove = entries.slice(0, entries.length - MAX_STORED_EVENTS);
+        for (const key of toRemove) _seenEventIds.delete(key);
+      }
+    }
+
     const effectiveTs = event.ts || new Date().toISOString();
     set((state) => {
       const recentEvents = [...state.events, event].slice(-MAX_STORED_EVENTS);
@@ -297,7 +346,8 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
     get().processAgentEvent(event);
   },
 
-  clearEvents: () =>
+  clearEvents: () => {
+    _seenEventIds.clear();
     set({
       events: [],
       currentRunId: null,
@@ -318,7 +368,16 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
       dataSources: createDefaultDataSources(),
       recoveryPlan: null,
       recoveryOptions: [],
-    }),
+      chatMessages: [
+        {
+          id: "welcome",
+          role: "assistant",
+          content:
+            "Describe an airline operations issue. I will launch an agent-framework run, stream traces over SSE, and show which Azure/Fabric datastores each agent used.",
+        },
+      ],
+    });
+  },
 
   setConnected: (connected) =>
     set((state) => ({
@@ -721,7 +780,7 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
                 evidence: [
                   ...agent.evidence,
                   {
-                    id: `ev-${Date.now()}`,
+                    id: uniqueId("ev"),
                     sourceType,
                     summary: evidenceSummary,
                     resultCount,
@@ -762,7 +821,7 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
                 toolCalls: [
                   ...state.agents[agentId].toolCalls,
                   {
-                    id: payloadString(payload, "toolId", `tool-${Date.now()}`),
+                    id: payloadString(payload, "toolId", uniqueId("tool")),
                     toolName,
                     dataSource: payloadString(payload, "sourceType", payloadString(payload, "dataSource", "unknown")),
                     status: "running",
@@ -834,7 +893,7 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
                 evidence: [
                   ...state.agents[agentId].evidence,
                   {
-                    id: `ev-${Date.now()}`,
+                    id: uniqueId("ev"),
                     sourceType: payloadString(payload, "sourceType", "unknown"),
                     summary: payloadString(payload, "summary", event.message),
                     resultCount: payloadNumber(payload, "resultCount"),
@@ -996,7 +1055,7 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
             agentEdges: [
               ...state.agentEdges,
               {
-                id: `edge-${fromAgent}-${toAgent}-${Date.now()}`,
+                id: uniqueId(`edge-${fromAgent}-${toAgent}`),
                 source: fromAgent,
                 target: toAgent,
                 reason: payloadString(payload, "reason"),
@@ -1174,6 +1233,21 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
       }
     }
   },
+
+  // ── Chat actions ───────────────────────────────────────────
+  addChatMessage: (message) =>
+    set((state) => ({ chatMessages: [...state.chatMessages, message] })),
+  clearChatMessages: () =>
+    set({
+      chatMessages: [
+        {
+          id: "welcome",
+          role: "assistant",
+          content:
+            "Describe an airline operations issue. I will launch an agent-framework run, stream traces over SSE, and show which Azure/Fabric datastores each agent used.",
+        },
+      ],
+    }),
 
   // ── UI actions ──────────────────────────────────────────────
   setSidebarCollapsed: (collapsed) => set({ sidebarCollapsed: collapsed }),

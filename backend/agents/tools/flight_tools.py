@@ -1,7 +1,6 @@
 """
 Flight data tools for the Flight Analyst Agent.
 Uses @ai_function decorator from Microsoft Agent Framework.
-Stub implementations returning mock data.
 """
 
 import random
@@ -12,6 +11,12 @@ from pydantic import Field
 import structlog
 
 logger = structlog.get_logger()
+_retriever = None
+
+
+def set_retriever(r):
+    global _retriever
+    _retriever = r
 
 
 @ai_function(approval_mode="never_require")
@@ -30,6 +35,11 @@ async def analyze_flight_data(
     Returns analysis results including delay patterns, on-time performance,
     and disruption statistics for the specified flights.
     """
+    if _retriever:
+        query = f"flight data for {', '.join(flight_ids[:10])} analysis type {analysis_type}"
+        rows, cits = await _retriever.query_sql(query)
+        return {"flights": rows[:20], "analysis_type": analysis_type, "total_analyzed": len(rows), "citations": [c.__dict__ for c in cits]}
+
     results = {}
     for flight_id in flight_ids:
         delay_minutes = random.randint(0, 120)
@@ -65,6 +75,18 @@ async def check_weather_impact(
     Returns weather conditions and their impact on flight operations
     including visibility, wind, precipitation, and operational rating.
     """
+    if _retriever:
+        query = f"weather impact at {', '.join(airports)} next {timeframe_hours} hours"
+        results = await _retriever.query_multiple(query, ["KQL", "NOSQL"])
+        kql_rows, kql_cits = results.get("KQL", ([], []))
+        nosql_rows, nosql_cits = results.get("NOSQL", ([], []))
+        return {
+            "weather_hazards": kql_rows[:15],
+            "notams": nosql_rows[:10],
+            "timeframe_hours": timeframe_hours,
+            "citations": [c.__dict__ for c in kql_cits + nosql_cits],
+        }
+
     weather = {}
     for airport in airports:
         severity = random.choice(["none", "minor", "moderate", "severe"])
@@ -96,6 +118,17 @@ async def query_route_status(
     Returns operational status for each route including capacity,
     demand levels, and any active restrictions or NOTAMs.
     """
+    if _retriever:
+        query = f"route status for {', '.join(routes[:10])}"
+        results = await _retriever.query_multiple(query, ["SQL", "GRAPH"])
+        sql_rows, sql_cits = results.get("SQL", ([], []))
+        graph_rows, graph_cits = results.get("GRAPH", ([], []))
+        return {
+            "routes": sql_rows[:15],
+            "connectivity": graph_rows[:10],
+            "citations": [c.__dict__ for c in sql_cits + graph_cits],
+        }
+
     statuses = {}
     for route in routes:
         parts = route.split("-")

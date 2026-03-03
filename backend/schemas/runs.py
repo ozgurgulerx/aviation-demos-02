@@ -3,7 +3,7 @@ Run and stage metadata schemas for workflow state management.
 Stored in PostgreSQL for durability.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field
@@ -48,7 +48,7 @@ class RunMetadata(BaseModel):
     status: RunStatus = Field(default=RunStatus.PENDING)
 
     # Timing
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     duration_ms: Optional[int] = None
@@ -95,10 +95,16 @@ DEFAULT_STAGES = [
 ]
 
 
-def create_new_run(problem_description: str = "", config: Dict[str, Any] = None) -> RunMetadata:
-    """Factory function to create a new run with default stages."""
+def create_new_run(
+    problem_description: str = "",
+    config: Dict[str, Any] = None,
+    stages: Optional[List[StageMetadata]] = None,
+) -> RunMetadata:
+    """Factory function to create a new run with given or default stages."""
+    run_stages = stages if stages is not None else [s.model_copy(deep=True) for s in DEFAULT_STAGES]
     return RunMetadata(
         problem_description=problem_description,
         config=config or {},
-        stages=[stage.model_copy(deep=True) for stage in DEFAULT_STAGES],
+        stages=run_stages,
+        total_stages=len(run_stages),
     )

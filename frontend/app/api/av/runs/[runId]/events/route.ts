@@ -1,5 +1,8 @@
 import { NextRequest } from "next/server";
 
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
  * SSE Proxy endpoint - forwards events from backend to frontend
  *
@@ -11,13 +14,23 @@ export async function GET(
   { params }: { params: Promise<{ runId: string }> }
 ) {
   const { runId } = await params;
-  const backendUrl = process.env.BACKEND_URL || "http://localhost:5001";
+
+  // Validate runId is a UUID to prevent path traversal
+  if (!UUID_RE.test(runId)) {
+    return new Response(
+      JSON.stringify({ error: "Invalid run ID format" }),
+      { status: 400, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  const backendUrl = process.env.BACKEND_URL || "http://localhost:5002";
   const query = request.nextUrl.search || "";
   const sseUrl = `${backendUrl}/api/av/runs/${runId}/events${query}`;
 
-  console.log(`[SSE Proxy] Connecting to backend: ${sseUrl}`);
+  console.log(`[SSE Proxy] Connecting to backend for run ${runId}`);
 
   try {
+    // Use request.signal to detect client disconnect and abort the backend fetch
     const backendResponse = await fetch(sseUrl, {
       headers: {
         Accept: "text/event-stream",
@@ -27,6 +40,7 @@ export async function GET(
           : {}),
       },
       cache: "no-store",
+      signal: request.signal,
     });
 
     if (!backendResponse.ok) {
@@ -51,13 +65,20 @@ export async function GET(
     const reader = backendResponse.body.getReader();
     const decoder = new TextDecoder();
 
+    // Abort backend stream when client disconnects
+    const onAbort = () => {
+      reader.cancel().catch(() => {});
+      writer.close().catch(() => {});
+    };
+    request.signal.addEventListener("abort", onAbort);
+
     // Forward events from backend to client
     (async () => {
       try {
         while (true) {
           const { done, value } = await reader.read();
           if (done) {
-            console.log("[SSE Proxy] Backend stream ended");
+            console.log(`[SSE Proxy] Backend stream ended for run ${runId}`);
             break;
           }
 
@@ -65,8 +86,13 @@ export async function GET(
           await writer.write(new TextEncoder().encode(chunk));
         }
       } catch (error) {
-        console.error("[SSE Proxy] Stream error:", error);
+        if (request.signal.aborted) {
+          console.log(`[SSE Proxy] Client disconnected for run ${runId}`);
+        } else {
+          console.error("[SSE Proxy] Stream error:", error);
+        }
       } finally {
+        request.signal.removeEventListener("abort", onAbort);
         try {
           await writer.close();
         } catch {
@@ -84,13 +110,16 @@ export async function GET(
       },
     });
   } catch (error) {
+    if (request.signal.aborted) {
+      return new Response(null, { status: 499 });
+    }
+
     console.error("[SSE Proxy] Connection error:", error);
 
     return new Response(
       JSON.stringify({
         error: "Backend connection failed",
         message: error instanceof Error ? error.message : "Unknown error",
-        backendUrl: sseUrl,
       }),
       {
         status: 503,

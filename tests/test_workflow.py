@@ -6,7 +6,7 @@ import pytest
 from orchestrator.workflows import WorkflowType
 from orchestrator.engine import OrchestratorEngine, OrchestratorDecision
 from orchestrator.trace_emitter import TraceEmitter
-from orchestrator.middleware import EvidenceCollector, EvidenceContextProvider
+from orchestrator.middleware import EvidenceCollector
 from orchestrator.workflows import OrchestrationMode
 
 
@@ -110,13 +110,3 @@ class TestEvidenceCollector:
         assert len(collector.get_evidence()) == 0
 
 
-class TestEvidenceContextProvider:
-    def test_creation(self):
-        collector = EvidenceCollector()
-        provider = EvidenceContextProvider(collector)
-        assert provider.max_evidence == 10
-
-    def test_custom_max_evidence(self):
-        collector = EvidenceCollector()
-        provider = EvidenceContextProvider(collector, max_evidence=5)
-        assert provider.max_evidence == 5

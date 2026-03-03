@@ -1,7 +1,7 @@
 "use client";
 
 import { useRef, useEffect, memo, useMemo, useState } from "react";
-import { motion, AnimatePresence } from "framer-motion";
+import { motion } from "framer-motion";
 import { ChevronRight, Database, Blend } from "lucide-react";
 import { useAviationStore } from "@/store/aviation-store";
 import type { WorkflowEvent } from "@/types/aviation";
@@ -276,13 +276,22 @@ function AgentActivityFeedInner() {
     );
   }
 
+  // Limit visible DOM rows for performance while keeping simple rendering
+  const MAX_VISIBLE_ROWS = 100;
+  const visibleEvents = interestingEvents.length > MAX_VISIBLE_ROWS
+    ? interestingEvents.slice(-MAX_VISIBLE_ROWS)
+    : interestingEvents;
+
   return (
     <div ref={scrollRef} className="av-scroll h-full space-y-2 overflow-y-auto p-3">
-      <AnimatePresence>
-        {interestingEvents.map((event) => (
-          <ActivityRow key={event.event_id} event={event} agents={agents} />
-        ))}
-      </AnimatePresence>
+      {interestingEvents.length > MAX_VISIBLE_ROWS && (
+        <div className="text-center text-[10px] text-muted-foreground py-1">
+          Showing latest {MAX_VISIBLE_ROWS} of {interestingEvents.length} traces
+        </div>
+      )}
+      {visibleEvents.map((event) => (
+        <ActivityRow key={event.event_id} event={event} agents={agents} />
+      ))}
     </div>
   );
 }

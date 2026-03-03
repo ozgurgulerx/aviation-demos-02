@@ -11,7 +11,7 @@ import asyncio
 import json
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List
 import structlog
 import asyncpg
@@ -45,20 +45,26 @@ class RunStore:
     @classmethod
     async def create(cls) -> "RunStore":
         """Factory method to create RunStore with connection pool."""
-        import ssl as _ssl
-        ssl_ctx = _ssl.create_default_context()
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = _ssl.CERT_NONE
+        # Use SSL only for remote hosts (Azure requires it; localhost does not)
+        ssl_param: object = False
+        if PGHOST not in ("localhost", "127.0.0.1", ""):
+            import ssl as _ssl
+            ca_cert = os.getenv("PG_SSL_CA_CERT", "")
+            if ca_cert:
+                ssl_ctx = _ssl.create_default_context(cafile=ca_cert)
+            else:
+                ssl_ctx = _ssl.create_default_context()
+            ssl_param = ssl_ctx
 
         pool = await asyncpg.create_pool(
             host=PGHOST,
             port=PGPORT,
             database=PGDATABASE,
             user=PGUSER,
-            password=PGPASSWORD,
+            password=PGPASSWORD or None,
             min_size=2,
             max_size=10,
-            ssl=ssl_ctx,
+            ssl=ssl_param,
         )
 
         store = cls(pool)
@@ -113,9 +119,10 @@ class RunStore:
         self,
         problem_description: str = "",
         config: dict = None,
+        stages: Optional[List["StageMetadata"]] = None,
     ) -> RunMetadata:
-        """Create a new run with default stages."""
-        run = create_new_run(problem_description, config)
+        """Create a new run with given or default stages."""
+        run = create_new_run(problem_description, config, stages=stages)
 
         async with self.pool.acquire() as conn:
             async with conn.transaction():
@@ -191,7 +198,7 @@ class RunStore:
     ):
         """Update run status."""
         async with self.pool.acquire() as conn:
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             updates = {"status": status.value}
 
             if status == RunStatus.RUNNING:
@@ -221,7 +228,7 @@ class RunStore:
     ):
         """Update stage status and metadata."""
         async with self.pool.acquire() as conn:
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
 
             if status == StageStatus.RUNNING:
                 await conn.execute(f"""
@@ -258,14 +265,14 @@ class RunStore:
         limit: int = 50,
         offset: int = 0,
     ) -> List[RunMetadata]:
-        """List runs with optional filters."""
+        """List runs with optional filters using a single CTE + LEFT JOIN query."""
         async with self.pool.acquire() as conn:
             conditions = []
-            params = []
+            params: list = []
             param_idx = 1
 
             if status:
-                conditions.append(f"status = ${param_idx}")
+                conditions.append(f"r.status = ${param_idx}")
                 params.append(status.value)
                 param_idx += 1
 
@@ -273,19 +280,62 @@ class RunStore:
 
             params.extend([limit, offset])
             rows = await conn.fetch(f"""
-                SELECT run_id FROM {PG_SCHEMA}.runs
-                {where_clause}
-                ORDER BY created_at DESC
-                LIMIT ${param_idx} OFFSET ${param_idx + 1}
+                WITH paginated_runs AS (
+                    SELECT * FROM {PG_SCHEMA}.runs r
+                    {where_clause}
+                    ORDER BY r.created_at DESC
+                    LIMIT ${param_idx} OFFSET ${param_idx + 1}
+                )
+                SELECT
+                    pr.*,
+                    s.stage_id AS s_stage_id,
+                    s.stage_name AS s_stage_name,
+                    s.stage_order AS s_stage_order,
+                    s.status AS s_status,
+                    s.started_at AS s_started_at,
+                    s.completed_at AS s_completed_at,
+                    s.duration_ms AS s_duration_ms,
+                    s.progress_pct AS s_progress_pct,
+                    s.error_message AS s_error_message
+                FROM paginated_runs pr
+                LEFT JOIN {PG_SCHEMA}.stages s ON s.run_id = pr.run_id
+                ORDER BY pr.created_at DESC, s.stage_order
             """, *params)
 
-            runs = []
+            runs_map: dict[str, RunMetadata] = {}
             for row in rows:
-                run = await self.get_run(row["run_id"])
-                if run:
-                    runs.append(run)
+                rid = row["run_id"]
+                if rid not in runs_map:
+                    runs_map[rid] = RunMetadata(
+                        run_id=rid,
+                        status=RunStatus(row["status"]),
+                        problem_description=row["problem_description"] or "",
+                        config=json.loads(row["config"]) if row["config"] else {},
+                        created_at=row["created_at"],
+                        started_at=row["started_at"],
+                        completed_at=row["completed_at"],
+                        duration_ms=row["duration_ms"],
+                        current_stage=row["current_stage"],
+                        stages_completed=row["stages_completed"] or 0,
+                        progress_pct=row["progress_pct"] or 0,
+                        error_message=row["error_message"],
+                        error_stage=row["error_stage"],
+                        event_count=row["event_count"] or 0,
+                    )
+                if row["s_stage_id"]:
+                    runs_map[rid].stages.append(StageMetadata(
+                        stage_id=row["s_stage_id"],
+                        stage_name=row["s_stage_name"],
+                        stage_order=row["s_stage_order"],
+                        status=StageStatus(row["s_status"]),
+                        started_at=row["s_started_at"],
+                        completed_at=row["s_completed_at"],
+                        duration_ms=row["s_duration_ms"],
+                        progress_pct=row["s_progress_pct"] or 0,
+                        error_message=row["s_error_message"],
+                    ))
 
-            return runs
+            return list(runs_map.values())
 
     async def close(self):
         """Close connection pool."""

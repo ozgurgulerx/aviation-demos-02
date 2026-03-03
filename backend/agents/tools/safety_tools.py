@@ -1,7 +1,6 @@
 """
 Safety tools for the Safety Inspector Agent.
 Uses @ai_function decorator from Microsoft Agent Framework.
-Stub implementations returning mock data.
 """
 
 import random
@@ -12,6 +11,12 @@ from pydantic import Field
 import structlog
 
 logger = structlog.get_logger()
+_retriever = None
+
+
+def set_retriever(r):
+    global _retriever
+    _retriever = r
 
 
 @ai_function(approval_mode="never_require")
@@ -30,6 +35,16 @@ async def check_compliance(
     Returns compliance assessment for each regulatory framework including
     pass/fail status, specific violations, and remediation recommendations.
     """
+    if _retriever:
+        query = f"regulatory compliance check: {solution_description} against {', '.join(regulations)}"
+        reg_rows, reg_cits = await _retriever.query_semantic(query, source="VECTOR_REG")
+        return {
+            "solution": solution_description[:100],
+            "regulatory_findings": reg_rows[:10],
+            "regulations_checked": regulations,
+            "citations": [c.__dict__ for c in reg_cits],
+        }
+
     results = {}
     all_compliant = True
 
@@ -91,6 +106,22 @@ async def assess_risk_factors(
     Returns risk assessment across multiple categories with likelihood,
     impact severity, and overall risk scores.
     """
+    if _retriever:
+        results = await _retriever.query_multiple(
+            scenario_description,
+            ["VECTOR_OPS", "VECTOR_REG", "KQL"],
+        )
+        ops_rows, ops_cits = results.get("VECTOR_OPS", ([], []))
+        reg_rows, reg_cits = results.get("VECTOR_REG", ([], []))
+        kql_rows, kql_cits = results.get("KQL", ([], []))
+        return {
+            "scenario": scenario_description[:100],
+            "similar_incidents": ops_rows[:5],
+            "regulatory_guidance": reg_rows[:5],
+            "current_hazards": kql_rows[:10],
+            "citations": [c.__dict__ for c in ops_cits + reg_cits + kql_cits],
+        }
+
     risks = {}
     for category in risk_categories:
         likelihood = round(random.uniform(0.05, 0.8), 2)
@@ -147,6 +178,21 @@ async def validate_solution(
     Returns a comprehensive validation result with pass/fail for each criterion,
     overall recommendation, and any conditions for approval.
     """
+    if _retriever:
+        results = await _retriever.query_multiple(
+            solution_description,
+            ["VECTOR_REG", "VECTOR_OPS"],
+        )
+        reg_rows, reg_cits = results.get("VECTOR_REG", ([], []))
+        ops_rows, ops_cits = results.get("VECTOR_OPS", ([], []))
+        return {
+            "solution": solution_description[:100],
+            "validation_criteria": validation_criteria,
+            "regulatory_validation": reg_rows[:5],
+            "operational_precedents": ops_rows[:5],
+            "citations": [c.__dict__ for c in reg_cits + ops_cits],
+        }
+
     validations = {}
     all_passed = True
 

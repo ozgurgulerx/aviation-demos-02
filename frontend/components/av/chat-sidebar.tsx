@@ -10,15 +10,13 @@ import { ScenarioCards } from "./scenario-cards";
 import type { ChatMessage, AgentInfo } from "@/types/aviation";
 import { chatMessage } from "@/lib/animation-variants";
 
+let _chatIdCounter = 0;
+function chatUniqueId(): string {
+  _chatIdCounter += 1;
+  return `chat-${Date.now()}-${_chatIdCounter}`;
+}
+
 export function ChatSidebar() {
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    {
-      id: "welcome",
-      role: "assistant",
-      content:
-        "Describe an airline operations issue. I will launch an agent-framework run, stream traces over SSE, and show which Azure/Fabric datastores each agent used.",
-    },
-  ]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -30,6 +28,8 @@ export function ChatSidebar() {
     sidebarCollapsed,
     setSidebarCollapsed,
     events,
+    chatMessages: messages,
+    addChatMessage,
   } = useAviationStore();
 
   const { reconnecting } = useSSE({ runId: currentRunId || "", enabled: !!currentRunId });
@@ -42,13 +42,7 @@ export function ChatSidebar() {
     const messageText = (text || input).trim();
     if (!messageText || isLoading) return;
 
-    const userMessage: ChatMessage = {
-      id: Date.now().toString(),
-      role: "user",
-      content: messageText,
-    };
-
-    setMessages((prev) => [...prev, userMessage]);
+    addChatMessage({ id: chatUniqueId(), role: "user", content: messageText });
     setInput("");
     setIsLoading(true);
 
@@ -61,28 +55,21 @@ export function ChatSidebar() {
 
       const data = await response.json();
       if (response.ok) {
-        const assistantMessage: ChatMessage = {
-          id: (Date.now() + 1).toString(),
+        addChatMessage({
+          id: chatUniqueId(),
           role: "assistant",
           content: data.response || data.message || "Processing...",
-        };
-        setMessages((prev) => [...prev, assistantMessage]);
+        });
 
         if (data.run_id) setCurrentRunId(data.run_id);
         if (data.agents && data.scenario) {
           initializeAgents(data.agents as AgentInfo[], data.scenario as string);
         }
       } else {
-        setMessages((prev) => [
-          ...prev,
-          { id: (Date.now() + 1).toString(), role: "assistant", content: "Error processing your request." },
-        ]);
+        addChatMessage({ id: chatUniqueId(), role: "assistant", content: "Error processing your request." });
       }
     } catch {
-      setMessages((prev) => [
-        ...prev,
-        { id: (Date.now() + 1).toString(), role: "assistant", content: "Connection error. Check backend availability." },
-      ]);
+      addChatMessage({ id: chatUniqueId(), role: "assistant", content: "Connection error. Check backend availability." });
     } finally {
       setIsLoading(false);
     }

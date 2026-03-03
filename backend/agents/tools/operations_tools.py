@@ -1,7 +1,6 @@
 """
 Operations tools for the Operations Advisor Agent.
 Uses @ai_function decorator from Microsoft Agent Framework.
-Stub implementations returning mock data.
 """
 
 import random
@@ -12,6 +11,12 @@ from pydantic import Field
 import structlog
 
 logger = structlog.get_logger()
+_retriever = None
+
+
+def set_retriever(r):
+    global _retriever
+    _retriever = r
 
 
 @ai_function(approval_mode="never_require")
@@ -30,6 +35,22 @@ async def evaluate_alternatives(
     Returns a ranked list of alternative solutions with cost estimates,
     time requirements, and feasibility scores.
     """
+    if _retriever:
+        results = await _retriever.query_multiple(
+            problem_description,
+            ["SQL", "FABRIC_SQL", "VECTOR_OPS"],
+        )
+        sql_rows, sql_cits = results.get("SQL", ([], []))
+        fabric_rows, fabric_cits = results.get("FABRIC_SQL", ([], []))
+        vector_rows, vector_cits = results.get("VECTOR_OPS", ([], []))
+        return {
+            "problem": problem_description[:100],
+            "operational_data": sql_rows[:10],
+            "historical_delays": fabric_rows[:10],
+            "similar_precedents": vector_rows[:5],
+            "citations": [c.__dict__ for c in sql_cits + fabric_cits + vector_cits],
+        }
+
     alternatives = []
     for i in range(num_alternatives):
         alt_id = chr(65 + i)  # A, B, C...
@@ -70,6 +91,15 @@ async def optimize_resources(
     Returns optimized resource assignments including crew scheduling,
     aircraft rotations, and gate allocations.
     """
+    if _retriever:
+        query = f"resource availability {resource_type} next {constraint_window_hours} hours"
+        rows, cits = await _retriever.query_sql(query)
+        return {
+            "optimization": rows[:20],
+            "constraint_window_hours": constraint_window_hours,
+            "citations": [c.__dict__ for c in cits],
+        }
+
     resources = {
         "crew": {
             "available_pilots": random.randint(10, 50),
@@ -118,6 +148,19 @@ async def calculate_impact(
     Returns impact assessment including passenger disruption,
     cost implications, schedule effects, and recovery time.
     """
+    if _retriever:
+        query = f"impact assessment for: {change_description} affecting {affected_flights} flights"
+        results = await _retriever.query_multiple(query, ["SQL", "FABRIC_SQL"])
+        sql_rows, sql_cits = results.get("SQL", ([], []))
+        fabric_rows, fabric_cits = results.get("FABRIC_SQL", ([], []))
+        return {
+            "change": change_description[:100],
+            "affected_flights": affected_flights,
+            "operational_impact": sql_rows[:10],
+            "historical_impact": fabric_rows[:10],
+            "citations": [c.__dict__ for c in sql_cits + fabric_cits],
+        }
+
     impact = {
         "change": change_description[:100],
         "affected_flights": affected_flights,

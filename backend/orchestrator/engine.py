@@ -12,6 +12,7 @@ import json
 import os
 import re
 import uuid
+from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
@@ -932,15 +933,12 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         self._coordinator_artifacts_emitted = True
 
     def _estimate_result_count(self, agent_id: str, source_type: str, response_text: str, index: int) -> int:
-        base = max(len(response_text) // 55, 8)
-        modifier = (len(agent_id) * 3 + len(source_type) * 7 + index * 11) % 34
-        return min(base + modifier, 220)
+        """Return 0 — actual result counts come from tool responses, not string heuristics."""
+        return 0
 
     def _estimate_confidence(self, source_count: int, message_count: int, response_text: str) -> float:
-        confidence = 0.62 + (0.04 * min(source_count, 4)) + (0.015 * min(message_count, 5))
-        if len(response_text) > 500:
-            confidence += 0.05
-        return min(round(confidence, 2), 0.96)
+        """Return 1.0 if real data sources responded, 0.0 otherwise."""
+        return 1.0 if source_count > 0 else 0.0
 
     async def _emit_query_starts(self, agent_id: str, objective: str):
         if not self.trace_emitter:
@@ -1247,34 +1245,30 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
 
         now = now or datetime.now(timezone.utc)
         for agent_id in list(self._active_agent_ids):
-            if agent_id in self._completed_agent_ids:
-                self._active_agent_ids.discard(agent_id)
-                continue
             execution_count = self._agent_execution_counts.get(agent_id, 0)
             guard_key = f"{agent_id}:{execution_count}"
             if guard_key in self._agent_stream_guarded_invocation_keys:
                 self._active_agent_ids.discard(agent_id)
                 continue
 
-            update_count = self._agent_stream_update_counts.get(agent_id, 0)
-            if update_count >= self._deterministic_stream_update_limit:
-                logger.warning(
-                    "agent_stream_update_limit_reached",
-                    run_id=self.run_id,
-                    agent_id=agent_id,
-                    updates=update_count,
-                    limit=self._deterministic_stream_update_limit,
-                )
-                await self._emit_synthetic_completion_if_stalled(
-                    agent_id=agent_id,
-                    reason="deterministic_stream_update_limit",
-                )
-                continue
-
             last_update_at = self._agent_stream_last_update_at.get(agent_id)
             if not last_update_at:
                 continue
-            if (now - last_update_at).total_seconds() >= self._deterministic_stream_timeout_seconds:
+            inactivity_seconds = (now - last_update_at).total_seconds()
+            if inactivity_seconds >= self._deterministic_stream_timeout_seconds:
+                update_count = self._agent_stream_update_counts.get(agent_id, 0)
+                if update_count >= self._deterministic_stream_update_limit:
+                    logger.warning(
+                        "agent_stream_update_limit_reached",
+                        run_id=self.run_id,
+                        agent_id=agent_id,
+                        updates=update_count,
+                        limit=self._deterministic_stream_update_limit,
+                    )
+                    reason = "deterministic_stream_update_limit"
+                else:
+                    reason = "deterministic_stream_timeout"
+
                 logger.warning(
                     "agent_stream_update_timeout",
                     run_id=self.run_id,
@@ -1283,7 +1277,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                 )
                 await self._emit_synthetic_completion_if_stalled(
                     agent_id=agent_id,
-                    reason="deterministic_stream_timeout",
+                    reason=reason,
                 )
 
     def _rebuild_workflow(self, input_message: str) -> None:
@@ -1325,6 +1319,8 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                         )
                         if not done:
                             next_event_task.cancel()
+                            with suppress(asyncio.CancelledError):
+                                await next_event_task
                             raise asyncio.TimeoutError()
                         event = next_event_task.result()
                     else:
@@ -1502,7 +1498,8 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             now = datetime.now(timezone.utc)
             self._agent_started_at[executor_id] = now
             if self._is_deterministic_mode():
-                self._agent_stream_last_update_at.setdefault(executor_id, now)
+                self._agent_stream_update_counts[executor_id] = 0
+                self._agent_stream_last_update_at[executor_id] = now
             self._active_agent_ids.add(executor_id)
             self._agent_progress_pct[executor_id] = max(self._agent_progress_pct.get(executor_id, 0.0), 5.0)
 
@@ -1697,20 +1694,6 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                 update_count = self._agent_stream_update_counts.get(executor_id, 0) + 1
                 self._agent_stream_update_counts[executor_id] = update_count
                 self._agent_stream_last_update_at[executor_id] = now
-
-                if update_count >= self._deterministic_stream_update_limit:
-                    logger.warning(
-                        "agent_stream_update_guard_triggered",
-                        run_id=self.run_id,
-                        agent_id=executor_id,
-                        updates=update_count,
-                        limit=self._deterministic_stream_update_limit,
-                    )
-                    await self._emit_synthetic_completion_if_stalled(
-                        agent_id=executor_id,
-                        reason="deterministic_stream_update_limit",
-                    )
-                    return
 
             await self.emit_event(
                 "agent.streaming",

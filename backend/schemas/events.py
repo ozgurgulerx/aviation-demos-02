@@ -3,10 +3,10 @@ Workflow event schemas for SSE streaming.
 Events are published to Redis Streams and consumed by the SSE endpoint.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional, Dict, Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 import uuid
 
 
@@ -91,7 +91,7 @@ class WorkflowEvent(BaseModel):
     run_id: str = Field(description="Workflow run identifier")
     stream_id: Optional[str] = Field(default=None, description="Redis stream message id for resume")
 
-    ts: datetime = Field(default_factory=datetime.utcnow, description="Event timestamp")
+    ts: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="Event timestamp")
     sequence: int = Field(default=0, description="Event sequence number within run")
 
     level: EventLevel = Field(default=EventLevel.INFO)
@@ -115,10 +115,9 @@ class WorkflowEvent(BaseModel):
     progress_pct: Optional[float] = Field(default=None, ge=0, le=100)
     duration_ms: Optional[int] = Field(default=None)
 
-    class Config:
-        json_encoders = {
-            datetime: lambda v: v.isoformat()
-        }
+    model_config = ConfigDict(
+        json_encoders={datetime: lambda v: v.isoformat()},
+    )
 
     def to_sse_data(self) -> str:
         return self.model_dump_json()

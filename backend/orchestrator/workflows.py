@@ -104,8 +104,8 @@ def create_coordinator_workflow(
     coordinator = _create_agent_by_id(resolved_coordinator_id)
     if not coordinator:
         # Fallback
-        from agents import create_flight_analyst
-        coordinator = create_flight_analyst(name="coordinator_fallback")
+        from agents import create_decision_coordinator
+        coordinator = create_decision_coordinator(name="coordinator_fallback")
 
     # Build specialist agents
     specialists: List[ChatAgent] = []
@@ -261,8 +261,8 @@ def create_deterministic_coordinator_workflow(
 
     coordinator = _create_agent_by_id(resolved_coordinator_id)
     if not coordinator:
-        from agents import create_flight_analyst
-        coordinator = create_flight_analyst(name="coordinator_fallback")
+        from agents import create_decision_coordinator
+        coordinator = create_decision_coordinator(name="coordinator_fallback")
 
     specialists: List[ChatAgent] = []
     for agent_id in active_agent_ids:

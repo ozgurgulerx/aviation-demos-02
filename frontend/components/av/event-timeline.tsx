@@ -1,6 +1,6 @@
 "use client";
 
-import { memo, useMemo, useRef, useEffect, useState } from "react";
+import { memo, useRef, useEffect, useState } from "react";
 import { motion } from "framer-motion";
 import {
   CheckCircle2,
@@ -172,24 +172,9 @@ function EventTimelineInner() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [filter, setFilter] = useState<TimelineFilter>("all");
 
-  const filtered = useMemo(
-    () =>
-      events.filter((event) => event.kind !== EventKinds.HEARTBEAT).filter((event) => shouldInclude(event, filter)),
-    [events, filter]
-  );
-
-  const grouped = useMemo(() => {
-    const lanes: Record<string, WorkflowEvent[]> = {};
-    for (const event of filtered) {
-      const lane = laneForEvent(event);
-      lanes[lane] = lanes[lane] ? [...lanes[lane], event] : [event];
-    }
-    return Object.entries(lanes).sort((a, b) => {
-      const aTs = Date.parse(a[1][a[1].length - 1]?.ts || "");
-      const bTs = Date.parse(b[1][b[1].length - 1]?.ts || "");
-      return bTs - aTs;
-    });
-  }, [filtered]);
+  const filtered = events
+    .filter((event) => event.kind !== EventKinds.HEARTBEAT)
+    .filter((event) => shouldInclude(event, filter));
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
@@ -202,6 +187,25 @@ function EventTimelineInner() {
       </div>
     );
   }
+
+  // Limit visible DOM rows for performance
+  const MAX_VISIBLE_ROWS = 100;
+  const visibleFiltered = filtered.length > MAX_VISIBLE_ROWS
+    ? filtered.slice(-MAX_VISIBLE_ROWS)
+    : filtered;
+
+  const grouped = (() => {
+    const lanes: Record<string, WorkflowEvent[]> = {};
+    for (const event of visibleFiltered) {
+      const lane = laneForEvent(event);
+      lanes[lane] = lanes[lane] ? [...lanes[lane], event] : [event];
+    }
+    return Object.entries(lanes).sort((a, b) => {
+      const aTs = Date.parse(a[1][a[1].length - 1]?.ts || "");
+      const bTs = Date.parse(b[1][b[1].length - 1]?.ts || "");
+      return bTs - aTs;
+    });
+  })();
 
   return (
     <div className="h-full min-h-0">
@@ -223,6 +227,11 @@ function EventTimelineInner() {
         ))}
       </div>
       <div ref={scrollRef} className="av-scroll h-[calc(100%-34px)] space-y-2 overflow-y-auto px-3 py-2">
+        {filtered.length > MAX_VISIBLE_ROWS && (
+          <div className="text-center text-[10px] text-muted-foreground py-1">
+            Showing latest {MAX_VISIBLE_ROWS} of {filtered.length} events
+          </div>
+        )}
         {grouped.map(([lane, laneEvents]) => (
           <section key={lane} className="space-y-1">
             <div className="sticky top-0 z-[1] rounded-md border border-av-sky/20 bg-av-midnight/80 px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">

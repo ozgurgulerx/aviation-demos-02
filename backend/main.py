@@ -6,9 +6,10 @@ Main entry point for the backend API.
 import os
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from dotenv import load_dotenv
+import logging
 import structlog
 
 # Load .env from project root (parent of backend/)
@@ -23,6 +24,9 @@ from schemas import WorkflowEvent, EventKind, EventLevel, RunStatus
 from schemas.runs import RunMetadata
 from services.event_bus import get_event_bus, close_event_bus
 from services.run_store import get_run_store
+
+# Configure Python stdlib logging so structlog filter_by_level works
+logging.basicConfig(format="%(message)s", stream=__import__("sys").stderr, level=logging.INFO)
 
 # Configure structured logging
 structlog.configure(
@@ -56,8 +60,32 @@ async def lifespan(app: FastAPI):
         logger.info("azure_openai_clients_warmed")
     except Exception as e:
         logger.warning("client_warmup_failed", error=str(e))
+
+    # Wire data retriever to all agent tool modules
+    retriever = None
+    try:
+        run_store = await get_run_store()
+        from data_sources.unified_retriever import get_retriever
+        retriever = await get_retriever(pg_pool=run_store.pool)
+        from agents.tools import RETRIEVER_MODULES
+        wired = 0
+        for mod in RETRIEVER_MODULES:
+            if hasattr(mod, "set_retriever"):
+                mod.set_retriever(retriever)
+                wired += 1
+        logger.info("retriever_wired_to_tools", modules_wired=wired)
+    except Exception as e:
+        logger.warning("retriever_wiring_failed", error=str(e))
+
     yield
+
     logger.info("shutting_down_aviation_solver_api")
+    if retriever:
+        try:
+            await retriever.close()
+            logger.info("retriever_closed")
+        except Exception as e:
+            logger.warning("retriever_close_failed", error=str(e))
     await close_event_bus()
 
 
@@ -74,12 +102,14 @@ from telemetry import configure_telemetry, get_current_trace_context
 configure_telemetry(app)
 
 # CORS configuration
+_cors_origins_env = os.getenv("CORS_ALLOWED_ORIGINS", "")
+_cors_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()] if _cors_origins_env else ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "Last-Event-ID"],
 )
 
 
@@ -179,7 +209,7 @@ class ChatResponse(BaseModel):
 @app.get("/health")
 async def health_check():
     """Health check endpoint for k8s probes."""
-    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
 @app.get("/ready")
@@ -269,8 +299,20 @@ async def start_solve(request: SolveRequest, background_tasks: BackgroundTasks):
                         parsed[key] = value
                 autonomous_turn_limits = parsed
 
+        # Generate stages dynamically from selected agents
+        from schemas.runs import StageMetadata
+        dynamic_stages = [
+            StageMetadata(
+                stage_id=a.agent_id,
+                stage_name=a.agent_name,
+                stage_order=i + 1,
+            )
+            for i, a in enumerate(selected)
+        ]
+
         run = await run_store.create_run(
             problem_description=request.problem,
+            stages=dynamic_stages if dynamic_stages else None,
             config={
                 "workflow_type": workflow_type,
                 "orchestration_mode": orchestration_mode,
@@ -395,15 +437,45 @@ async def chat(request: ChatRequest):
     """
     Chat endpoint for natural language interaction.
 
-    Takes a user message and returns a response from the aviation advisor.
+    Uses a ChatAgent with the orchestrator model to answer questions
+    about aviation operations, or about completed runs via run context.
     """
-    # Simple echo response for now - will be wired to agent in later phase
-    return ChatResponse(
-        response=f"I received your message about: {request.message[:100]}. "
-        "The aviation multi-agent solver is ready to help analyze this problem. "
-        "Use the 'Solve' button to start a full analysis.",
-        run_id=request.run_id,
-    )
+    try:
+        from agents import create_decision_coordinator
+
+        agent = create_decision_coordinator(name="chat_advisor")
+
+        # Build context from run if provided
+        context_parts: list[str] = []
+        if request.run_id:
+            run_store = await get_run_store()
+            run = await run_store.get_run(request.run_id)
+            if run:
+                context_parts.append(
+                    f"Run {run.run_id} ({run.status.value}): {run.problem_description[:300]}"
+                )
+                for stage in run.stages:
+                    context_parts.append(f"  Stage '{stage.stage_name}': {stage.status.value}")
+
+        context = "\n".join(context_parts)
+        prompt = request.message
+        if context:
+            prompt = f"Context from run:\n{context}\n\nUser question: {request.message}"
+
+        response_text = await agent.run(prompt)
+
+        return ChatResponse(
+            response=str(response_text),
+            run_id=request.run_id,
+        )
+    except Exception as e:
+        logger.warning("chat_agent_failed", error=str(e))
+        return ChatResponse(
+            response=f"I received your message about: {request.message[:100]}. "
+            "The aviation multi-agent solver is ready to help analyze this problem. "
+            "Use the 'Solve' button to start a full analysis.",
+            run_id=request.run_id,
+        )
 
 
 # ============================================================================
@@ -481,8 +553,10 @@ async def execute_workflow(
             if event_type in aliases:
                 return aliases[event_type]
 
-            if event_type.endswith(".failed"):
-                return EventKind.RUN_FAILED
+            if event_type in {"agent.failed", "executor.failed"}:
+                # Keep explicit handling of explicit failure channels aligned with known workflow contracts.
+                # Unknown suffix-matching failures should not be promoted to terminal run failure.
+                return EventKind.WORKFLOW_STATUS if event_type.startswith("workflow.") else EventKind.PROGRESS_UPDATE
             if event_type.startswith("workflow."):
                 return EventKind.WORKFLOW_STATUS
             return EventKind.PROGRESS_UPDATE

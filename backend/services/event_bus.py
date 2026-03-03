@@ -6,7 +6,7 @@ Supports pub/sub via Redis Streams for reliable, scalable event delivery.
 import asyncio
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import AsyncGenerator, Optional
 import redis.asyncio as redis
 from redis.asyncio.client import Redis
@@ -158,7 +158,7 @@ class EventBus:
             start_id=start_id,
         )
 
-        last_heartbeat = datetime.utcnow()
+        last_heartbeat = datetime.now(timezone.utc)
         heartbeat_sequence = 0
         retry_count = 0
         last_sequence = 0
@@ -206,7 +206,7 @@ class EventBus:
 
                 # Send heartbeat if needed
                 if include_heartbeats:
-                    now = datetime.utcnow()
+                    now = datetime.now(timezone.utc)
                     if (now - last_heartbeat).total_seconds() >= HEARTBEAT_INTERVAL:
                         heartbeat_sequence += 1
                         yield heartbeat_event(run_id, sequence=heartbeat_sequence)

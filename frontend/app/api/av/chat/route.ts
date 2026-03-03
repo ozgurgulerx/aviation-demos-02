@@ -18,19 +18,28 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const backendUrl = process.env.BACKEND_URL || "http://localhost:5001";
+    const backendUrl = process.env.BACKEND_URL || "http://localhost:5002";
 
-    // Forward to backend solve endpoint
-    const response = await fetch(`${backendUrl}/api/av/solve`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        problem: message,
-        workflow_type: "handoff",
-        orchestration_mode: "deterministic",
-        max_executor_invocations: 200,
-      }),
-    });
+    // Forward to backend solve endpoint with 30s timeout
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30_000);
+
+    let response: Response;
+    try {
+      response = await fetch(`${backendUrl}/api/av/solve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          problem: message,
+          workflow_type: "handoff",
+          orchestration_mode: "deterministic",
+          max_executor_invocations: 200,
+        }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
 
     if (!response.ok) {
       const errorText = await response.text();

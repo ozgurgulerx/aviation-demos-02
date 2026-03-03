@@ -85,22 +85,23 @@ export function BottomDrawer({ panels }: BottomDrawerProps) {
         </div>
       </div>
 
-      {bottomDrawerOpen && (
-        <div className="min-h-0 flex-1 overflow-hidden">
-          <Tabs.Content value="activity" className="av-scroll h-full overflow-y-auto">
-            {panels.activity}
-          </Tabs.Content>
-          <Tabs.Content value="timeline" className="av-scroll h-full overflow-y-auto">
-            {panels.timeline}
-          </Tabs.Content>
-          <Tabs.Content value="plan" className="av-scroll h-full overflow-y-auto">
-            {panels.plan}
-          </Tabs.Content>
-          <Tabs.Content value="sources" className="av-scroll h-full overflow-y-auto">
-            {panels.sources}
-          </Tabs.Content>
-        </div>
-      )}
+      <div
+        className="min-h-0 flex-1 overflow-hidden"
+        style={{ display: bottomDrawerOpen ? undefined : "none" }}
+      >
+        <Tabs.Content value="activity" className="av-scroll h-full overflow-y-auto">
+          {panels.activity}
+        </Tabs.Content>
+        <Tabs.Content value="timeline" className="av-scroll h-full overflow-y-auto">
+          {panels.timeline}
+        </Tabs.Content>
+        <Tabs.Content value="plan" className="av-scroll h-full overflow-y-auto">
+          {panels.plan}
+        </Tabs.Content>
+        <Tabs.Content value="sources" className="av-scroll h-full overflow-y-auto">
+          {panels.sources}
+        </Tabs.Content>
+      </div>
     </Tabs.Root>
   );
 }

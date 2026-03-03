@@ -36,15 +36,15 @@ interface AgentData {
   [key: string]: unknown;
 }
 
-const DATA_SOURCE_META: Record<string, { provider: "Azure" | "Fabric" | "Other"; tone: string }> = {
-  SQL: { provider: "Azure", tone: "hsl(var(--av-azure))" },
-  NOSQL: { provider: "Azure", tone: "hsl(var(--av-azure))" },
-  VECTOR_OPS: { provider: "Azure", tone: "hsl(var(--av-azure))" },
-  VECTOR_REG: { provider: "Azure", tone: "hsl(var(--av-azure))" },
-  VECTOR_AIRPORT: { provider: "Azure", tone: "hsl(var(--av-azure))" },
-  KQL: { provider: "Fabric", tone: "hsl(var(--av-fabric))" },
-  GRAPH: { provider: "Fabric", tone: "hsl(var(--av-fabric))" },
-  FABRIC_SQL: { provider: "Fabric", tone: "hsl(var(--av-fabric))" },
+const DATA_SOURCE_META: Record<string, { provider: "Azure" | "Fabric" | "Other"; tone: string; toneVar: string }> = {
+  SQL: { provider: "Azure", tone: "hsl(var(--av-azure))", toneVar: "var(--av-azure)" },
+  NOSQL: { provider: "Azure", tone: "hsl(var(--av-azure))", toneVar: "var(--av-azure)" },
+  VECTOR_OPS: { provider: "Azure", tone: "hsl(var(--av-azure))", toneVar: "var(--av-azure)" },
+  VECTOR_REG: { provider: "Azure", tone: "hsl(var(--av-azure))", toneVar: "var(--av-azure)" },
+  VECTOR_AIRPORT: { provider: "Azure", tone: "hsl(var(--av-azure))", toneVar: "var(--av-azure)" },
+  KQL: { provider: "Fabric", tone: "hsl(var(--av-fabric))", toneVar: "var(--av-fabric)" },
+  GRAPH: { provider: "Fabric", tone: "hsl(var(--av-fabric))", toneVar: "var(--av-fabric)" },
+  FABRIC_SQL: { provider: "Fabric", tone: "hsl(var(--av-fabric))", toneVar: "var(--av-fabric)" },
 };
 
 function AgentNodeInner({ data }: NodeProps & { data: AgentData }) {
@@ -196,15 +196,15 @@ function AgentNodeInner({ data }: NodeProps & { data: AgentData }) {
         <div className="flex gap-1 px-3 pb-2 flex-wrap">
           {data.dataSources.map((ds) => {
             const isActiveDs = data.activeQuery === ds;
-            const meta = DATA_SOURCE_META[ds] || { provider: "Other", tone: "hsl(var(--av-silver))" };
+            const meta = DATA_SOURCE_META[ds] || { provider: "Other", tone: "hsl(var(--av-silver))", toneVar: "var(--av-silver)" };
             return (
               <span
                 key={ds}
                 className="inline-flex items-center gap-1 text-[8px] font-semibold px-1.5 py-0.5 rounded tracking-wide"
                 style={{
-                  backgroundColor: isActiveDs ? `${data.color}20` : `${meta.tone}12`,
+                  backgroundColor: isActiveDs ? `${data.color}20` : `hsl(${meta.toneVar} / 0.12)`,
                   color: isActiveDs ? data.color : meta.tone,
-                  border: isActiveDs ? `1px solid ${data.color}40` : `1px solid ${meta.tone}35`,
+                  border: isActiveDs ? `1px solid ${data.color}40` : `1px solid hsl(${meta.toneVar} / 0.35)`,
                 }}
                 title={`${ds} • ${meta.provider}`}
               >
