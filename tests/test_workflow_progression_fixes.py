@@ -696,6 +696,14 @@ def test_problem_injected_into_specialist_instructions():
             f"{specialist_id} instructions missing problem context"
         )
 
+    # Coordinator should also receive the problem context
+    coord_executor = workflow.executors["recovery_coordinator"]
+    coord_instructions = coord_executor._agent.default_options.get("instructions", "")
+    assert "thunderstorm at ORD" in coord_instructions, (
+        "Coordinator instructions missing problem context"
+    )
+    assert "Current Scenario" in coord_instructions
+
 
 @pytest.mark.asyncio
 async def test_streaming_accum_captures_function_result_content():
@@ -765,7 +773,7 @@ async def test_handoff_snapshot_uses_accumulated_tool_results():
 
 @pytest.mark.usefixtures("_set_aoai_endpoint")
 def test_coordinator_instructions_include_json_schema():
-    """LLM-directed coordinator instructions should include the JSON output schema."""
+    """LLM-directed coordinator instructions should include a valid JSON output schema."""
     workflow = create_coordinator_workflow(
         scenario="hub_disruption",
         active_agent_ids=[
@@ -779,6 +787,11 @@ def test_coordinator_instructions_include_json_schema():
     assert "selectedOptionId" in instructions
     assert "timeline" in instructions
     assert "criteria" in instructions
+    # Braces should be single (valid JSON), not double-escaped
+    assert '{"time":' in instructions.replace(" ", "") or '"time"' in instructions
+    assert "{{" not in instructions, (
+        "Coordinator instructions contain double-braces — JSON schema is malformed"
+    )
 
 
 @pytest.mark.usefixtures("_set_aoai_endpoint")
