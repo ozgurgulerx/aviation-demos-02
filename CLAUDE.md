@@ -81,9 +81,36 @@ Agents:
 
 ## Local Development
 - **Frontend**: Must run on **port 3002** (`next dev -p 3002`). Port 3001 is used by another project.
-- **Backend**: Must run on **port 5002** (`PORT=5002`). Port 5001 is used by another project.
+- **Backend**: Must run on **port 5002** (`PORT=5002` in `.env`). The hardcoded default in `main.py` is `5001` for k8s compatibility.
 
-## Environment
+## Azure Deployment
+
+### Target Tenant (MANDATORY)
+- **Tenant ID**: `52095a81-130f-4b06-83f1-9859b2c73de6`
+- **Tenant**: `admin@MngEnvMCAP705508.onmicrosoft.com`
+- **Subscription ID**: `6a539906-6ce2-4e3b-84ee-89f701de18d8`
+- **Resource Group**: `rg-aviation-rag`
+- All deployments MUST target this tenant. CI/CD validates tenant on every deploy.
+
+### Infrastructure
 - **ACR**: `avrag705508acr.azurecr.io`
 - **Backend image**: `aviation-multi-agent-backend`
-- **Azure OpenAI**: `aoai-ep-swedencentral02.openai.azure.com`
+- **AKS cluster**: `aks-aviation-rag` (namespace: `aviation-multi-agent`)
+- **Frontend**: Azure App Service `aviation-multiagent-frontend-705508`
+- **Azure OpenAI**: `swedencentral.api.cognitive.microsoft.com`
+- **PostgreSQL**: `aviationragpg705508.postgres.database.azure.com` (READ-ONLY for existing schemas)
+- **Backend internal URL**: `http://10.0.0.4` (AKS internal LoadBalancer, reachable from App Service via VNet)
+
+### CI/CD (GitHub Actions)
+- **Service Principal**: `github-aviation-demos-02-deploy` (app ID: `4c49d528-94ac-425c-bde6-c755f3a4d4e4`)
+- Uses OIDC federated credentials (no stored secrets in Azure)
+- Backend deploys to AKS on push to `main` (paths: `backend/`, `tests/`, `k8s/`)
+- Frontend deploys to App Service on push to `main` (paths: `frontend/`)
+- Required GitHub secrets: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `AZURE_OPENAI_API_KEY`, `PGPASSWORD`, `BACKEND_URL`
+
+### DO NOT MODIFY (other projects)
+- **aviation-demos-01** repo and its service principal `github-aviation-rag-deploy` — separate project
+- **fund-rag namespace on AKS** — Do not touch
+- **ic-autopilot namespace on aks-fund-rag** — Do not touch
+- **rg-fund-rag resource group** — Do not modify existing resources
+- **rg-emrgpay resource group** — Different project, do not touch

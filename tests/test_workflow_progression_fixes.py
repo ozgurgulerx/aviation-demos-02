@@ -139,10 +139,13 @@ async def test_workflow_status_event_includes_workflow_state():
 
 @pytest.fixture
 def _set_aoai_endpoint(monkeypatch):
-    """Set a dummy AZURE_OPENAI_ENDPOINT so agent factories don't fail."""
+    """Patch the module-level AZURE_OPENAI_ENDPOINT so agent factories don't fail."""
     monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://dummy.openai.azure.com/")
     monkeypatch.setenv("AZURE_OPENAI_API_KEY", "dummy-key-for-testing")
     monkeypatch.setenv("AZURE_OPENAI_AUTH_MODE", "api-key")
+    # Also patch the module-level constants that were already evaluated at import time
+    monkeypatch.setattr("agents.client.AZURE_OPENAI_ENDPOINT", "https://dummy.openai.azure.com/")
+    monkeypatch.setattr("agents.client.AZURE_OPENAI_KEY", "dummy-key-for-testing")
 
 
 @pytest.mark.usefixtures("_set_aoai_endpoint")
