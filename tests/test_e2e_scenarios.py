@@ -54,8 +54,10 @@ pytestmark = [
     pytest.mark.skipif(not _HAS_CREDS, reason="Azure OpenAI credentials not set"),
 ]
 
-# Per-test timeout (seconds) — generous to account for LLM latency
-E2E_TIMEOUT = 480
+# Per-test timeout (seconds) — must exceed the engine's per-agent scaled
+# timeout (120s × n_agents + 180s).  Hub_disruption with 9 agents needs ~1260s
+# from the engine, but mock tools make it faster.  720s is generous for tests.
+E2E_TIMEOUT = 720
 
 
 # ---------------------------------------------------------------------------
