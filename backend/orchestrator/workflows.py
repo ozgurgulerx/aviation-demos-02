@@ -24,6 +24,7 @@ from orchestrator.agent_registry import (
     detect_scenario,
     get_agent_by_id,
 )
+from agents.middleware import ToolCallSanitizer
 
 logger = structlog.get_logger()
 
@@ -52,6 +53,9 @@ class OrchestrationMode:
 # Agent factory — creates ChatAgent instances from registry IDs
 # ═══════════════════════════════════════════════════════════════════
 
+_sanitizer = ToolCallSanitizer()
+
+
 def _create_agent_by_id(agent_id: str) -> Optional[ChatAgent]:
     """Create a ChatAgent instance from the agent registry."""
     from agents import agent_factories
@@ -60,7 +64,11 @@ def _create_agent_by_id(agent_id: str) -> Optional[ChatAgent]:
         logger.warning("agent_factory_not_found", agent_id=agent_id)
         return None
     try:
-        return factory(name=agent_id)
+        agent = factory(name=agent_id)
+        # Attach ToolCallSanitizer so orphaned tool_calls in conversation
+        # history are patched before reaching Azure OpenAI.
+        agent.middleware = list(agent.middleware or []) + [_sanitizer]
+        return agent
     except Exception as e:
         logger.error("agent_factory_failed", agent_id=agent_id, error=str(e))
         return None
