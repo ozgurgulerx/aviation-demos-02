@@ -164,7 +164,8 @@ def test_coordinator_workflow_constrains_handoff_targets_and_turn_limits():
 
     coordinator_executor = workflow.executors[coordinator_id]
     assert getattr(coordinator_executor, "_handoff_targets") == specialist_ids
-    assert getattr(coordinator_executor, "_autonomous_mode_turn_limit") == 8
+    # default_coordinator_turns = min(len(specialists) + 2, 6) = min(8, 6) = 6
+    assert getattr(coordinator_executor, "_autonomous_mode_turn_limit") == 6
 
     for specialist_id in specialist_ids:
         specialist_executor = workflow.executors[specialist_id]

@@ -141,7 +141,7 @@ export function ChatSidebar() {
                 )}
               </div>
               <div
-                className={`max-w-[88%] p-2.5 rounded-lg text-xs leading-relaxed ${
+                className={`max-w-[88%] p-2.5 rounded-lg text-xs leading-relaxed whitespace-pre-line ${
                   message.role === "user"
                     ? "border border-av-sky/40 bg-gradient-to-r from-av-sky to-sky-300 text-av-navy font-semibold shadow-[0_8px_24px_rgba(14,165,233,0.25)]"
                     : "border border-av-sky/15 bg-av-midnight/76"

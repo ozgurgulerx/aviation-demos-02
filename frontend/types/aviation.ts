@@ -177,6 +177,9 @@ export interface AgentInfo {
   dataSources: string[];
   included: boolean;
   reason: string;
+  description?: string;
+  outputs?: string[];
+  category?: "specialist" | "coordinator" | "placeholder";
 }
 
 export interface SolveResponse {

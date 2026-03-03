@@ -464,7 +464,10 @@ class OrchestratorEngine:
         selected_baseline = {agent.agent_id for agent in self.selected_agents}
         all_profiles = [*self.selected_agents, *self.excluded_agents]
         profile_map = {profile.agent_id: profile for profile in all_profiles}
-        selectable_profiles = [profile for profile in all_profiles if profile.category != "placeholder"]
+        selectable_profiles = [
+            profile for profile in all_profiles
+            if profile.category != "placeholder" and profile.agent_id in selected_baseline
+        ]
 
         llm_plan = await self._llm_plan_agent_selection(
             problem=problem,
@@ -586,7 +589,9 @@ class OrchestratorEngine:
             "You are an orchestration planner. Choose the best subset of agents and execution order for the query. "
             "Return strict JSON only with keys: selectedAgentIds, excludedAgentIds, executionOrder, "
             "coordinatorAgentId, confidence, reasoning, agentReasons. "
-            "Rules: include exactly one coordinator agent and put coordinator last in executionOrder."
+            "Rules: include exactly one coordinator agent and put coordinator last in executionOrder. "
+            "IMPORTANT: Only select agents from the provided candidateAgents list. "
+            "These have been pre-filtered for the detected scenario."
         )
         user_payload = {
             "problem": problem,
@@ -1085,6 +1090,20 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         )
         self._active_query_contexts.pop(agent_id, None)
 
+    def _effective_execution_timeout(self) -> int:
+        """Scale execution timeout for LLM-directed mode based on agent count.
+
+        Each agent round-trip (coordinator → specialist → coordinator) involves
+        multiple real LLM calls. The base 600s budget is too tight when 5+ agents
+        are in play with real Azure OpenAI latency.
+        """
+        base = self._deterministic_execution_timeout_seconds
+        if not self._is_llm_directed_mode():
+            return base
+        n_agents = len(self.selected_agents) if self.selected_agents else 1
+        # 120s per agent + 180s for selection/synthesis overhead, floor at base
+        return max(base, 120 * n_agents + 180)
+
     async def _execute_workflow_with_events(self, input_message: str) -> Dict[str, Any]:
         max_retries = 3
         for attempt in range(1, max_retries + 1):
@@ -1092,7 +1111,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                 if self._is_bounded_orchestration_mode():
                     return await asyncio.wait_for(
                         self._stream_workflow(input_message),
-                        timeout=self._deterministic_execution_timeout_seconds,
+                        timeout=self._effective_execution_timeout(),
                     )
                 return await self._stream_workflow(input_message)
             except asyncio.TimeoutError as exc:
@@ -1108,7 +1127,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                             "error": "bounded orchestration execution timeout",
                             "reason": timeout_reason,
                             "workflowState": "FAILED",
-                            "timeoutSeconds": self._deterministic_execution_timeout_seconds,
+                            "timeoutSeconds": self._effective_execution_timeout(),
                             "orchestration_mode": self.orchestration_mode,
                         },
                     )
@@ -1338,9 +1357,9 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         stream_timeout_seconds = (
             max(self._deterministic_stream_timeout_seconds, 180)
             if self._is_deterministic_mode()
-            else max(60, self._deterministic_execution_timeout_seconds // 4)
+            else max(60, self._effective_execution_timeout() // 4)
         )
-        max_idle_loops = 3 if self._is_deterministic_mode() else 1
+        max_idle_loops = 3 if self._is_deterministic_mode() else 2
         idle_loop_count = 0
         stream_iterator = self.workflow.run_stream(input_message).__aiter__()
 
@@ -1375,7 +1394,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                     )
                     await self._check_stalled_streaming_agents()
 
-                    if self._is_deterministic_mode():
+                    if self._is_bounded_orchestration_mode():
                         if not self._active_agent_ids:
                             logger.warning(
                                 "workflow_stream_inactivity_no_active_agents",
@@ -1560,7 +1579,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
 
             now = datetime.now(timezone.utc)
             self._agent_started_at[executor_id] = now
-            if self._is_deterministic_mode():
+            if self._is_bounded_orchestration_mode():
                 self._agent_stream_update_counts[executor_id] = 0
                 self._agent_stream_last_update_at[executor_id] = now
             self._active_agent_ids.add(executor_id)
@@ -1753,7 +1772,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             self._agent_progress_pct[executor_id] = next_progress
             self._active_agent_ids.add(executor_id)
             now = datetime.now(timezone.utc)
-            if self._is_deterministic_mode():
+            if self._is_bounded_orchestration_mode():
                 update_count = self._agent_stream_update_counts.get(executor_id, 0) + 1
                 self._agent_stream_update_counts[executor_id] = update_count
                 self._agent_stream_last_update_at[executor_id] = now

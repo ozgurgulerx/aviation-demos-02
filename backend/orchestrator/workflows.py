@@ -173,6 +173,12 @@ After all specialists have reported back:
 
 You are DONE after Phase 2. Do not delegate again.
 
+## Empty/No-Data Rule
+If specialists return no data, empty results, or zero query matches, do NOT
+re-delegate. Instead, synthesize recommendations based on aviation domain
+knowledge, standard operating procedures, and the scenario context.
+State clearly which recommendations are data-backed vs. SOP-based.
+
 Start now by calling the first handoff tool.
 """
     coordinator.default_options["instructions"] = coordinator_instructions
@@ -203,7 +209,10 @@ Start now by calling the first handoff tool.
         builder = builder.add_handoff(specialist, [coordinator])
 
     configured_turn_limits = autonomous_turn_limits or {}
-    coordinator_turn_limit = configured_turn_limits.get(coordinator.name or coordinator.id, 8)
+    default_coordinator_turns = min(len(specialists) + 2, 6)
+    coordinator_turn_limit = configured_turn_limits.get(
+        coordinator.name or coordinator.id, default_coordinator_turns
+    )
     specialist_turn_limits = {
         (s.name or s.id): configured_turn_limits.get(s.name or s.id, 2)
         for s in specialists
@@ -229,7 +238,7 @@ Start now by calling the first handoff tool.
             or "score_recovery_option" in recent
         )
         # Safety valve: reduced threshold so workflows don't run too long
-        conversation_long_enough = n_msgs > (n_specialists * 3 + 8)
+        conversation_long_enough = n_msgs > (n_specialists * 2 + 4)
         should_stop = (
             (has_recommendation and has_timeline)
             or has_final_tool_signal

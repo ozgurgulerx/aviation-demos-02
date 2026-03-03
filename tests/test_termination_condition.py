@@ -104,16 +104,16 @@ def test_terminates_on_final_tool_signals(termination_fn, tool_name):
 # ---------- Safety valve tests ----------
 
 def test_safety_valve_with_6_specialists(termination_fn):
-    """Safety valve should fire at n_specialists * 3 + 8 = 26 messages for 6 specialists."""
-    # 27 messages should trigger safety valve (> 26)
-    conversation = [_msg(f"Message {i}") for i in range(27)]
+    """Safety valve should fire at n_specialists * 2 + 4 = 16 messages for 6 specialists."""
+    # 17 messages should trigger safety valve (> 16)
+    conversation = [_msg(f"Message {i}") for i in range(17)]
     assert termination_fn(conversation) is True
 
 
 def test_no_premature_termination_under_safety_valve(termination_fn):
     """Should not fire safety valve under threshold."""
-    # 25 messages should NOT trigger safety valve (not > 26)
-    conversation = [_msg(f"Message {i}") for i in range(25)]
+    # 15 messages should NOT trigger safety valve (not > 16)
+    conversation = [_msg(f"Message {i}") for i in range(15)]
     assert termination_fn(conversation) is False
 
 

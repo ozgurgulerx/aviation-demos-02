@@ -30,6 +30,8 @@ class AgentSelectionResult(BaseModel):
     agent_name: str
     short_name: str
     category: str
+    description: str = ""
+    outputs: List[str] = []
     included: bool
     reason: str
     conditions_evaluated: List[str]
@@ -238,6 +240,13 @@ SCENARIO_AGENTS = {
     },
 }
 
+SCENARIO_DESCRIPTIONS = {
+    "hub_disruption": "Hub Disruption Recovery",
+    "predictive_maintenance": "Predictive Maintenance Analysis",
+    "diversion": "Diversion Management",
+    "crew_fatigue": "Crew Fatigue Assessment",
+}
+
 # Keywords for scenario detection
 SCENARIO_KEYWORDS = {
     "hub_disruption": [
@@ -305,6 +314,8 @@ def select_agents_for_problem(
             agent_name=agent.name,
             short_name=agent.short_name,
             category=agent.category,
+            description=agent.description,
+            outputs=agent.outputs,
             included=is_included,
             reason=f"Required for {scenario} scenario" if is_included else f"Not needed for {scenario}",
             conditions_evaluated=[scenario, "keyword_match"],

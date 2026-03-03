@@ -1,5 +1,70 @@
 import { NextRequest, NextResponse } from "next/server";
 
+interface AgentPayload {
+  id: string;
+  name: string;
+  included: boolean;
+  category?: string;
+  description?: string;
+  outputs?: string[];
+  dataSources?: string[];
+}
+
+const SCENARIO_LABELS: Record<string, string> = {
+  hub_disruption: "Hub Disruption Recovery",
+  predictive_maintenance: "Predictive Maintenance Analysis",
+  diversion: "Diversion Management",
+  crew_fatigue: "Crew Fatigue Assessment",
+};
+
+function buildWorkflowSummary(scenario: string, agents: AgentPayload[]): string {
+  const included = agents.filter((a) => a.included);
+  const specialists = included.filter((a) => a.category !== "coordinator");
+  const coordinator = included.find((a) => a.category === "coordinator");
+  const scenarioLabel = SCENARIO_LABELS[scenario] || scenario.replace(/_/g, " ");
+
+  const lines: string[] = [];
+
+  lines.push(`Scenario: ${scenarioLabel}`);
+  lines.push(
+    `Recruiting ${included.length} agents (${specialists.length} specialist${specialists.length !== 1 ? "s" : ""} + ${coordinator ? "1 coordinator" : "0 coordinators"}).`
+  );
+  lines.push("");
+
+  // Specialist details
+  lines.push("Specialist agents:");
+  for (const agent of specialists) {
+    const sources = agent.dataSources?.length ? ` [${agent.dataSources.join(", ")}]` : "";
+    lines.push(`  ${agent.name}${sources}`);
+    if (agent.description) {
+      lines.push(`    ${agent.description}`);
+    }
+    if (agent.outputs?.length) {
+      lines.push(`    \u2192 ${agent.outputs.join("; ")}`);
+    }
+  }
+
+  // Coordinator
+  if (coordinator) {
+    lines.push("");
+    lines.push(`Coordinator: ${coordinator.name}`);
+    if (coordinator.description) {
+      lines.push(`  ${coordinator.description}`);
+    }
+  }
+
+  // Execution plan
+  lines.push("");
+  lines.push("Execution plan:");
+  lines.push(
+    `  ${coordinator?.name || "Coordinator"} will delegate to each specialist via handoff, collect their findings, then synthesize a scored recovery plan with implementation timeline.`
+  );
+  lines.push("");
+  lines.push("Streaming results now...");
+
+  return lines.join("\n");
+}
+
 /**
  * POST /api/av/chat
  *
@@ -51,9 +116,11 @@ export async function POST(request: NextRequest) {
     }
 
     const data = await response.json();
+    const agentList: AgentPayload[] = data.agents || [];
+    const detailedResponse = buildWorkflowSummary(data.scenario || "", agentList);
 
     return NextResponse.json({
-      response: `Analyzing your problem with ${data.agents?.filter((a: { included: boolean }) => a.included).length || 0} specialist agents. Scenario: ${data.scenario || "auto-detected"}.`,
+      response: detailedResponse,
       run_id: data.run_id,
       scenario: data.scenario,
       agents: data.agents || [],

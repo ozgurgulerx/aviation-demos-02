@@ -179,6 +179,9 @@ class AgentInfo(BaseModel):
     dataSources: list[str] = []
     included: bool = True
     reason: str = ""
+    description: str = ""
+    outputs: list[str] = []
+    category: str = "specialist"
 
 
 class SolveResponse(BaseModel):
@@ -267,12 +270,16 @@ async def start_solve(request: SolveRequest, background_tasks: BackgroundTasks):
                 id=a.agent_id, name=a.agent_name, icon=a.icon,
                 color=a.color, dataSources=a.data_sources,
                 included=True, reason=a.reason,
+                description=a.description, outputs=a.outputs,
+                category=a.category,
             ))
         for a in excluded:
             agent_infos.append(AgentInfo(
                 id=a.agent_id, name=a.agent_name, icon=a.icon,
                 color=a.color, dataSources=a.data_sources,
                 included=False, reason=a.reason,
+                description=a.description, outputs=a.outputs,
+                category=a.category,
             ))
 
         workflow_type = request.workflow_type or "handoff"
