@@ -32,7 +32,7 @@ export async function POST(request: NextRequest) {
         body: JSON.stringify({
           problem: message,
           workflow_type: "handoff",
-          orchestration_mode: "deterministic",
+          orchestration_mode: "llm_directed",
           max_executor_invocations: 200,
         }),
         signal: controller.signal,

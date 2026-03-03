@@ -5,6 +5,10 @@ Provides:
 - SCENARIOS: canonical prompts + expected agent mappings for all 4 scenario cards
 - EventCollector: async callback that records (event_type, payload) tuples
 - Validation helpers for agent activations, event ordering, etc.
+
+Validators are written for the LLM-directed orchestration mode where the
+coordinator is the start agent in a HandoffBuilder star topology and
+dynamically delegates to specialists via tool-based handoff calls.
 """
 
 from __future__ import annotations
@@ -179,48 +183,72 @@ def validate_agent_activations(
     expected_agents: List[str],
     expected_coordinator: str,
 ):
-    """Assert that all expected specialists + coordinator were activated."""
+    """Assert coordinator + at least N-1 expected specialists were activated.
+
+    In LLM-directed mode the coordinator always runs (it is the start agent)
+    and gpt-5-mini selects which specialists to recruit.  The LLM may
+    reasonably exclude one specialist, so we require at least len-1 matches.
+    """
     activated = set(collector.get_activated_agent_ids())
-    expected_set = set(expected_agents) | {expected_coordinator}
-    missing = expected_set - activated
-    assert not missing, (
-        f"Missing activated agents: {sorted(missing)}\n"
+
+    # Coordinator MUST always be activated
+    assert expected_coordinator in activated, (
+        f"Coordinator '{expected_coordinator}' was not activated\n"
         f"Activated: {sorted(activated)}\n"
         f"Timeline:\n{collector.dump_timeline()}"
     )
+
+    # At least N-1 expected specialists must be activated
+    seen_specialists = set(expected_agents) & activated
+    min_required = max(1, len(expected_agents) - 1)
+    assert len(seen_specialists) >= min_required, (
+        f"Too few specialists activated: need >= {min_required}, "
+        f"got {len(seen_specialists)} {sorted(seen_specialists)}\n"
+        f"Missing: {sorted(set(expected_agents) - activated)}\n"
+        f"Activated: {sorted(activated)}\n"
+        f"Timeline:\n{collector.dump_timeline()}"
+    )
+
+    # Warn if any were excluded
+    missing = set(expected_agents) - activated
+    if missing:
+        warnings.warn(
+            f"LLM excluded {sorted(missing)} from selection "
+            f"(this is acceptable — LLM-directed mode allows selective recruitment)",
+            stacklevel=2,
+        )
 
 
 def validate_specialists_invoked(
     collector: EventCollector,
     expected_agents: List[str],
 ):
-    """Assert at least one specialist was invoked by the workflow.
+    """Assert at least one specialist was invoked via coordinator handoff.
 
-    In deterministic mode, the WorkflowBuilder fan-out dispatches through a
-    specialist_aggregator. Due to framework limitations, not all specialists
-    may be individually invoked in every run. We verify that the aggregator
-    ran (meaning dispatch happened) and at least one specialist was invoked.
+    In LLM-directed mode the coordinator delegates to specialists through
+    handoff tool calls. The LLM may skip some specialists it deems
+    irrelevant, so we require at least one to have been invoked or completed.
     """
     invoked = collector.get_invoked_agent_ids()
     completed = collector.get_completed_agent_ids()
     all_seen = invoked | completed
 
-    # The specialist_aggregator must have been invoked (it dispatches work)
-    assert "specialist_aggregator" in invoked or (all_seen & set(expected_agents)), (
-        f"No specialists invoked at all\n"
+    seen_specialists = all_seen & set(expected_agents)
+    assert seen_specialists, (
+        f"No specialists were invoked at all\n"
+        f"Expected at least one of: {sorted(expected_agents)}\n"
         f"Invoked: {sorted(invoked)}\n"
         f"Completed: {sorted(completed)}\n"
         f"Timeline:\n{collector.dump_timeline()}"
     )
 
-    # Warn (but don't fail) if some specialists were missed
-    seen_specialists = all_seen & set(expected_agents)
+    # Warn (but don't fail) if the LLM skipped some specialists
     missing = set(expected_agents) - all_seen
     if missing:
         warnings.warn(
-            f"Not all specialists invoked: missing {sorted(missing)}, "
-            f"saw {sorted(seen_specialists)} "
-            f"(framework fan-out limitation in deterministic mode)",
+            f"LLM-directed coordinator skipped specialists: {sorted(missing)}, "
+            f"invoked {sorted(seen_specialists)} "
+            f"(acceptable — LLM selectively recruits agents)",
             stacklevel=2,
         )
 
@@ -229,26 +257,23 @@ def validate_coordinator_invoked(
     collector: EventCollector,
     expected_coordinator: str,
 ):
-    """Check whether the coordinator was invoked.
+    """Assert the coordinator was invoked.
 
-    In deterministic mode, the coordinator only runs if the aggregator's
-    fan-in handler fires and forwards results. Due to framework limitations,
-    this doesn't always happen. We warn instead of failing when the
-    coordinator wasn't invoked, since the run itself still completes
-    successfully with specialist findings.
+    In LLM-directed mode the coordinator is the start agent in the
+    HandoffBuilder star topology, so it must always be invoked.
     """
     invoked = collector.get_invoked_agent_ids()
     completed = collector.get_completed_agent_ids()
     all_seen = invoked | completed
     coordinator_ids = {expected_coordinator, "coordinator"}
-    if not (coordinator_ids & all_seen):
-        warnings.warn(
-            f"Coordinator '{expected_coordinator}' was not invoked by the workflow. "
-            f"This is a known framework limitation in deterministic mode where the "
-            f"fan-in handler may not trigger. "
-            f"Invoked: {sorted(invoked)}, Completed: {sorted(completed)}",
-            stacklevel=2,
-        )
+    assert coordinator_ids & all_seen, (
+        f"Coordinator '{expected_coordinator}' was never invoked. "
+        f"In LLM-directed mode the coordinator is the start agent and "
+        f"must always run.\n"
+        f"Invoked: {sorted(invoked)}\n"
+        f"Completed: {sorted(completed)}\n"
+        f"Timeline:\n{collector.dump_timeline()}"
+    )
 
 
 def validate_no_run_failed(collector: EventCollector):
@@ -272,18 +297,50 @@ def validate_run_completed(collector: EventCollector):
 
 
 def validate_coordinator_output(collector: EventCollector):
-    """Check if the coordinator produced artifacts. Warns if absent."""
-    artifact_types = {"recovery.option", "coordinator.scoring", "coordinator.plan"}
-    has_artifact = any(t in artifact_types for t, _ in collector.events)
+    """Assert the coordinator completed. Warn if no structured artifacts."""
     has_coordinator_done = any(
         t in ("executor.completed", "agent.completed")
         and ("coordinator" in (p.get("executor_id", "") or p.get("agent_id", "")))
         for t, p in collector.events
     )
-    if not (has_artifact or has_coordinator_done):
+    assert has_coordinator_done, (
+        "Coordinator never completed. In LLM-directed mode the coordinator "
+        "is the start agent and must always complete.\n"
+        f"Timeline:\n{collector.dump_timeline()}"
+    )
+
+    artifact_types = {"recovery.option", "coordinator.scoring", "coordinator.plan"}
+    has_artifact = any(t in artifact_types for t, _ in collector.events)
+    if not has_artifact:
         warnings.warn(
-            "Coordinator produced no artifacts and did not complete. "
-            "This is expected in deterministic mode when the fan-in "
-            "handler doesn't trigger.",
+            "Coordinator completed but produced no structured artifacts "
+            "(recovery.option / coordinator.scoring / coordinator.plan). "
+            "The LLM may have synthesised its response in free-form text.",
             stacklevel=2,
         )
+
+
+def validate_llm_selection_trace(collector: EventCollector):
+    """Assert that the LLM agent-selection trace event was emitted.
+
+    In LLM-directed mode, gpt-5-mini selects which agents to recruit and
+    emits an ``orchestrator.decision`` event with
+    ``decisionType == "llm_agent_selection"`` containing its reasoning.
+    """
+    decisions = collector.get_events_by_type("orchestrator.decision")
+    llm_selections = [
+        d for d in decisions
+        if d.get("decisionType") == "llm_agent_selection"
+    ]
+    assert llm_selections, (
+        "No orchestrator.decision event with decisionType='llm_agent_selection' "
+        "was emitted. LLM-directed mode should always emit this trace.\n"
+        f"All decision events: {decisions}\n"
+        f"Timeline:\n{collector.dump_timeline()}"
+    )
+
+    # Validate payload structure
+    sel = llm_selections[0]
+    assert sel.get("reason"), (
+        f"LLM selection trace is missing 'reason': {sel}"
+    )

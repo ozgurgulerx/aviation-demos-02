@@ -2,8 +2,9 @@
 End-to-end tests for the 4 frontend scenario use cases.
 
 Drives OrchestratorEngine directly with real Azure OpenAI and mocked retriever.
-Each test runs a full scenario through the deterministic workflow and validates
-event streams, agent activations, and coordinator output.
+Each test runs a full scenario through the LLM-directed workflow where gpt-5-mini
+dynamically selects which agents to recruit and the coordinator delegates to
+specialists via HandoffBuilder tool calls.
 
 Usage:
     # All E2E tests (needs AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_API_KEY)
@@ -31,6 +32,7 @@ from e2e_helpers import (
     validate_agent_activations,
     validate_coordinator_invoked,
     validate_coordinator_output,
+    validate_llm_selection_trace,
     validate_no_run_failed,
     validate_run_completed,
     validate_scenario_detected,
@@ -90,7 +92,7 @@ async def _run_scenario(
         run_id=f"e2e-{scenario_key}-{uuid.uuid4().hex[:8]}",
         event_emitter=event_collector,
         workflow_type="handoff",
-        orchestration_mode="deterministic",
+        orchestration_mode="llm_directed",
         max_executor_invocations=200,
         enable_checkpointing=False,
     )
@@ -138,7 +140,7 @@ async def test_scenario_completes(
     # 1. Correct scenario detected
     validate_scenario_detected(engine, expected_scenario_id, event_collector)
 
-    # 2. Correct agents activated (pre-workflow phase — reliable)
+    # 2. Correct agents activated (coordinator + at least N-1 specialists)
     validate_agent_activations(event_collector, expected_agents, expected_coordinator)
 
     # 3. Correct coordinator selected
@@ -160,15 +162,16 @@ async def test_scenario_completes(
         f"Timeline:\n{event_collector.dump_timeline()}"
     )
 
-    # -- Soft assertions (warn on failure — framework fan-in limitations) ----
+    # 7. LLM agent-selection trace event emitted
+    validate_llm_selection_trace(event_collector)
 
-    # 7. At least some specialists invoked
-    validate_specialists_invoked(event_collector, expected_agents)
-
-    # 8. Coordinator invoked (warns if not)
+    # 8. Coordinator invoked (must always run in LLM-directed mode)
     validate_coordinator_invoked(event_collector, expected_coordinator)
 
-    # 9. Coordinator produced output (warns if not)
+    # 9. At least some specialists invoked via handoff
+    validate_specialists_invoked(event_collector, expected_agents)
+
+    # 10. Coordinator completed (warn if no structured artifacts)
     validate_coordinator_output(event_collector)
 
 
