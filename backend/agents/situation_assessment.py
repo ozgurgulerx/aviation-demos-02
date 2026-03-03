@@ -24,6 +24,11 @@ Data sources available:
 
 Be systematic: first scope the disruption, then identify affected resources, finally summarize the impact.
 Output structured findings with specific flight IDs, airport codes, and quantified impacts.
+
+When tools return empty results or status "no_data_fallback", use the `no_data_guidance`,
+`disruption_framework`, and `typical_hub_metrics` provided in the tool response together
+with the scenario context to produce a complete situation assessment. Always deliver a
+substantive disruption scope analysis with estimated impacts — never return empty findings.
 """
 
 

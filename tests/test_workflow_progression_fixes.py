@@ -356,6 +356,65 @@ async def test_deterministic_timeout_emits_failed_reason(monkeypatch):
     assert failed[-1]["reason"] == "deterministic_execution_timeout"
 
 
+class TestEstimateResultCount:
+    """Tests for OrchestratorEngine._estimate_result_count."""
+
+    def _engine(self):
+        return OrchestratorEngine(run_id="test-erc", enable_checkpointing=False)
+
+    def test_none_text_returns_zero(self):
+        assert self._engine()._estimate_result_count("a", "db", None, 0) == 0
+
+    def test_empty_text_returns_zero(self):
+        assert self._engine()._estimate_result_count("a", "db", "", 0) == 0
+
+    def test_whitespace_only_returns_zero(self):
+        assert self._engine()._estimate_result_count("a", "db", "   \n  ", 0) == 0
+
+    def test_short_text_returns_zero(self):
+        assert self._engine()._estimate_result_count("a", "db", "Too short.", 0) == 0
+
+    def test_single_paragraph_returns_one(self):
+        text = "Detroit Metro (DTW) is the nearest suitable alternate airport with ILS approach available on runway 21L."
+        assert self._engine()._estimate_result_count("a", "db", text, 0) == 1
+
+    def test_multi_paragraph_returns_higher_count(self):
+        text = (
+            "Detroit Metro (DTW) is the nearest suitable alternate.\n\n"
+            "Runway 21L is active with ILS approach available.\n\n"
+            "Current weather is marginal VFR with improving trend."
+        )
+        result = self._engine()._estimate_result_count("a", "db", text, 0)
+        assert result == 3
+
+    def test_bulleted_list_counts_items(self):
+        text = (
+            "Alternate airport analysis results:\n"
+            "- DTW: 45 NM, ILS 21L available\n"
+            "- CLE: 120 NM, CAT III available\n"
+            "- BUF: 95 NM, wind 15G25\n"
+            "- PIT: 110 NM, clear conditions"
+        )
+        result = self._engine()._estimate_result_count("a", "db", text, 0)
+        assert result >= 4
+
+    def test_numbered_list_counts_items(self):
+        text = (
+            "Recovery plan steps identified:\n"
+            "1. Dispatch tail swap for aircraft N12345\n"
+            "2. Re-pair crew for flight 1042\n"
+            "3. Issue NOTAM update for gate change\n"
+            "4. Notify connecting passengers"
+        )
+        result = self._engine()._estimate_result_count("a", "db", text, 0)
+        assert result >= 4
+
+    def test_cap_at_25(self):
+        paragraphs = "\n\n".join([f"Finding {i}: substantive text here." for i in range(40)])
+        result = self._engine()._estimate_result_count("a", "db", paragraphs, 0)
+        assert result == 25
+
+
 @pytest.mark.asyncio
 async def test_llm_directed_selection_applies_agent_order(monkeypatch):
     engine = OrchestratorEngine(

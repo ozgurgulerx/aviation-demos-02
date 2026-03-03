@@ -6,6 +6,7 @@ from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
 from agents.tools import retriever_query
+from agents.tools.domain_knowledge import DISRUPTION_FRAMEWORK
 
 logger = structlog.get_logger()
 
@@ -29,13 +30,25 @@ async def map_disruption_scope(
             retriever_query(_retriever.query_sql(query)),
             retriever_query(_retriever.query_graph(query, hops=2)),
         )
-        return {
-            "affected_flights": sql_rows[:20],
-            "network_connections": graph_rows[:15],
-            "citations": [c.__dict__ for c in sql_cit + graph_cit],
-            "scope": {"airports": airports, "window_hours": time_window_hours},
-        }
-    return {"airports": airports, "estimated_affected_flights": len(airports) * 12, "status": "mock"}
+        if sql_rows or graph_rows:
+            return {
+                "affected_flights": sql_rows[:20],
+                "network_connections": graph_rows[:15],
+                "citations": [c.__dict__ for c in sql_cit + graph_cit],
+                "scope": {"airports": airports, "window_hours": time_window_hours},
+            }
+    # Fallback: provide disruption assessment framework
+    return {
+        "airports": airports,
+        "scope": {"airports": airports, "window_hours": time_window_hours},
+        "status": "no_data_fallback",
+        "no_data_guidance": (
+            f"No flight disruption data retrieved for {', '.join(airports)}. Use the disruption "
+            "assessment framework and typical hub metrics below along with the scenario context "
+            "to estimate the scope of disruption."
+        ),
+        "disruption_framework": DISRUPTION_FRAMEWORK,
+    }
 
 
 @ai_function(approval_mode="never_require")
@@ -47,8 +60,21 @@ async def query_flight_schedule(
     if _retriever:
         query = f"flight schedule at {', '.join(airports)} status {status_filter}"
         rows, cits = await retriever_query(_retriever.query_sql(query))
-        return {"flights": rows[:30], "total": len(rows), "citations": [c.__dict__ for c in cits]}
-    return {"airports": airports, "filter": status_filter, "flights": [], "status": "mock"}
+        if rows:
+            return {"flights": rows[:30], "total": len(rows), "citations": [c.__dict__ for c in cits]}
+    # Fallback: provide estimation heuristics
+    return {
+        "airports": airports,
+        "filter": status_filter,
+        "flights": [],
+        "status": "no_data_fallback",
+        "no_data_guidance": (
+            "No flight schedule data retrieved. Use the estimation heuristics and typical "
+            "hub metrics below to reason about the likely flight activity at these airports."
+        ),
+        "estimation_heuristics": DISRUPTION_FRAMEWORK["estimation_heuristics"],
+        "typical_hub_metrics": DISRUPTION_FRAMEWORK["typical_hub_metrics"],
+    }
 
 
 @ai_function(approval_mode="never_require")
@@ -59,5 +85,15 @@ async def get_live_positions(
     if _retriever:
         query = f"live aircraft positions near {', '.join(airports)}"
         rows, cits = await retriever_query(_retriever.query_kql(query, window_minutes=30))
-        return {"positions": rows[:50], "count": len(rows), "citations": [c.__dict__ for c in cits]}
-    return {"airports": airports, "positions": [], "status": "mock"}
+        if rows:
+            return {"positions": rows[:50], "count": len(rows), "citations": [c.__dict__ for c in cits]}
+    # Fallback: note to use scenario context
+    return {
+        "airports": airports,
+        "positions": [],
+        "status": "no_data_fallback",
+        "no_data_guidance": (
+            "No live ADS-B position data available. Base your situational awareness on the "
+            "scenario description and any flight schedule information already obtained."
+        ),
+    }

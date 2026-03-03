@@ -188,7 +188,10 @@ Start now by calling the first handoff tool.
         handoff_protocol = (
             "Workflow protocol:\n"
             "- Run one focused analysis pass using your tools.\n"
-            "- Return concise, evidence-backed findings.\n"
+            "- If tools return data, provide concise, evidence-backed findings.\n"
+            "- If tools return empty results or 'no_data_fallback' status, use the domain\n"
+            "  knowledge guidance and scenario context to produce a substantive analysis.\n"
+            "  Never return empty findings.\n"
             f"- Immediately call `handoff_to_{coordinator_ref}` after your findings.\n"
             "- Do not hand off to any other specialist.\n\n"
         )

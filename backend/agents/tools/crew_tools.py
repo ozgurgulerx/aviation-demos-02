@@ -6,6 +6,7 @@ from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
 from agents.tools import retriever_query
+from agents.tools.domain_knowledge import FAR_117_LIMITS, CREW_SCHEDULING_SOPS
 
 logger = structlog.get_logger()
 _retriever = None
@@ -24,8 +25,20 @@ async def query_crew_availability(
     if _retriever:
         query = f"crew members at {base_airport} role {role} with remaining duty hours"
         rows, cits = await retriever_query(_retriever.query_sql(query))
-        return {"available_crew": rows[:15], "citations": [c.__dict__ for c in cits]}
-    return {"base": base_airport, "role": role, "available_crew": [], "status": "mock"}
+        if rows:
+            return {"available_crew": rows[:15], "citations": [c.__dict__ for c in cits]}
+    # Fallback: provide crew scheduling SOPs
+    return {
+        "base": base_airport,
+        "role": role,
+        "available_crew": [],
+        "status": "no_data_fallback",
+        "no_data_guidance": (
+            f"No crew availability records found for {base_airport}. Use the scheduling SOPs "
+            "and reserve crew procedures below to recommend crew sourcing strategies."
+        ),
+        "scheduling_sops": CREW_SCHEDULING_SOPS,
+    }
 
 
 @ai_function(approval_mode="never_require")
@@ -39,12 +52,22 @@ async def check_duty_limits(
             retriever_query(_retriever.query_sql(query)),
             retriever_query(_retriever.query_semantic("FAR 117 duty time limitations", source="VECTOR_REG")),
         )
-        return {
-            "crew_status": sql_rows[:10],
-            "regulations": reg_rows[:3],
-            "citations": [c.__dict__ for c in sql_cits + reg_cits],
-        }
-    return {"crew_ids": crew_ids, "all_within_limits": "unknown", "status": "mock"}
+        if sql_rows or reg_rows:
+            return {
+                "crew_status": sql_rows[:10],
+                "regulations": reg_rows[:3],
+                "citations": [c.__dict__ for c in sql_cits + reg_cits],
+            }
+    # Fallback: provide FAR 117 duty limits
+    return {
+        "crew_ids": crew_ids,
+        "status": "no_data_fallback",
+        "no_data_guidance": (
+            "No duty records found for these crew members. Use the FAR 117 limits below "
+            "and the scenario context to assess duty limit compliance."
+        ),
+        "far_117_limits": FAR_117_LIMITS,
+    }
 
 
 @ai_function(approval_mode="never_require")
@@ -56,5 +79,18 @@ async def propose_crew_pairing(
     if _retriever:
         query = f"crew pairing options for flight {flight_id}"
         rows, cits = await retriever_query(_retriever.query_sql(query))
-        return {"proposed_pairing": rows[:5], "citations": [c.__dict__ for c in cits]}
-    return {"flight_id": flight_id, "roles": required_roles or ["captain", "first_officer"], "status": "mock"}
+        if rows:
+            return {"proposed_pairing": rows[:5], "citations": [c.__dict__ for c in cits]}
+    # Fallback: provide pairing guidelines
+    roles = required_roles or ["captain", "first_officer"]
+    return {
+        "flight_id": flight_id,
+        "roles": roles,
+        "status": "no_data_fallback",
+        "no_data_guidance": (
+            f"No crew pairing data found for flight {flight_id}. Use the standard pairing "
+            "guidelines and minimum complement requirements below to propose a crew solution."
+        ),
+        "pairing_guidelines": CREW_SCHEDULING_SOPS["pairing_guidelines"],
+        "minimum_complement": CREW_SCHEDULING_SOPS["minimum_complement"],
+    }

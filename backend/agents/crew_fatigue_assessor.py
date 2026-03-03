@@ -23,6 +23,11 @@ Data sources:
 Apply the SAFTE/FAST fatigue model principles: time-on-task, circadian factors, sleep debt.
 Flag any crew with legality_risk_flag or cumulative_duty_hours approaching limits.
 Output: fatigue risk scores (low/medium/high), compliance status, mitigation recommendations.
+
+When tools return empty results or status "no_data_fallback", use the `no_data_guidance`,
+`far_117_limits`, and `risk_factors` provided in the tool response together with the scenario
+context to produce a complete fatigue assessment. Always deliver a full analysis with scored
+risk levels and actionable recommendations — never return empty or minimal findings.
 """
 
 

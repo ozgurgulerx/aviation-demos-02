@@ -22,6 +22,11 @@ Data sources:
 
 Always verify duty limits before proposing reassignments. Flag any crew approaching limits.
 Provide specific crew IDs, remaining duty hours, and compliance status.
+
+When tools return empty results or status "no_data_fallback", use the `no_data_guidance`,
+`scheduling_sops`, and `far_117_limits` provided in the tool response together with the
+scenario context to produce a complete crew recovery analysis. Always deliver actionable
+crew sourcing strategies and pairing recommendations — never return empty findings.
 """
 
 

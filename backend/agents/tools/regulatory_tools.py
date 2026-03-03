@@ -6,6 +6,7 @@ from agent_framework import tool as ai_function
 from pydantic import Field
 import structlog
 from agents.tools import retriever_query
+from agents.tools.domain_knowledge import REGULATORY_REFERENCES
 
 logger = structlog.get_logger()
 _retriever = None
@@ -27,12 +28,25 @@ async def check_compliance(
             retriever_query(_retriever.query_semantic(query, source="VECTOR_REG")),
             retriever_query(_retriever.query_semantic(query, source="VECTOR_OPS")),
         )
-        return {
-            "regulations": reg_rows[:5],
-            "operational_precedents": ops_rows[:3],
-            "citations": [c.__dict__ for c in reg_cits + ops_cits],
-        }
-    return {"action": action_description[:80], "area": regulation_area, "compliant": "unknown", "status": "mock"}
+        if reg_rows or ops_rows:
+            return {
+                "regulations": reg_rows[:5],
+                "operational_precedents": ops_rows[:3],
+                "citations": [c.__dict__ for c in reg_cits + ops_cits],
+            }
+    # Fallback: provide key regulation references
+    area_refs = REGULATORY_REFERENCES.get(regulation_area) or REGULATORY_REFERENCES.get("safety", {})
+    return {
+        "action": action_description[:80],
+        "area": regulation_area,
+        "status": "no_data_fallback",
+        "no_data_guidance": (
+            "No regulation documents retrieved from search. Use the key regulatory references "
+            "below and your aviation domain knowledge to evaluate compliance of the proposed action."
+        ),
+        "applicable_regulations": area_refs,
+        "all_regulation_areas": REGULATORY_REFERENCES,
+    }
 
 
 @ai_function(approval_mode="never_require")
@@ -43,5 +57,16 @@ async def search_regulations(
     """Search FAA/EASA regulatory documents."""
     if _retriever:
         rows, cits = await retriever_query(_retriever.query_semantic(query, top=top, source="VECTOR_REG"))
-        return {"regulations": rows[:top], "citations": [c.__dict__ for c in cits]}
-    return {"query": query[:80], "regulations": [], "status": "mock"}
+        if rows:
+            return {"regulations": rows[:top], "citations": [c.__dict__ for c in cits]}
+    # Fallback: provide applicable regulation citations
+    return {
+        "query": query[:80],
+        "regulations": [],
+        "status": "no_data_fallback",
+        "no_data_guidance": (
+            "No regulation documents found for this query. Use the regulation references below "
+            "to identify applicable rules and provide compliance guidance."
+        ),
+        "regulation_references": REGULATORY_REFERENCES,
+    }

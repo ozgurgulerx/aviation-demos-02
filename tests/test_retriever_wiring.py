@@ -77,9 +77,9 @@ async def test_mock_returns_not_optimistic(mod, func_name, kwargs, critical_fiel
     ids=[f"{m.__name__}.{f}" for m, f, _, _ in SAFETY_CRITICAL_MOCK_CASES],
 )
 async def test_mock_returns_include_status_mock(mod, func_name, kwargs, critical_fields):
-    """All mock returns must include 'status': 'mock'."""
+    """All mock/fallback returns must include a non-empty status indicator."""
     func = getattr(mod, func_name)
     result = await func(**kwargs)
-    assert result.get("status") == "mock", (
-        f"{mod.__name__}.{func_name} mock return missing 'status': 'mock'"
+    assert result.get("status") in ("mock", "no_data_fallback"), (
+        f"{mod.__name__}.{func_name} mock return missing status indicator, got: {result.get('status')!r}"
     )
