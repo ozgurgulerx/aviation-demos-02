@@ -1218,13 +1218,54 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             return "SOURCE_QUERY_BLOCKED"
         return "SOURCE_QUERY_ERROR"
 
+    @staticmethod
+    def _is_explicit_error_citation_title(title: str) -> bool:
+        if not title:
+            return False
+        if re.match(r"^\s*([A-Z0-9_]{3,})\s*:\s*", title):
+            return True
+        lowered = title.strip().lower()
+        if lowered.startswith(
+            (
+                "sql error:",
+                "kql error:",
+                "graph error:",
+                "search error:",
+                "cosmos error:",
+                "fabric sql error:",
+                "tds error:",
+                "error:",
+                "unknown search source:",
+            )
+        ):
+            return True
+        return lowered in {
+            "no database connection",
+            "schema insufficient for query",
+            "kql schema insufficient",
+            "kql endpoint not configured",
+            "no fabric token available",
+            "no fabric token",
+            "no graph endpoint configured",
+            "azure-search-documents not installed",
+            "search endpoint/key not configured",
+            "azure-cosmos not installed",
+            "cosmos endpoint not configured",
+            "could not generate t-sql",
+            "pyodbc not installed",
+            "no fabric sql connection string",
+        }
+
     def _infer_result_count_from_payload(self, payload: Dict[str, Any]) -> int:
         for key in ("count", "total", "total_analyzed", "trend_count"):
             value = payload.get(key)
             if isinstance(value, int) and value >= 0:
                 return value
         max_len = 0
-        for value in payload.values():
+        for key, value in payload.items():
+            normalized_key = str(key).strip().lower()
+            if normalized_key in {"citations", "sourceerrors", "errors", "warnings"}:
+                continue
             if isinstance(value, list):
                 max_len = max(max_len, len(value))
         return max_len
@@ -1269,18 +1310,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             if not source_type:
                 continue
             title = str(citation.get("title") or "")
-            lowered = title.lower()
-            is_error = (
-                "error" in lowered
-                or "failed" in lowered
-                or "not configured" in lowered
-                or "not installed" in lowered
-                or "timeout" in lowered
-                or "timed out" in lowered
-                or "blocked" in lowered
-                or "missing" in lowered
-                or "no " in lowered
-            )
+            is_error = self._is_explicit_error_citation_title(title)
             entry = per_source.setdefault(
                 source_type,
                 {"status": "complete", "result_count": inferred_count, "error_code": "", "error_message": "", "query_summary": ""},
