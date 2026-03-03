@@ -148,6 +148,7 @@ class OrchestratorEngine:
         self._stream_throttle_td = timedelta(
             milliseconds=int(os.getenv("STREAM_THROTTLE_MS", "500"))
         )
+        self._streaming_text_accum: Dict[str, List[str]] = {}
 
         if enable_checkpointing:
             self.checkpoint_storage = InMemoryCheckpointStorage()
@@ -1219,6 +1220,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         self._agent_stream_update_counts.clear()
         self._agent_stream_last_update_at.clear()
         self._agent_stream_guarded_invocation_keys.clear()
+        self._streaming_text_accum.clear()
         logger.info("workflow_state_reset", run_id=self.run_id)
 
     async def _emit_synthetic_agent_completion(self, agent_id: str, reason: str):
@@ -1241,6 +1243,10 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         self._agent_stream_update_counts.pop(agent_id, None)
         self._agent_stream_last_update_at.pop(agent_id, None)
 
+        # Use accumulated streaming text for the summary if available
+        synth_text = "".join(self._streaming_text_accum.get(agent_id, []))[:500]
+        summary_msg = synth_text if synth_text else f"{agent_name} completed via synthetic timeout guard."
+
         await self.emit_event(
             "executor.completed",
             {
@@ -1260,8 +1266,8 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                 "agentId": agent_id,
                 "agentName": agent_name,
                 "agent_name": agent_name,
-                "message_count": 0,
-                "summary": f"{agent_name} completed via synthetic timeout guard.",
+                "message_count": len(self._streaming_text_accum.get(agent_id, [])),
+                "summary": summary_msg,
                 "status": "completed",
                 "completionReason": "stream_timeout",
                 "terminationReason": reason,
@@ -1276,12 +1282,19 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                 agent_id=agent_id,
                 agent_name=agent_name,
                 success=True,
-                result_summary=f"{agent_name} completed with synthetic timeout guard.",
+                result_summary=summary_msg,
             )
+        if synth_text:
+            self.evidence.append({
+                "evidence_id": f"ev-{uuid.uuid4().hex[:8]}",
+                "type": "agent_response",
+                "agent": agent_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
         await self._emit_query_completions_and_evidence(
             agent_id=agent_id,
-            response_text=f"{agent_name} completed with synthetic timeout guard.",
-            message_count=0,
+            response_text=summary_msg,
+            message_count=len(self._streaming_text_accum.get(agent_id, [])),
         )
         await self._emit_progress(f"agent_completed:{agent_id}")
 
@@ -1425,11 +1438,65 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                 if isinstance(event, WorkflowOutputEvent):
                     final_output = event.data
 
+                # --- Capture specialist contributions from ExecutorCompletedEvent ---
+                if isinstance(event, ExecutorCompletedEvent):
+                    comp_executor_id = event.executor_id or "unknown"
+
+                    if comp_executor_id == self._coordinator_agent_id:
+                        # Coordinator: extract artifacts for the plan/scoring UI
+                        if not self._coordinator_artifacts_emitted:
+                            coord_text = ""
+                            if isinstance(event.data, list):
+                                for item in event.data:
+                                    if hasattr(item, "agent_response") and item.agent_response:
+                                        coord_text = self._extract_response_text(item.agent_response)
+                                        break
+                            if not coord_text:
+                                chunks = self._streaming_text_accum.get(comp_executor_id, [])
+                                if chunks:
+                                    coord_text = "".join(chunks)[:8000]
+                            if coord_text:
+                                await self._emit_coordinator_artifacts(coord_text)
+                    else:
+                        # Specialist agent: capture as agent contribution
+                        already_heard = any(r["agent"] == comp_executor_id for r in agent_responses)
+                        if not already_heard:
+                            resp_text = ""
+                            msg_count = 0
+                            # Extract from AgentExecutorResponse in completion data
+                            if isinstance(event.data, list):
+                                for item in event.data:
+                                    if hasattr(item, "agent_response") and item.agent_response:
+                                        resp_text = self._extract_response_text(item.agent_response)
+                                        msg_count = len(item.agent_response.messages) if item.agent_response.messages else 0
+                                        break
+                            # Fallback: accumulated streaming text
+                            if not resp_text:
+                                chunks = self._streaming_text_accum.get(comp_executor_id, [])
+                                if chunks:
+                                    resp_text = "".join(chunks)[:8000]
+                                    msg_count = 1
+                            if resp_text or comp_executor_id in self._agent_execution_counts:
+                                agent_responses.append({
+                                    "agent": comp_executor_id,
+                                    "messages": msg_count,
+                                    "result_summary": (resp_text or "Agent completed execution.")[:500],
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                })
+                                self.evidence.append({
+                                    "evidence_id": f"ev-{uuid.uuid4().hex[:8]}",
+                                    "type": "agent_response",
+                                    "agent": comp_executor_id,
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                })
+
                 if isinstance(event, AgentRunEvent):
                     response = event.data
                     if response is None:
                         continue
                     agent_name = event.executor_id or "unknown"
+                    if any(r["agent"] == agent_name for r in agent_responses):
+                        continue
                     result_summary = ""
                     if response.messages:
                         text = self._extract_response_text(response)
@@ -1446,6 +1513,15 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                         "type": "agent_response", "agent": agent_name,
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     })
+
+                # --- Accumulate streaming text from AgentRunUpdateEvent ---
+                if self._is_agent_update_event(event):
+                    upd_agent_id = event.executor_id or self._last_executor_id or "unknown"
+                    upd_data = event.data
+                    if upd_data is not None:
+                        chunk = getattr(upd_data, "text", None) or (upd_data if isinstance(upd_data, str) else "")
+                        if chunk:
+                            self._streaming_text_accum.setdefault(upd_agent_id, []).append(chunk)
         except _LoopCappedSignal:
             logger.info(
                 "workflow_loop_capped_graceful",
@@ -1470,6 +1546,28 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                             agent_id=agent_id,
                             reason="stream_completed_without_completion",
                         )
+
+            # Sweep: capture contributions from invoked agents not yet in agent_responses
+            for agent_id in list(self._agent_execution_counts.keys()):
+                if agent_id == self._coordinator_agent_id:
+                    continue
+                if any(r["agent"] == agent_id for r in agent_responses):
+                    continue
+                chunks = self._streaming_text_accum.get(agent_id, [])
+                if chunks:
+                    text = "".join(chunks)[:500]
+                    agent_responses.append({
+                        "agent": agent_id,
+                        "messages": 1,
+                        "result_summary": text,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                    self.evidence.append({
+                        "evidence_id": f"ev-{uuid.uuid4().hex[:8]}",
+                        "type": "agent_response",
+                        "agent": agent_id,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
 
             # Guarantee a coordinator.plan event reaches the UI
             if not self._coordinator_artifacts_emitted and self._is_bounded_orchestration_mode():
