@@ -1,7 +1,8 @@
 "use client";
 
 import { memo, useMemo } from "react";
-import { AlertTriangle, Gauge, Plane, Wifi } from "lucide-react";
+import Link from "next/link";
+import { AlertTriangle, Gauge, Plane, Wifi, LayoutGrid } from "lucide-react";
 import { useAviationStore } from "@/store/aviation-store";
 import { cn } from "@/lib/utils";
 import { TRACE_V2_ENABLED } from "@/lib/feature-flags";
@@ -110,6 +111,14 @@ function HeaderBarInner() {
               <span className="text-muted-foreground">{isConnected ? "Live stream" : "Offline"}</span>
             </div>
           )}
+
+          <Link
+            href="/inventory"
+            className="flex items-center gap-1 rounded-lg border border-border/60 px-2.5 py-1 text-[10px] font-semibold text-muted-foreground transition hover:border-av-sky/40 hover:text-av-sky"
+          >
+            <LayoutGrid className="h-3 w-3" />
+            <span className="hidden sm:inline">Inventory</span>
+          </Link>
 
           <button
             onClick={() => {

@@ -8,17 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import { slidePanel } from "@/lib/animation-variants";
 import { payloadString, type WorkflowEvent } from "@/types/aviation";
 import { cn } from "@/lib/utils";
-
-const SOURCE_COLORS: Record<string, string> = {
-  SQL: "#38bdf8",
-  KQL: "#14b8a6",
-  GRAPH: "#2dd4bf",
-  VECTOR_OPS: "#0ea5e9",
-  VECTOR_REG: "#0284c7",
-  VECTOR_AIRPORT: "#0369a1",
-  NOSQL: "#2563eb",
-  FABRIC_SQL: "#14b8a6",
-};
+import { SOURCE_COLORS } from "@/lib/aviation-constants";
 
 const TAB_ITEMS = [
   { id: "overview", label: "Overview" },

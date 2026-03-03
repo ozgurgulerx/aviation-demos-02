@@ -423,6 +423,13 @@ async def list_runs(
     }
 
 
+@app.get("/api/av/inventory")
+async def get_agent_inventory():
+    """Return full agent inventory with tools, instructions, and scenario mappings."""
+    from orchestrator.inventory import get_inventory
+    return get_inventory()
+
+
 @app.get("/api/av/workflows")
 async def list_workflows():
     """List canonical workflow variants used by smoke tests and UI-driven runs."""
