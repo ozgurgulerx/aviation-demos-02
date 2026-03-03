@@ -15,7 +15,8 @@ import re
 import uuid
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from openai import APIStatusError, RateLimitError, AuthenticationError
 
@@ -727,6 +728,46 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
     def _get_agent_profile(self, agent_id: str) -> Optional[AgentSelectionResult]:
         return self._agent_lookup.get(agent_id)
 
+    def _extract_text_from_content_item(self, item: Any) -> str:
+        if item is None:
+            return ""
+        if isinstance(item, str):
+            return item.strip()
+        if isinstance(item, dict):
+            for key in ("text", "message"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            for key in ("result", "output"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+                if value is not None:
+                    try:
+                        serialized = json.dumps(value, ensure_ascii=True)
+                    except Exception:
+                        serialized = str(value)
+                    if serialized.strip():
+                        return serialized.strip()
+            return ""
+
+        for key in ("text", "message"):
+            value = getattr(item, key, None)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for key in ("result", "output"):
+            value = getattr(item, key, None)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            if value is not None:
+                try:
+                    serialized = json.dumps(value, ensure_ascii=True)
+                except Exception:
+                    serialized = str(value)
+                if serialized.strip():
+                    return serialized.strip()
+        return ""
+
     def _extract_response_text(self, response: Any) -> str:
         messages = getattr(response, "messages", None) or []
         chunks: List[str] = []
@@ -743,20 +784,31 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             if isinstance(content, list):
                 text_parts = []
                 for part in content:
-                    if isinstance(part, str):
-                        text_parts.append(part)
-                    elif isinstance(part, dict):
-                        maybe_text = part.get("text")
-                        if isinstance(maybe_text, str):
-                            text_parts.append(maybe_text)
+                    extracted = self._extract_text_from_content_item(part)
+                    if extracted:
+                        text_parts.append(extracted)
                 if text_parts:
                     chunks.append(" ".join(text_parts))
                     continue
+
+            contents = getattr(msg, "contents", None)
+            if isinstance(contents, list):
+                text_parts = []
+                for part in contents:
+                    extracted = self._extract_text_from_content_item(part)
+                    if extracted:
+                        text_parts.append(extracted)
+                if text_parts:
+                    chunks.append(" ".join(text_parts))
+                    continue
+
             text = getattr(msg, "text", None)
             if isinstance(text, str) and text.strip():
                 chunks.append(text)
                 continue
-            chunks.append(str(msg))
+            msg_repr = str(msg).strip()
+            if msg_repr and "object at 0x" not in msg_repr:
+                chunks.append(msg_repr)
         merged = " ".join(chunks).strip()
         # Fallback: try .text property directly (e.g., AgentResponse.text)
         if not merged:
@@ -764,6 +816,43 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             if isinstance(direct_text, str) and direct_text.strip():
                 merged = direct_text.strip()
         return merged[:8000]
+
+    def _extract_text_and_message_count_from_executor_data(self, data: Any) -> Tuple[str, int]:
+        if data is None:
+            return "", 0
+
+        candidates = data if isinstance(data, list) else [data]
+        for candidate in candidates:
+            if candidate is None:
+                continue
+
+            agent_response = getattr(candidate, "agent_response", None)
+            if agent_response is not None:
+                response_text = self._extract_response_text(agent_response)
+                if not response_text:
+                    response_text = str(getattr(agent_response, "text", "") or "").strip()
+                messages = getattr(agent_response, "messages", None)
+                message_count = len(messages) if isinstance(messages, list) else (1 if response_text else 0)
+                if response_text:
+                    return response_text[:8000], message_count
+
+            full_conversation = getattr(candidate, "full_conversation", None)
+            if isinstance(full_conversation, list) and full_conversation:
+                response_text = self._extract_response_text(SimpleNamespace(messages=full_conversation))
+                if response_text:
+                    return response_text[:8000], len(full_conversation)
+
+            if hasattr(candidate, "messages"):
+                response_text = self._extract_response_text(candidate)
+                messages = getattr(candidate, "messages", None)
+                message_count = len(messages) if isinstance(messages, list) else (1 if response_text else 0)
+                if response_text:
+                    return response_text[:8000], message_count
+
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()[:8000], 1
+
+        return "", 0
 
     @staticmethod
     def _normalize_score(value: Any) -> float:
@@ -2011,12 +2100,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                         )
                         # Coordinator: extract artifacts for the plan/scoring UI
                         if not self._coordinator_artifacts_emitted:
-                            coord_text = ""
-                            if isinstance(event.data, list):
-                                for item in event.data:
-                                    if hasattr(item, "agent_response") and item.agent_response:
-                                        coord_text = self._extract_response_text(item.agent_response)
-                                        break
+                            coord_text, _ = self._extract_text_and_message_count_from_executor_data(event.data)
                             if not coord_text:
                                 chunks = self._streaming_text_accum.get(comp_executor_id, [])
                                 if chunks:
@@ -2027,36 +2111,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                         # Specialist agent: capture as agent contribution
                         already_heard = any(r["agent"] == comp_executor_id for r in agent_responses)
                         if not already_heard:
-                            resp_text = ""
-                            msg_count = 0
-
-                            # Path A: Extract from AgentExecutorResponse.agent_response in event.data
-                            if isinstance(event.data, list):
-                                for item in event.data:
-                                    ar = getattr(item, "agent_response", None)
-                                    if ar:
-                                        # Try _extract_response_text first (iterates messages)
-                                        resp_text = self._extract_response_text(ar)
-                                        if not resp_text:
-                                            # Try .text property directly
-                                            resp_text = getattr(ar, "text", "") or ""
-                                        msgs = getattr(ar, "messages", None)
-                                        msg_count = len(msgs) if msgs else (1 if resp_text else 0)
-                                        if resp_text:
-                                            break
-                                    # Try full_conversation as fallback
-                                    if not resp_text:
-                                        fc = getattr(item, "full_conversation", None)
-                                        if fc:
-                                            parts = []
-                                            for m in fc:
-                                                t = getattr(m, "text", None)
-                                                if t and isinstance(t, str) and t.strip():
-                                                    parts.append(t.strip())
-                                            if parts:
-                                                resp_text = " ".join(parts)[:8000]
-                                                msg_count = len(parts)
-                                                break
+                            resp_text, msg_count = self._extract_text_and_message_count_from_executor_data(event.data)
 
                             # Path B: Handoff snapshot (captured at HandoffSentEvent)
                             if not resp_text:
@@ -2082,11 +2137,11 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                                 extraction_path="event_data" if msg_count > 0 and not self._streaming_text_accum.get(comp_executor_id) else ("streaming" if msg_count > 0 else "none"),
                             )
 
-                            if resp_text or comp_executor_id in self._agent_execution_counts:
+                            if resp_text:
                                 agent_responses.append({
                                     "agent": comp_executor_id,
                                     "messages": msg_count,
-                                    "result_summary": (resp_text or "Agent completed execution.")[:500],
+                                    "result_summary": resp_text[:500],
                                     "timestamp": datetime.now(timezone.utc).isoformat(),
                                 })
                                 self.evidence.append({
@@ -2476,51 +2531,8 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                 streaming_chunks=len(self._streaming_text_accum.get(executor_id, [])),
             )
 
-            # Extract real content from multiple possible data formats
-            resp_text = ""
-            msg_count = 0
-
-            if event.data is not None:
-                data = event.data
-                # Format 1: list of AgentExecutorResponse (coordinator completions)
-                if isinstance(data, list):
-                    for item in data:
-                        ar = getattr(item, "agent_response", None)
-                        if ar:
-                            resp_text = self._extract_response_text(ar)
-                            if not resp_text:
-                                resp_text = getattr(ar, "text", "") or ""
-                            msgs = getattr(ar, "messages", None)
-                            msg_count = len(msgs) if msgs else (1 if resp_text else 0)
-                            if resp_text:
-                                break
-                        # Try full_conversation as fallback
-                        if not resp_text:
-                            fc = getattr(item, "full_conversation", None)
-                            if fc:
-                                parts = []
-                                for m in fc:
-                                    t = getattr(m, "text", None)
-                                    if t and isinstance(t, str) and t.strip():
-                                        parts.append(t.strip())
-                                if parts:
-                                    resp_text = " ".join(parts)[:8000]
-                                    msg_count = len(parts)
-                                    break
-                # Format 2: single AgentExecutorResponse
-                elif hasattr(data, "agent_response") and data.agent_response:
-                    resp_text = self._extract_response_text(data.agent_response)
-                    if not resp_text:
-                        resp_text = getattr(data.agent_response, "text", "") or ""
-                    msg_count = len(data.agent_response.messages) if getattr(data.agent_response, "messages", None) else (1 if resp_text else 0)
-                # Format 3: direct AgentResponse (has .messages)
-                elif hasattr(data, "messages"):
-                    resp_text = self._extract_response_text(data)
-                    msg_count = len(data.messages) if data.messages else 0
-                # Format 4: string
-                elif isinstance(data, str) and data.strip():
-                    resp_text = data.strip()[:8000]
-                    msg_count = 1
+            # Extract real content from all supported completion payload shapes.
+            resp_text, msg_count = self._extract_text_and_message_count_from_executor_data(event.data)
 
             # Fallback: handoff snapshot > accumulated streaming text
             if not resp_text:

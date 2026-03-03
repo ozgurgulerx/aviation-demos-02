@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 import pytest
 
-from agent_framework import AgentExecutorResponse, AgentResponse, AgentResponseUpdate, AgentRunEvent, AgentRunUpdateEvent, ChatMessage, Content, ExecutorCompletedEvent, ExecutorInvokedEvent, WorkflowRunState, WorkflowStatusEvent
+from agent_framework import AgentExecutorResponse, AgentResponse, AgentResponseUpdate, AgentRunEvent, AgentRunUpdateEvent, ChatMessage, Content, ExecutorCompletedEvent, ExecutorInvokedEvent, WorkflowOutputEvent, WorkflowRunState, WorkflowStatusEvent
 from agent_framework._workflows._handoff import HandoffSentEvent
 
 from orchestrator.agent_registry import AgentSelectionResult, SCENARIO_AGENTS
@@ -739,6 +739,101 @@ async def test_executor_completed_extracts_from_agent_executor_response():
 
 
 @pytest.mark.asyncio
+async def test_stream_workflow_extracts_single_executor_response_for_specialist():
+    class _FakeWorkflow:
+        def __init__(self, events):
+            self._events = events
+
+        async def run_stream(self, _input):
+            for event in self._events:
+                yield event
+
+    captured: list[tuple[str, dict]] = []
+
+    async def emit(event_type: str, payload: dict):
+        captured.append((event_type, payload))
+
+    engine = OrchestratorEngine(
+        run_id="test-stream-single-specialist",
+        event_emitter=emit,
+        workflow_type=WorkflowType.SEQUENTIAL,
+        enable_checkpointing=False,
+    )
+    specialist = _agent("specialist_single", "Specialist Single")
+    engine.selected_agents = [specialist]
+    engine._agent_lookup = {specialist.agent_id: specialist}
+
+    specialist_resp = AgentExecutorResponse(
+        executor_id=specialist.agent_id,
+        agent_response=AgentResponse(messages=[
+            ChatMessage(role="assistant", text="Crew swap plan ready with two reserve crews at ORD."),
+        ]),
+    )
+    engine.workflow = _FakeWorkflow([
+        ExecutorInvokedEvent(specialist.agent_id),
+        ExecutorCompletedEvent(specialist.agent_id, specialist_resp),
+        WorkflowOutputEvent({}, specialist.agent_id),
+    ])
+
+    result = await engine._stream_workflow("test")
+    assert result["agent_responses"]
+    assert result["agent_responses"][0]["agent"] == "specialist_single"
+    assert result["agent_responses"][0]["messages"] >= 1
+    assert "Crew swap plan ready" in result["agent_responses"][0]["result_summary"]
+    assert "completed execution" not in result["summary"]
+
+
+@pytest.mark.asyncio
+async def test_stream_workflow_extracts_single_executor_response_for_coordinator():
+    class _FakeWorkflow:
+        def __init__(self, events):
+            self._events = events
+
+        async def run_stream(self, _input):
+            for event in self._events:
+                yield event
+
+    captured: list[tuple[str, dict]] = []
+
+    async def emit(event_type: str, payload: dict):
+        captured.append((event_type, payload))
+
+    engine = OrchestratorEngine(
+        run_id="test-stream-single-coordinator",
+        event_emitter=emit,
+        workflow_type=WorkflowType.SEQUENTIAL,
+        enable_checkpointing=False,
+    )
+    coordinator = _agent("decision_coordinator", "Decision Coordinator", category="coordinator")
+    engine.selected_agents = [coordinator]
+    engine._agent_lookup = {coordinator.agent_id: coordinator}
+    engine._coordinator_agent_id = coordinator.agent_id
+
+    coordinator_json = (
+        '{"summary":"Divert to DTW and protect long-haul banks.",'
+        '"finalAnswer":"Divert to DTW immediately and trigger reserve-crew swaps.",'
+        '"options":[],'
+        '"timeline":[],'
+        '"selectedOptionId":""}'
+    )
+    coordinator_resp = AgentExecutorResponse(
+        executor_id=coordinator.agent_id,
+        agent_response=AgentResponse(messages=[
+            ChatMessage(role="assistant", text=coordinator_json),
+        ]),
+    )
+    engine.workflow = _FakeWorkflow([
+        ExecutorInvokedEvent(coordinator.agent_id),
+        ExecutorCompletedEvent(coordinator.agent_id, coordinator_resp),
+        WorkflowOutputEvent({}, coordinator.agent_id),
+    ])
+
+    result = await engine._stream_workflow("test")
+    assert result["answer"] == "Divert to DTW immediately and trigger reserve-crew swaps."
+    assert result.get("finalAnswer") == "Divert to DTW immediately and trigger reserve-crew swaps."
+
+
+@pytest.mark.asyncio
 async def test_executor_completed_extracts_from_full_conversation():
     """agent.completed should extract text from full_conversation when agent_response is empty."""
     captured: list[tuple[str, dict]] = []
@@ -929,6 +1024,18 @@ async def test_streaming_accum_captures_function_result_content():
     assert len(chunks) == 1
     assert "DTW" in chunks[0]
     assert "ILS 21L" in chunks[0]
+
+
+def test_extract_response_text_reads_message_contents_function_result():
+    engine = OrchestratorEngine(run_id="test-contents-function-result", enable_checkpointing=False)
+    response = AgentResponse(messages=[
+        ChatMessage(
+            role="assistant",
+            contents=[Content.from_function_result(call_id="call_1", result="DTW recommended with ILS 21L.")],
+        )
+    ])
+    extracted = engine._extract_response_text(response)
+    assert "DTW recommended" in extracted
 
 
 @pytest.mark.asyncio
