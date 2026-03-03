@@ -38,6 +38,7 @@ export interface Agent {
   description: string;
   dataSources: string[];
   scenarios: string[];
+  outputs: string[];
   instructions: string;
   tools: AgentTool[];
   modelTier: string;
@@ -69,9 +70,10 @@ interface AgentCardProps {
   agent: Agent;
   highlighted: boolean;
   onClick: () => void;
+  onDataSourceClick?: (agent: Agent) => void;
 }
 
-export function AgentCard({ agent, highlighted, onClick }: AgentCardProps) {
+export function AgentCard({ agent, highlighted, onClick, onDataSourceClick }: AgentCardProps) {
   const Icon = ICONS[agent.icon] || Radar;
   const isPlaceholder = agent.category === "placeholder";
 
@@ -136,13 +138,33 @@ export function AgentCard({ agent, highlighted, onClick }: AgentCardProps) {
         {agent.description}
       </p>
 
+      {/* Outputs (first 2) */}
+      {agent.outputs.length > 0 && (
+        <div className="mt-2 space-y-0.5">
+          {agent.outputs.slice(0, 2).map((output) => (
+            <p
+              key={output}
+              className="line-clamp-1 flex items-start gap-1 text-[9px] leading-tight text-muted-foreground/80"
+            >
+              <span className="mt-[3px] h-1 w-1 shrink-0 rounded-full" style={{ backgroundColor: agent.color }} />
+              {output}
+            </p>
+          ))}
+        </div>
+      )}
+
       {/* Data source pills */}
       {agent.dataSources.length > 0 && (
         <div className="mt-2 flex flex-wrap gap-1">
           {agent.dataSources.map((ds) => (
-            <span
+            <button
               key={ds}
-              className="rounded px-1.5 py-[1px] text-[8px] font-semibold tracking-wide"
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onDataSourceClick?.(agent);
+              }}
+              className="rounded px-1.5 py-[1px] text-[8px] font-semibold tracking-wide transition hover:brightness-125"
               style={{
                 backgroundColor: `${SOURCE_COLORS[ds] || "#666"}18`,
                 color: SOURCE_COLORS[ds] || "#666",
@@ -150,7 +172,7 @@ export function AgentCard({ agent, highlighted, onClick }: AgentCardProps) {
               }}
             >
               {ds}
-            </span>
+            </button>
           ))}
         </div>
       )}
@@ -158,7 +180,7 @@ export function AgentCard({ agent, highlighted, onClick }: AgentCardProps) {
       {/* Phase badge for placeholders */}
       {isPlaceholder && (
         <span className="mt-2 inline-flex self-start rounded-full border border-border/50 bg-muted/30 px-2 py-0.5 text-[9px] font-medium text-muted-foreground">
-          Phase {agent.phase}
+          Phase 2 — Planned
         </span>
       )}
     </button>

@@ -13,7 +13,7 @@ import os
 import re
 import uuid
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from openai import APIStatusError, RateLimitError, AuthenticationError
@@ -144,6 +144,10 @@ class OrchestratorEngine:
         self._agent_stream_update_counts: Dict[str, int] = {}
         self._agent_stream_last_update_at: Dict[str, datetime] = {}
         self._agent_stream_guarded_invocation_keys: set[str] = set()
+        self._agent_stream_throttle_at: Dict[str, datetime] = {}
+        self._stream_throttle_td = timedelta(
+            milliseconds=int(os.getenv("STREAM_THROTTLE_MS", "500"))
+        )
 
         if enable_checkpointing:
             self.checkpoint_storage = InMemoryCheckpointStorage()
@@ -716,7 +720,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                 continue
             chunks.append(str(msg))
         merged = " ".join(chunks).strip()
-        return merged[:1200]
+        return merged[:8000]
 
     @staticmethod
     def _normalize_score(value: Any) -> float:
@@ -805,6 +809,30 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             "selectedOptionId": selected_option_id,
             "summary": summary or "Coordinator synthesized specialist findings.",
         }
+
+    def _build_fused_summary(self, agent_responses: List[Dict[str, Any]]) -> str:
+        """Build a human-readable summary from accumulated agent evidence and responses."""
+        parts: List[str] = []
+        result_snippets: List[str] = []
+        for resp in agent_responses:
+            agent = resp.get("agent", "unknown")
+            messages = resp.get("messages", 0)
+            parts.append(f"{agent} ({messages} messages)")
+            result_text = resp.get("result_summary", "")
+            if result_text:
+                result_snippets.append(f"**{agent}**: {result_text}")
+
+        evidence_count = len(self.evidence)
+        agent_count = len(agent_responses)
+
+        header = f"Analysis complete. {agent_count} specialist agents contributed findings"
+        if parts:
+            header += f": {', '.join(parts)}"
+        header += f". {evidence_count} evidence items collected."
+
+        if result_snippets:
+            return header + "\n\n" + "\n\n".join(result_snippets)
+        return header
 
     def _parse_coordinator_artifacts(self, response_text: str) -> Dict[str, Any]:
         parsed_json = self._extract_json_object_from_text(response_text)
@@ -1375,9 +1403,15 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                     if response is None:
                         continue
                     agent_name = event.executor_id or "unknown"
+                    result_summary = ""
+                    if response.messages:
+                        text = self._extract_response_text(response)
+                        if text:
+                            result_summary = text[:500]
                     agent_responses.append({
                         "agent": agent_name,
                         "messages": len(response.messages) if response.messages else 0,
+                        "result_summary": result_summary,
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     })
                     self.evidence.append({
@@ -1410,7 +1444,27 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                             reason="stream_completed_without_completion",
                         )
 
+            # Guarantee a coordinator.plan event reaches the UI
+            if not self._coordinator_artifacts_emitted and self._is_bounded_orchestration_mode():
+                summary = self._build_fused_summary(agent_responses)
+                await self.emit_event("coordinator.plan", {
+                    "selectedOptionId": "",
+                    "timeline": [],
+                    "summary": summary,
+                    "options": [],
+                })
+                self._coordinator_artifacts_emitted = True
+                logger.info(
+                    "fallback_coordinator_plan_emitted",
+                    run_id=self.run_id,
+                    agents_heard=len(agent_responses),
+                )
+
+        fused_summary = self._build_fused_summary(agent_responses)
+
         if isinstance(final_output, dict):
+            if "summary" not in final_output:
+                final_output["summary"] = fused_summary
             return final_output
 
         return {
@@ -1418,7 +1472,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             "scenario": self.scenario,
             "agent_responses": agent_responses,
             "evidence_count": len(self.evidence),
-            "summary": f"Problem analyzed by {len(agent_responses)} agents in {self.scenario} scenario",
+            "summary": fused_summary,
         }
 
     async def _process_workflow_event(self, event: WorkflowEvent):
@@ -1698,36 +1752,30 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             next_progress = min(92.0, self._agent_progress_pct.get(executor_id, 5.0) + 8.0)
             self._agent_progress_pct[executor_id] = next_progress
             self._active_agent_ids.add(executor_id)
+            now = datetime.now(timezone.utc)
             if self._is_deterministic_mode():
-                now = datetime.now(timezone.utc)
                 update_count = self._agent_stream_update_counts.get(executor_id, 0) + 1
                 self._agent_stream_update_counts[executor_id] = update_count
                 self._agent_stream_last_update_at[executor_id] = now
 
-            await self.emit_event(
-                "agent.streaming",
-                {
-                    **event_data,
-                    "is_streaming": True,
-                    "agentId": executor_id,
-                    "agentName": agent_name,
-                    "percentComplete": next_progress,
-                    "currentStep": "streaming_analysis",
-                    "executionCount": self._agent_execution_counts.get(executor_id, 0),
-                },
-            )
-            await self.emit_event(
-                "agent.progress",
-                {
-                    **event_data,
-                    "agentId": executor_id,
-                    "agentName": agent_name,
-                    "percentComplete": next_progress,
-                    "currentStep": "streaming_analysis",
-                    "executionCount": self._agent_execution_counts.get(executor_id, 0),
-                },
-            )
-            await self._emit_progress(f"agent_streaming:{executor_id}")
+            # Throttle: emit at most one consolidated event per _stream_throttle_td per agent
+            last_emit = self._agent_stream_throttle_at.get(executor_id)
+            if last_emit and (now - last_emit) < self._stream_throttle_td:
+                # Under throttle window — skip all emits, just track progress internally
+                pass
+            else:
+                self._agent_stream_throttle_at[executor_id] = now
+                await self.emit_event(
+                    "agent.progress",
+                    {
+                        **event_data,
+                        "agentId": executor_id,
+                        "agentName": agent_name,
+                        "percentComplete": next_progress,
+                        "currentStep": "streaming_analysis",
+                        "executionCount": self._agent_execution_counts.get(executor_id, 0),
+                    },
+                )
             return
 
         if isinstance(event, WorkflowOutputEvent):

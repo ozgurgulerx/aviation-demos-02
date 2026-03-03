@@ -3,7 +3,7 @@
 import { memo, useState, useEffect, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import * as Tabs from "@radix-ui/react-tabs";
-import { X, Terminal, Wrench, Database, Map } from "lucide-react";
+import { X, Terminal, Wrench, Database, Map, FileOutput } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { SOURCE_COLORS } from "@/lib/aviation-constants";
 import type { Agent, ScenarioConfig } from "./agent-card";
@@ -24,17 +24,19 @@ interface AgentDetailModalProps {
   onClose: () => void;
   scenarios: Record<string, ScenarioConfig>;
   allAgents: Agent[];
+  initialTab?: string;
 }
 
 const TAB_ITEMS = [
   { id: "prompt", label: "Prompt", icon: Terminal },
   { id: "tools", label: "Tools", icon: Wrench },
+  { id: "outputs", label: "Outputs", icon: FileOutput },
   { id: "datasources", label: "Data Sources", icon: Database },
   { id: "scenarios", label: "Scenarios", icon: Map },
 ] as const;
 
-function AgentDetailModalInner({ agent, onClose, scenarios, allAgents }: AgentDetailModalProps) {
-  const [activeTab, setActiveTab] = useState("prompt");
+function AgentDetailModalInner({ agent, onClose, scenarios, allAgents, initialTab }: AgentDetailModalProps) {
+  const [activeTab, setActiveTab] = useState(initialTab || "prompt");
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent) => {
@@ -58,8 +60,8 @@ function AgentDetailModalInner({ agent, onClose, scenarios, allAgents }: AgentDe
 
   // Reset tab when agent changes
   useEffect(() => {
-    setActiveTab("prompt");
-  }, [agent?.id]);
+    setActiveTab(initialTab || "prompt");
+  }, [agent?.id, initialTab]);
 
   const agentScenarios = Object.entries(scenarios).filter(
     ([, config]) =>
@@ -159,7 +161,7 @@ function AgentDetailModalInner({ agent, onClose, scenarios, allAgents }: AgentDe
                     </div>
                   ) : (
                     <p className="text-xs text-muted-foreground">
-                      No system prompt available (Phase {agent.phase} placeholder).
+                      This agent is planned for Phase 2. System prompt and behavioral instructions will be defined during implementation.
                     </p>
                   )}
                 </Tabs.Content>
@@ -168,7 +170,7 @@ function AgentDetailModalInner({ agent, onClose, scenarios, allAgents }: AgentDe
                 <Tabs.Content value="tools" className="space-y-3 p-4">
                   {agent.tools.length === 0 ? (
                     <p className="text-xs text-muted-foreground">
-                      No tools defined (Phase {agent.phase} placeholder).
+                      This agent is planned for Phase 2. Tool functions will be implemented based on the assigned data sources.
                     </p>
                   ) : (
                     agent.tools.map((tool) => (
@@ -214,6 +216,30 @@ function AgentDetailModalInner({ agent, onClose, scenarios, allAgents }: AgentDe
                         )}
                       </div>
                     ))
+                  )}
+                </Tabs.Content>
+
+                {/* Outputs tab */}
+                <Tabs.Content value="outputs" className="space-y-2 p-4">
+                  {agent.outputs && agent.outputs.length > 0 ? (
+                    agent.outputs.map((output) => (
+                      <div
+                        key={output}
+                        className="flex items-start gap-3 rounded-lg border border-av-sky/14 bg-av-surface/56 p-3"
+                      >
+                        <div
+                          className="mt-0.5 w-1.5 shrink-0 rounded-full"
+                          style={{ backgroundColor: agent.color, minHeight: 24 }}
+                        />
+                        <p className="text-xs leading-relaxed text-foreground/90">
+                          {output}
+                        </p>
+                      </div>
+                    ))
+                  ) : (
+                    <p className="text-xs text-muted-foreground">
+                      Outputs will be defined during Phase 2 implementation.
+                    </p>
                   )}
                 </Tabs.Content>
 

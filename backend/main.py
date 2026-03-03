@@ -556,6 +556,9 @@ async def execute_workflow(
                 "orchestrator.run_started": EventKind.RUN_STARTED,
                 "orchestrator.run_completed": EventKind.RUN_COMPLETED,
                 "orchestrator.run_failed": EventKind.RUN_FAILED,
+                "coordinator.scoring": EventKind.COORDINATOR_SCORING,
+                "coordinator.plan": EventKind.COORDINATOR_PLAN,
+                "recovery.option": EventKind.RECOVERY_OPTION,
             }
             if event_type in aliases:
                 return aliases[event_type]
@@ -638,13 +641,20 @@ async def execute_workflow(
         # Update run status
         await run_store.update_run_status(run_id, RunStatus.COMPLETED)
 
-        # Emit completion
+        # Emit completion with summary for the UI
+        summary = ""
+        if isinstance(result, dict):
+            summary = result.get("summary", "")
+            if not summary:
+                summary = f"Analysis complete. {result.get('evidence_count', 0)} evidence items collected."
+
         await event_bus.publish(WorkflowEvent(
             run_id=run_id,
             kind=EventKind.RUN_COMPLETED,
-            message=f"Aviation solver completed using {workflow_type} workflow",
+            message=summary or f"Aviation solver completed using {workflow_type} workflow",
             payload={
                 "result": result,
+                "summary": summary,
                 "workflow_type": workflow_type,
                 "orchestration_mode": orchestration_mode,
             },

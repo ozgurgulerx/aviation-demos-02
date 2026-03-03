@@ -22,6 +22,7 @@ export default function InventoryPage() {
   const [loading, setLoading] = useState(true);
   const [selectedAgent, setSelectedAgent] = useState<Agent | null>(null);
   const [activeScenario, setActiveScenario] = useState<string | null>(null);
+  const [initialTab, setInitialTab] = useState<string | undefined>(undefined);
 
   useEffect(() => {
     const ac = new AbortController();
@@ -56,7 +57,15 @@ export default function InventoryPage() {
     };
   }, [data]);
 
-  const handleCloseModal = useCallback(() => setSelectedAgent(null), []);
+  const handleCloseModal = useCallback(() => {
+    setSelectedAgent(null);
+    setInitialTab(undefined);
+  }, []);
+
+  const handleDataSourceClick = useCallback((agent: Agent) => {
+    setInitialTab("datasources");
+    setSelectedAgent(agent);
+  }, []);
 
   if (loading) {
     return (
@@ -189,6 +198,7 @@ export default function InventoryPage() {
                   highlightedAgentIds.has(agent.id)
                 }
                 onClick={() => setSelectedAgent(agent)}
+                onDataSourceClick={handleDataSourceClick}
               />
             ))}
           </div>
@@ -210,17 +220,21 @@ export default function InventoryPage() {
                   highlightedAgentIds.has(agent.id)
                 }
                 onClick={() => setSelectedAgent(agent)}
+                onDataSourceClick={handleDataSourceClick}
               />
             ))}
           </div>
 
           {/* Placeholders */}
-          <h2 className="mb-3 mt-6 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-            Phase 2 — Placeholders
+          <h2 className="mb-2 mt-6 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+            Phase 2 — Planned Agents
             <span className="ml-1.5 text-[10px] font-normal text-muted-foreground/60">
               ({grouped.placeholders.length})
             </span>
           </h2>
+          <p className="mb-3 text-[11px] leading-relaxed text-muted-foreground/70">
+            These agents are planned for Phase 2. They have scenario assignments and data source mappings defined but do not yet have system prompts, tools, or active orchestration wiring.
+          </p>
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
             {grouped.placeholders.map((agent) => (
               <AgentCard
@@ -228,6 +242,7 @@ export default function InventoryPage() {
                 agent={agent}
                 highlighted={false}
                 onClick={() => setSelectedAgent(agent)}
+                onDataSourceClick={handleDataSourceClick}
               />
             ))}
           </div>
@@ -240,6 +255,7 @@ export default function InventoryPage() {
         onClose={handleCloseModal}
         scenarios={data.scenarios}
         allAgents={data.agents}
+        initialTab={initialTab}
       />
     </div>
   );

@@ -176,16 +176,25 @@ function OrchestrationCanvasInner() {
   );
   const prevTopologyRef = useRef<string>("");
   const assembleTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const rafRef = useRef<number | null>(null);
   const [isAssembling, setIsAssembling] = useState(false);
 
-  // Stable serialization keys for memoization
-  const agentKey = useMemo(
+  // Layout key: only changes when agent set, inclusion, category, or coarse status changes.
+  // Maps fine-grained statuses to 3 coarse buckets so streaming progress ticks don't
+  // trigger a full node rebuild.
+  const layoutKey = useMemo(
     () =>
       agentList
-        .map(
-          (a) =>
-            `${a.id}:${a.status}:${a.evidence.length}:${a.activeQuery ?? ""}:${a.currentObjective ?? ""}:${a.confidence ?? ""}`
-        )
+        .map((a) => {
+          const coarseStatus =
+            a.status === "done" || a.status === "error" || a.status === "excluded"
+              ? a.status
+              : a.status === "idle"
+              ? "idle"
+              : "active"; // thinking, querying, activated, streaming → all "active"
+          return `${a.id}:${coarseStatus}:${a.included ? 1 : 0}:${a.category}:${a.evidence.length}`;
+        })
+        .sort()
         .join("|"),
     [agentList]
   );
@@ -334,40 +343,48 @@ function OrchestrationCanvasInner() {
       initialEdges: assembledEdges,
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agentKey, edgeKey, hasAgents]);
+  }, [layoutKey, edgeKey, hasAgents]);
 
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>(radialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(initialEdges);
 
-  // Sync when agent state changes
+  // Sync when agent state changes — RAF-throttled to avoid multiple updates per frame
   useEffect(() => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
     if (assembleTimerRef.current) {
       clearTimeout(assembleTimerRef.current);
       assembleTimerRef.current = null;
     }
 
-    if (radialNodes.length > 0) {
-      const topologyChanged = prevTopologyRef.current !== topologyKey;
-      prevTopologyRef.current = topologyKey;
-      setEdges(initialEdges);
-      if (topologyChanged) {
-        setIsAssembling(true);
-        setNodes(clusterNodes);
-        assembleTimerRef.current = setTimeout(() => {
-          setNodes(radialNodes);
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = null;
+      if (radialNodes.length > 0) {
+        const topologyChanged = prevTopologyRef.current !== topologyKey;
+        prevTopologyRef.current = topologyKey;
+        setEdges(initialEdges);
+        if (topologyChanged) {
+          setIsAssembling(true);
+          setNodes(clusterNodes);
+          assembleTimerRef.current = setTimeout(() => {
+            setNodes(radialNodes);
+            setIsAssembling(false);
+          }, 260);
+        } else {
           setIsAssembling(false);
-        }, 260);
+          setNodes(radialNodes);
+        }
       } else {
         setIsAssembling(false);
-        setNodes(radialNodes);
+        setNodes([]);
+        setEdges([]);
       }
-    } else {
-      setIsAssembling(false);
-      setNodes([]);
-      setEdges([]);
-    }
+    });
 
     return () => {
+      if (rafRef.current) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
       if (assembleTimerRef.current) {
         clearTimeout(assembleTimerRef.current);
         assembleTimerRef.current = null;

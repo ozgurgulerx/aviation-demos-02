@@ -105,6 +105,30 @@ function uniqueId(prefix: string): string {
 // Event deduplication set
 const _seenEventIds = new Set<string>();
 
+// Deferred event-rate calculation (runs every 2 s instead of on every event)
+let _eventRateTimer: ReturnType<typeof setInterval> | null = null;
+function _ensureEventRateTimer(
+  getState: () => AviationStore,
+  setState: (partial: Partial<AviationStore>) => void,
+) {
+  if (_eventRateTimer) return;
+  _eventRateTimer = setInterval(() => {
+    const state = getState();
+    if (state.events.length === 0) return;
+    const cutoffMs = Date.now() - 60_000;
+    const rate = state.events.filter((e) => {
+      const t = Date.parse(e.ts);
+      return Number.isFinite(t) && t >= cutoffMs && e.kind !== EventKinds.HEARTBEAT;
+    }).length;
+    if (rate !== state.eventRatePerMin) {
+      setState({
+        eventRatePerMin: rate,
+        runProgress: { ...state.runProgress, eventRatePerMin: rate },
+      });
+    }
+  }, 2000);
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // Store interface
 // ═══════════════════════════════════════════════════════════════════
@@ -292,6 +316,9 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
   },
 
   addEvent: (event) => {
+    // Start deferred event-rate timer on first event
+    _ensureEventRateTimer(get, set);
+
     // Event deduplication — skip events already processed
     const dedupKey = event.stream_id || event.event_id;
     if (dedupKey && _seenEventIds.has(dedupKey)) return;
@@ -306,15 +333,83 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
     }
 
     const effectiveTs = event.ts || new Date().toISOString();
+    const payload = event.payload || {};
+    const isStreamingEvent =
+      event.kind === EventKinds.AGENT_PROGRESS ||
+      event.kind === EventKinds.AGENT_STREAMING;
+
+    // ── Fast path: high-frequency streaming events → single set() ──
+    if (isStreamingEvent) {
+      const agentId =
+        payloadString(payload, "agentId") ||
+        payloadString(payload, "executor_id") ||
+        event.agent_name ||
+        "";
+
+      set((state) => {
+        const recentEvents = [...state.events, event].slice(-MAX_STORED_EVENTS);
+        const runPct = payloadNumber(payload, "runProgressPct", state.runProgress.overallPct);
+        const baseResult = {
+          events: recentEvents,
+          lastEventId: event.stream_id || event.event_id,
+          lastMeaningfulEventAt: effectiveTs,
+        };
+
+        if (!agentId || !state.agents[agentId]) {
+          return {
+            ...baseResult,
+            runProgress: {
+              ...state.runProgress,
+              overallPct: Math.max(state.runProgress.overallPct, runPct),
+              lastEventKind: event.kind,
+              lastUpdateAt: effectiveTs,
+              isLive: state.isConnected,
+            },
+          };
+        }
+
+        const reportedRunPct = payloadNumber(payload, "runProgressPct", -1);
+        const reportedCurrentStep = payloadString(payload, "currentStep");
+        const percentComplete = payloadNumber(
+          payload,
+          "percentComplete",
+          Math.min((state.agents[agentId].percentComplete ?? 0) + 6, 92),
+        );
+        const currentStep = payloadString(payload, "currentStep", "streaming");
+        const nextActiveIds = state.activeAgentIds.includes(agentId)
+          ? state.activeAgentIds
+          : [...state.activeAgentIds, agentId];
+
+        return {
+          ...baseResult,
+          agents: {
+            ...state.agents,
+            [agentId]: {
+              ...incrementAgentTrace(state.agents[agentId], event.ts),
+              status: "thinking" as const,
+              currentStep,
+              lastAction: "streaming",
+              percentComplete,
+            },
+          },
+          activeAgentIds: nextActiveIds,
+          runProgress: {
+            ...state.runProgress,
+            overallPct: Math.max(state.runProgress.overallPct, runPct),
+            agentsRunning: nextActiveIds.length,
+            currentStep: reportedCurrentStep || currentStep,
+            lastEventKind: event.kind,
+            lastUpdateAt: effectiveTs,
+            isLive: state.isConnected,
+          },
+        };
+      });
+      return; // skip updateRunFromEvent & processAgentEvent
+    }
+
+    // ── Normal path: merge event-list + run-metadata update into one set() ──
     set((state) => {
       const recentEvents = [...state.events, event].slice(-MAX_STORED_EVENTS);
-      const cutoffMs = Date.now() - 60_000;
-      const eventRatePerMin = recentEvents.filter((e) => {
-        const t = Date.parse(e.ts);
-        return Number.isFinite(t) && t >= cutoffMs && e.kind !== EventKinds.HEARTBEAT;
-      }).length;
-
-      const payload = event.payload || {};
       const runPct = payloadNumber(payload, "runProgressPct", state.runProgress.overallPct);
       const nextProgress: RunProgress = {
         ...state.runProgress,
@@ -330,24 +425,68 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
         currentStep: payloadString(payload, "currentStep", state.runProgress.currentStep),
         lastEventKind: event.kind,
         lastUpdateAt: effectiveTs,
-        eventRatePerMin,
         isLive: state.isConnected,
       };
+
+      // Inline updateRunFromEvent — compute updated currentRun in same set()
+      let currentRun = state.currentRun;
+      if (currentRun) {
+        const run = { ...currentRun };
+        const updateStage = (stageId: string, updater: (s: Stage) => Stage) => {
+          run.stages = run.stages.map((s) =>
+            s.stage_id === stageId ? updater({ ...s }) : s
+          );
+        };
+        switch (event.kind) {
+          case EventKinds.STAGE_STARTED:
+            if (event.stage_id) {
+              run.current_stage = event.stage_id;
+              updateStage(event.stage_id, (s) => ({ ...s, status: "running", started_at: event.ts }));
+            }
+            break;
+          case EventKinds.STAGE_COMPLETED:
+            if (event.stage_id) {
+              updateStage(event.stage_id, (s) => ({ ...s, status: "succeeded", completed_at: event.ts, duration_ms: event.duration_ms }));
+              run.stages_completed = run.stages.filter((s) => s.status === "succeeded" || s.status === "skipped").length;
+              run.progress_pct = (run.stages_completed / run.total_stages) * 100;
+            }
+            break;
+          case EventKinds.STAGE_FAILED:
+            if (event.stage_id) {
+              updateStage(event.stage_id, (s) => ({ ...s, status: "failed", error_message: event.message }));
+            }
+            break;
+          case EventKinds.RUN_COMPLETED:
+            run.status = "completed";
+            run.completed_at = event.ts;
+            break;
+          case EventKinds.RUN_FAILED:
+            run.status = "failed";
+            run.error_message = event.message;
+            break;
+        }
+        run.event_count = recentEvents.length;
+        currentRun = run;
+      }
 
       return {
         events: recentEvents,
         lastEventId: event.stream_id || event.event_id,
         lastMeaningfulEventAt: isMeaningfulEvent(event.kind) ? effectiveTs : state.lastMeaningfulEventAt,
-        eventRatePerMin,
         runProgress: nextProgress,
+        currentRun,
       };
     });
-    get().updateRunFromEvent(event);
+    // processAgentEvent handles all remaining agent-specific state updates
     get().processAgentEvent(event);
   },
 
   clearEvents: () => {
     _seenEventIds.clear();
+    if (_eventRateTimer) {
+      clearInterval(_eventRateTimer);
+      _eventRateTimer = null;
+    }
     set({
       events: [],
       currentRunId: null,
@@ -1200,6 +1339,32 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
       }
 
       case EventKinds.RUN_COMPLETED: {
+        const completionSummary = payloadString(payload, "summary");
+        // Add fused-answer chat message so the user sees a final answer
+        if (completionSummary) {
+          get().addChatMessage({
+            id: `completion-${event.event_id}`,
+            role: "assistant",
+            content: completionSummary,
+          });
+        }
+        // If recovery plan is still empty, try to populate from result
+        if (!get().recoveryPlan) {
+          const result = payload.result as Record<string, unknown> | undefined;
+          if (result?.summary) {
+            set({
+              recoveryPlan: {
+                selectedOptionId: (result.selectedOptionId as string) || "",
+                summary: result.summary as string,
+                timeline: Array.isArray(result.timeline) ? result.timeline : [],
+                options: get().recoveryOptions,
+                criteria: ["delay_reduction", "crew_margin", "safety_score", "cost_impact", "passenger_impact"],
+              },
+              bottomDrawerTab: "plan",
+              bottomDrawerOpen: true,
+            });
+          }
+        }
         set((state) => ({
           runProgress: {
             ...state.runProgress,
@@ -1217,6 +1382,15 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
       }
 
       case EventKinds.RUN_FAILED: {
+        const errorMsg =
+          payloadString(payload, "error") ||
+          event.message ||
+          "Analysis failed";
+        get().addChatMessage({
+          id: `failure-${event.event_id}`,
+          role: "assistant",
+          content: `Analysis failed: ${errorMsg}`,
+        });
         set((state) => ({
           runProgress: {
             ...state.runProgress,

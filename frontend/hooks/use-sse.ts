@@ -73,7 +73,9 @@ export function useSSE({ runId, onEvent, onError, enabled = true }: UseSSEOption
           return;
         }
 
-        console.log("[SSE] Event:", event.kind, event.message);
+        if (event.kind !== EventKinds.AGENT_STREAMING && event.kind !== EventKinds.AGENT_PROGRESS) {
+          console.log("[SSE] Event:", event.kind, event.message);
+        }
         addEvent(event);
         onEventRef.current?.(event);
 

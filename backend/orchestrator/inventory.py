@@ -180,6 +180,7 @@ def get_inventory() -> dict:
             "description": agent_def.description,
             "dataSources": agent_def.data_sources,
             "scenarios": agent_def.scenarios,
+            "outputs": agent_def.outputs,
             "instructions": instructions,
             "tools": tools,
             "modelTier": "agent",
@@ -195,6 +196,6 @@ def get_inventory() -> dict:
     _cached_inventory = {
         "agents": agents,
         "scenarios": scenarios,
-        "orchestrationPatterns": ["sequential", "handoff_llm_directed", "deterministic_parallel"],
+        "orchestrationPatterns": ["sequential", "concurrent", "group_chat", "handoff", "magentic"],
     }
     return _cached_inventory
