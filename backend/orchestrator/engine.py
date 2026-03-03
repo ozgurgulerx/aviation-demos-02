@@ -389,8 +389,11 @@ class OrchestratorEngine:
             )
             await self._emit_stage_completed("synthesize_output", "Synthesize Output", synth_started_at)
 
+            summary = result.get("summary", "") if isinstance(result, dict) else ""
             await self.emit_event("orchestrator.run_completed", {
-                "result": result, "decision_count": len(self.decisions),
+                "result": result,
+                "summary": summary,
+                "decision_count": len(self.decisions),
                 "evidence_count": len(self.evidence),
                 "scenario": self.scenario,
                 "orchestration_mode": self.orchestration_mode,
@@ -1095,14 +1098,19 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
 
         Each agent round-trip (coordinator → specialist → coordinator) involves
         multiple real LLM calls. The base 600s budget is too tight when 5+ agents
-        are in play with real Azure OpenAI latency.
+        are in play with real Azure OpenAI latency. The timeout must also cover
+        the streaming loop's idle-detection window (max_idle_loops × stream_timeout)
+        so the outer timeout never preempts the inner idle break.
         """
         base = self._deterministic_execution_timeout_seconds
         if not self._is_llm_directed_mode():
             return base
         n_agents = len(self.selected_agents) if self.selected_agents else 1
-        # 120s per agent + 180s for selection/synthesis overhead, floor at base
-        return max(base, 120 * n_agents + 180)
+        agent_budget = 120 * n_agents + 180
+        # idle-loop budget: stream_timeout_seconds × max_idle_loops (2)
+        stream_timeout = max(60, agent_budget // 4)
+        idle_budget = stream_timeout * 2
+        return max(base, agent_budget + idle_budget)
 
     async def _execute_workflow_with_events(self, input_message: str) -> Dict[str, Any]:
         max_retries = 3

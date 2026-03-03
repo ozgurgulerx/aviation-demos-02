@@ -1247,6 +1247,14 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
           bottomDrawerTab: "plan",
           bottomDrawerOpen: true,
         });
+        const planSummary = payloadString(payload, "summary");
+        if (planSummary) {
+          get().addChatMessage({
+            id: `plan-${event.event_id}`,
+            role: "assistant",
+            content: planSummary,
+          });
+        }
         break;
       }
 
@@ -1339,7 +1347,9 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
       }
 
       case EventKinds.RUN_COMPLETED: {
-        const completionSummary = payloadString(payload, "summary");
+        const completionSummary =
+          payloadString(payload, "summary") ||
+          ((payload.result as Record<string, unknown>)?.summary as string) || "";
         // Add fused-answer chat message so the user sees a final answer
         if (completionSummary) {
           get().addChatMessage({

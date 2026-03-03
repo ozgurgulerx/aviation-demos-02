@@ -209,7 +209,7 @@ Start now by calling the first handoff tool.
         builder = builder.add_handoff(specialist, [coordinator])
 
     configured_turn_limits = autonomous_turn_limits or {}
-    default_coordinator_turns = min(len(specialists) + 2, 6)
+    default_coordinator_turns = len(specialists) + 4
     coordinator_turn_limit = configured_turn_limits.get(
         coordinator.name or coordinator.id, default_coordinator_turns
     )
@@ -237,8 +237,8 @@ Start now by calling the first handoff tool.
             or "rank_options" in recent
             or "score_recovery_option" in recent
         )
-        # Safety valve: reduced threshold so workflows don't run too long
-        conversation_long_enough = n_msgs > (n_specialists * 2 + 4)
+        # Safety valve: allow enough room for all specialist handoffs + coordinator synthesis
+        conversation_long_enough = n_msgs > (n_specialists * 3 + 6)
         should_stop = (
             (has_recommendation and has_timeline)
             or has_final_tool_signal
