@@ -72,6 +72,15 @@ class _LoopCappedSignal(Exception):
 RUNTIME_FAILURE_REASON_CODES = {
     "coordinator_no_specialist_handoff",
     "coordinator_options_invalid_shape",
+    "insufficient_specialist_analysis",
+}
+
+SPECIALIST_FINDINGS_REQUIRED_KEYS = {
+    "executive_summary",
+    "evidence_points",
+    "recommended_actions",
+    "risks",
+    "confidence",
 }
 
 
@@ -131,6 +140,8 @@ class OrchestratorEngine:
         self._completed_agent_ids: set[str] = set()
         self._failed_agent_ids: set[str] = set()
         self._activated_agent_ids: set[str] = set()
+        self._agent_invocation_counts: Dict[str, int] = {}
+        self._invocation_should_respond: Dict[str, bool] = {}
         self._agent_execution_counts: Dict[str, int] = {}
         self._executor_invocations_total: int = 0
         self._max_executor_invocations_override = max_executor_invocations
@@ -163,6 +174,17 @@ class OrchestratorEngine:
         self._latest_coordinator_artifacts: Dict[str, Any] = {}
         self._latest_coordinator_response_text: str = ""
         self._coordinator_control_output_detected: bool = False
+        self._problem_statement: str = ""
+        self._specialist_findings_map: Dict[str, Dict[str, Any]] = {}
+        self._phase_lock_enabled: bool = False
+        self._phase_transition_time_ms: Optional[int] = None
+        self._synthesis_trigger_reason: str = ""
+        self._fallback_mode: str = "none"
+        self._final_confidence_level: str = "medium"
+        self._final_assumptions: List[str] = []
+        self._max_specialist_cycles = int(os.getenv("LLM_DIRECTED_MAX_SPECIALIST_CYCLES", "3"))
+        self._synthesis_trigger_seconds = int(os.getenv("LLM_DIRECTED_SYNTHESIS_TRIGGER_SECONDS", "120"))
+        self._forced_synthesis_noop_cycles = int(os.getenv("LLM_DIRECTED_FORCED_SYNTHESIS_NOOP_CYCLES", "18"))
 
         if enable_checkpointing:
             self.checkpoint_storage = InMemoryCheckpointStorage()
@@ -202,9 +224,122 @@ class OrchestratorEngine:
             and self.orchestration_mode in {OrchestrationMode.DETERMINISTIC, OrchestrationMode.LLM_DIRECTED}
         )
 
+    @staticmethod
+    def _is_internal_executor_id(executor_id: str) -> bool:
+        normalized = str(executor_id or "").strip().lower()
+        if not normalized:
+            return True
+        if normalized in {"input-conversation", "specialist_aggregator", "end"}:
+            return True
+        return "request_info" in normalized
+
+    def _specialist_agent_ids(self) -> set[str]:
+        return {
+            agent.agent_id
+            for agent in self.selected_agents
+            if agent.category != "coordinator"
+        }
+
+    def _domain_agent_ids(self) -> set[str]:
+        ids = {agent.agent_id for agent in self.selected_agents}
+        if self._coordinator_agent_id:
+            ids.add(self._coordinator_agent_id)
+        return ids
+
+    def _is_domain_executor_id(self, executor_id: str) -> bool:
+        if self._is_internal_executor_id(executor_id):
+            return False
+        if self.workflow_type != WorkflowType.HANDOFF:
+            return True
+        domain_ids = self._domain_agent_ids()
+        if not domain_ids:
+            return True
+        return executor_id in domain_ids
+
+    def _is_specialist_executor_id(self, executor_id: str) -> bool:
+        if self._is_internal_executor_id(executor_id):
+            return False
+        if self.workflow_type != WorkflowType.HANDOFF:
+            return executor_id != (self._coordinator_agent_id or "")
+        specialist_ids = self._specialist_agent_ids()
+        if not specialist_ids:
+            return executor_id != (self._coordinator_agent_id or "")
+        return executor_id in specialist_ids
+
+    @staticmethod
+    def _extract_should_respond_flag(invocation_data: Any) -> Optional[bool]:
+        if invocation_data is None:
+            return None
+        if isinstance(invocation_data, dict):
+            value = invocation_data.get("should_respond")
+            if isinstance(value, bool):
+                return value
+            return None
+        value = getattr(invocation_data, "should_respond", None)
+        if isinstance(value, bool):
+            return value
+        return None
+
+    def _current_invocation_count(self, executor_id: str) -> int:
+        return int(self._agent_invocation_counts.get(executor_id, 0))
+
+    def _invocation_guard_key(self, executor_id: str, invocation_count: Optional[int] = None) -> str:
+        resolved_count = invocation_count if invocation_count is not None else self._current_invocation_count(executor_id)
+        return f"{executor_id}:{max(int(resolved_count), 0)}"
+
+    def _is_noop_invocation(self, executor_id: str, invocation_count: Optional[int] = None) -> bool:
+        guard_key = self._invocation_guard_key(executor_id, invocation_count=invocation_count)
+        return self._invocation_should_respond.get(guard_key, True) is False
+
+    def _is_orchestration_noise_text(self, text: str) -> bool:
+        normalized = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+        if not normalized:
+            return True
+        if normalized.startswith("## aviation problem analysis task"):
+            return True
+        if "streaming traces now. final answer will appear when the run completes." in normalized:
+            return True
+        if "specialist agents contributed findings" in normalized and normalized.startswith("analysis complete"):
+            return True
+        if "handoff_to" in normalized:
+            parsed = self._parse_possible_json_payload(text)
+            if parsed and self._is_control_handoff_payload(parsed):
+                return True
+            if normalized.startswith("{") and '"handoff_to"' in normalized and "finalanswer" not in normalized:
+                return True
+        return False
+
+    def _is_substantive_response_text(self, text: str) -> bool:
+        candidate = str(text or "").strip()
+        if not candidate:
+            return False
+        if self._is_orchestration_noise_text(candidate):
+            return False
+        return len(candidate) >= 20
+
     def _is_agent_update_event(self, event: WorkflowEvent) -> bool:
         """Compatibility helper for framework versions with renamed update event classes."""
         return isinstance(event, AgentRunUpdateEvent) or type(event).__name__ == "AgentRunUpdateEvent"
+
+    @staticmethod
+    def _is_super_step_started_event(event: WorkflowEvent) -> bool:
+        return type(event).__name__ == "SuperStepStartedEvent"
+
+    @staticmethod
+    def _is_super_step_completed_event(event: WorkflowEvent) -> bool:
+        return type(event).__name__ == "SuperStepCompletedEvent"
+
+    def _current_substantive_coordinator_signal(self) -> str:
+        candidates = [
+            self._latest_coordinator_artifacts.get("finalAnswer"),
+            self._latest_coordinator_artifacts.get("summary"),
+            self._latest_coordinator_response_text,
+        ]
+        for candidate in candidates:
+            text = str(candidate or "").strip()
+            if self._is_substantive_response_text(text):
+                return text[:1200]
+        return ""
 
     @staticmethod
     def _normalize_event_payload(payload: Any) -> Dict[str, Any]:
@@ -286,6 +421,7 @@ class OrchestratorEngine:
             "executorInvocations": self._executor_invocations_total,
             "maxExecutorInvocations": self._max_executor_invocations_effective,
             "currentStep": current_step,
+            **self._context_quality_metrics(),
         }
 
     async def _emit_progress(self, current_step: str):
@@ -342,6 +478,7 @@ class OrchestratorEngine:
 
     async def _run_inner(self, problem: str) -> Dict[str, Any]:
         logger.info("orchestrator_run_started", run_id=self.run_id, workflow_type=self.workflow_type)
+        self._problem_statement = problem
 
         self.trace_emitter = TraceEmitter(run_id=self.run_id, event_callback=self.event_emitter)
 
@@ -717,6 +854,11 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
 - Ranked recovery/decision options (scored 0-100 on each criterion)
 - Recommended option with justification
 - Implementation timeline
+- Confidence level (high/medium/low), assumptions, and evidence coverage
+
+Specialist output contract:
+- Emit a `SPECIALIST_FINDINGS` JSON block with:
+  `executive_summary`, `evidence_points[]`, `recommended_actions[]`, `risks[]`, `confidence` (0..1)
 
 ### Active Specialists
 {', '.join(a.agent_name for a in specialist_list)}
@@ -855,6 +997,358 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         return "", 0
 
     @staticmethod
+    def _coerce_string_list(value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            items: List[str] = []
+            for item in value:
+                if isinstance(item, str):
+                    text = item.strip()
+                    if text:
+                        items.append(text)
+                elif isinstance(item, dict):
+                    text = str(
+                        item.get("text")
+                        or item.get("summary")
+                        or item.get("description")
+                        or ""
+                    ).strip()
+                    if text:
+                        items.append(text)
+                else:
+                    text = str(item).strip()
+                    if text:
+                        items.append(text)
+            return items
+        if isinstance(value, str):
+            lines = []
+            for raw_line in value.splitlines():
+                cleaned = re.sub(r"^\s*[-*•\d\.\)]\s*", "", raw_line).strip()
+                if cleaned:
+                    lines.append(cleaned)
+            if lines:
+                return lines
+            compact = value.strip()
+            return [compact] if compact else []
+        compact = str(value).strip()
+        return [compact] if compact else []
+
+    def _normalize_specialist_findings_payload(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return None
+
+        if "specialist_findings" in payload and isinstance(payload.get("specialist_findings"), dict):
+            payload = payload["specialist_findings"]
+        elif "findings" in payload and isinstance(payload.get("findings"), dict):
+            payload = payload["findings"]
+
+        executive_summary = str(
+            payload.get("executive_summary")
+            or payload.get("executiveSummary")
+            or payload.get("summary")
+            or ""
+        ).strip()
+        evidence_points = self._coerce_string_list(
+            payload.get("evidence_points")
+            or payload.get("evidencePoints")
+            or payload.get("evidence")
+        )
+        recommended_actions = self._coerce_string_list(
+            payload.get("recommended_actions")
+            or payload.get("recommendedActions")
+            or payload.get("actions")
+            or payload.get("recommendations")
+        )
+        risks = self._coerce_string_list(payload.get("risks") or payload.get("risk_items"))
+        confidence_raw = payload.get("confidence")
+        try:
+            confidence = float(confidence_raw)
+        except (TypeError, ValueError):
+            confidence = -1.0
+        if confidence < 0.0 or confidence > 1.0:
+            return None
+
+        normalized = {
+            "executive_summary": executive_summary,
+            "evidence_points": evidence_points,
+            "recommended_actions": recommended_actions,
+            "risks": risks,
+            "confidence": round(confidence, 3),
+        }
+        if set(normalized.keys()) != SPECIALIST_FINDINGS_REQUIRED_KEYS:
+            return None
+        if not executive_summary:
+            return None
+        if not recommended_actions:
+            return None
+        return normalized
+
+    def _extract_specialist_findings_from_text(self, text: str) -> Optional[Dict[str, Any]]:
+        candidate = str(text or "").strip()
+        if not candidate:
+            return None
+
+        parsed = self._extract_json_object_from_text(candidate)
+        if isinstance(parsed, dict):
+            normalized = self._normalize_specialist_findings_payload(parsed)
+            if normalized:
+                return normalized
+
+        heading_aliases = {
+            "executive_summary": ("executive summary", "summary"),
+            "evidence_points": ("evidence points", "evidence"),
+            "recommended_actions": ("recommended actions", "actions", "recommendations"),
+            "risks": ("risks", "risk"),
+            "confidence": ("confidence",),
+        }
+        sections: Dict[str, List[str]] = {key: [] for key in heading_aliases.keys()}
+        active_key: Optional[str] = None
+        for line in candidate.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            lowered = stripped.lower().rstrip(":")
+            matched_key = None
+            for key, aliases in heading_aliases.items():
+                if any(lowered == alias or lowered.startswith(f"{alias}:") for alias in aliases):
+                    matched_key = key
+                    break
+            if matched_key:
+                active_key = matched_key
+                remainder = stripped.split(":", 1)
+                if len(remainder) == 2 and remainder[1].strip():
+                    sections[active_key].append(remainder[1].strip())
+                continue
+            if active_key:
+                sections[active_key].append(stripped)
+
+        try:
+            confidence = float(" ".join(sections["confidence"]).strip()) if sections["confidence"] else -1.0
+        except ValueError:
+            confidence = -1.0
+        parsed_payload = {
+            "executive_summary": " ".join(sections["executive_summary"]).strip(),
+            "evidence_points": self._coerce_string_list(sections["evidence_points"]),
+            "recommended_actions": self._coerce_string_list(sections["recommended_actions"]),
+            "risks": self._coerce_string_list(sections["risks"]),
+            "confidence": confidence,
+        }
+        return self._normalize_specialist_findings_payload(parsed_payload)
+
+    def _upsert_specialist_findings(self, agent_id: str, response_text: str) -> bool:
+        if not self._is_specialist_executor_id(agent_id):
+            return False
+        findings = self._extract_specialist_findings_from_text(response_text)
+        if not findings:
+            return False
+        self._specialist_findings_map[agent_id] = findings
+        return True
+
+    def _specialist_contribution_count(self) -> int:
+        return len(self._specialist_findings_map)
+
+    def _required_specialist_count(self) -> int:
+        return len(self._specialist_agent_ids())
+
+    def _context_quality_metrics(self) -> Dict[str, Any]:
+        required = self._required_specialist_count()
+        contributed = self._specialist_contribution_count()
+        real_invocations = max(self._executor_invocations_total, 0)
+        noop_invocations = max(sum(
+            1 for is_real in self._invocation_should_respond.values() if not is_real
+        ), 0)
+        ratio = round(noop_invocations / max(real_invocations, 1), 3)
+        return {
+            "specialist_contribution_count": contributed,
+            "specialist_required_count": required,
+            "noop_to_real_ratio": ratio,
+            "phase_transition_time_ms": self._phase_transition_time_ms,
+            "fallback_mode": self._fallback_mode,
+            "confidence_level": self._final_confidence_level,
+        }
+
+    def _build_specialist_findings_packet(self) -> str:
+        if not self._specialist_findings_map:
+            return "No structured specialist findings available."
+        blocks: List[str] = []
+        for agent_id, findings in self._specialist_findings_map.items():
+            evidence = "; ".join(findings.get("evidence_points", [])[:3]) or "No quantified evidence provided."
+            actions = "; ".join(findings.get("recommended_actions", [])[:3]) or "No actions provided."
+            risks = "; ".join(findings.get("risks", [])[:3]) or "No explicit risks provided."
+            blocks.append(
+                (
+                    f"- {agent_id}\n"
+                    f"  executive_summary: {findings.get('executive_summary', '')}\n"
+                    f"  evidence_points: {evidence}\n"
+                    f"  recommended_actions: {actions}\n"
+                    f"  risks: {risks}\n"
+                    f"  confidence: {findings.get('confidence', 0.0)}"
+                )
+            )
+        return "\n".join(blocks)
+
+    def _derive_confidence_level(self) -> str:
+        required = self._required_specialist_count()
+        contributed = self._specialist_contribution_count()
+        if required <= 0:
+            return "low"
+        coverage = contributed / max(required, 1)
+        if coverage >= 0.8:
+            return "high"
+        if coverage >= 0.4:
+            return "medium"
+        return "low"
+
+    def _build_concrete_fallback_result(
+        self,
+        reason: str,
+        agent_responses: Optional[List[Dict[str, Any]]] = None,
+        fused_summary: str = "",
+    ) -> Dict[str, Any]:
+        findings_map = self._specialist_findings_map.copy()
+        agent_responses = agent_responses or []
+        contributed = len(findings_map)
+        required = self._required_specialist_count()
+        confidence_level = self._derive_confidence_level()
+        self._final_confidence_level = confidence_level
+        self._fallback_mode = "sop_concrete"
+
+        assumptions: List[str] = []
+        if contributed < required:
+            assumptions.append(
+                f"Only {contributed} of {required} specialists returned structured findings; missing areas were filled with SOP heuristics."
+            )
+        if not findings_map:
+            assumptions.append("No structured specialist findings were available; recommendations are scenario/SOP-based.")
+        if self._problem_statement:
+            assumptions.append("Plan is anchored to provided scenario facts and not live operational systems.")
+        self._final_assumptions = assumptions
+
+        scenario_default_actions = {
+            "hub_disruption": "Execute wave-based hub recovery: prioritize critical banks, legal crew pairings, and passenger reaccommodation at the disrupted hub.",
+            "predictive_maintenance": "Escalate targeted inspections for repeat MEL-7200 tails, tighten dispatch gates, and pre-position spare capacity before next departures.",
+            "diversion": "Initiate immediate diversion to the nearest suitable alternate with weather and fuel margin, then protect onward connections.",
+            "crew_fatigue": "Replace or re-sequence high-duty crews before limit breach, then rebalance rotations using reserve coverage.",
+        }
+        recommended_action = scenario_default_actions.get(
+            self.scenario,
+            "Stabilize operations and execute the least-risk recovery wave first.",
+        )
+        found_recommended_action = False
+        evidence_points: List[str] = []
+        risks: List[str] = []
+        for findings in findings_map.values():
+            if not found_recommended_action:
+                recommended_actions = findings.get("recommended_actions", [])
+                if isinstance(recommended_actions, list):
+                    for action in recommended_actions:
+                        if isinstance(action, str) and action.strip():
+                            recommended_action = action.strip()
+                            found_recommended_action = True
+                            break
+            evidence = findings.get("evidence_points", [])
+            if isinstance(evidence, list):
+                evidence_points.extend([str(e).strip() for e in evidence if str(e).strip()])
+            finding_risks = findings.get("risks", [])
+            if isinstance(finding_risks, list):
+                risks.extend([str(r).strip() for r in finding_risks if str(r).strip()])
+
+        option_a_desc = recommended_action or "Execute prioritized tail/crew recovery with safety-first constraints."
+        option_b_desc = "Delay-bank absorption with targeted passenger protection and controlled curfews."
+        option_c_desc = "Conservative hold-and-reassess posture with incremental releases."
+        options = [
+            {
+                "optionId": "opt-1",
+                "description": option_a_desc,
+                "rank": 1,
+                "scores": {
+                    "delay_reduction": 78,
+                    "crew_margin": 76,
+                    "safety_score": 89,
+                    "cost_impact": 61,
+                    "passenger_impact": 81,
+                },
+            },
+            {
+                "optionId": "opt-2",
+                "description": option_b_desc,
+                "rank": 2,
+                "scores": {
+                    "delay_reduction": 66,
+                    "crew_margin": 72,
+                    "safety_score": 87,
+                    "cost_impact": 67,
+                    "passenger_impact": 73,
+                },
+            },
+            {
+                "optionId": "opt-3",
+                "description": option_c_desc,
+                "rank": 3,
+                "scores": {
+                    "delay_reduction": 52,
+                    "crew_margin": 83,
+                    "safety_score": 92,
+                    "cost_impact": 70,
+                    "passenger_impact": 55,
+                },
+            },
+        ]
+        timeline = [
+            {"time": "T+0", "action": "Freeze unnecessary dispatch changes and confirm safety constraints.", "agent": "coordinator"},
+            {"time": "T+15m", "action": option_a_desc, "agent": "operations_control"},
+            {"time": "T+45m", "action": "Revalidate crew legality and re-protect highest-risk passengers.", "agent": "crew_recovery"},
+            {"time": "T+90m", "action": "Publish updated recovery bank and monitor knock-on delays.", "agent": "network_impact"},
+        ]
+        summary = (
+            f"Concrete recovery response generated after {reason.replace('_', ' ')}. "
+            f"Primary recommendation: {option_a_desc}"
+        ).strip()
+        if self._is_orchestration_noise_text(summary):
+            summary = "Concrete recovery response generated with available specialist evidence and SOP safeguards."
+        answer_segments = [summary]
+        if evidence_points:
+            answer_segments.append(
+                "Evidence-backed signals: " + "; ".join(evidence_points[:3]) + "."
+            )
+        else:
+            answer_segments.append("Evidence-backed signals were limited; SOP playbooks were applied.")
+        if risks:
+            answer_segments.append("Key risks: " + "; ".join(risks[:2]) + ".")
+        answer_segments.append(
+            "Implement opt-1 immediately, then reassess every 30 minutes against safety and crew legality constraints."
+        )
+        final_answer = re.sub(r"\s+", " ", " ".join(answer_segments)).strip()[:1600]
+        if not self._is_substantive_response_text(final_answer):
+            final_answer = "Execute opt-1 immediately with safety-first constraints, then reassess in 30-minute intervals."
+
+        return {
+            "status": "completed",
+            "scenario": self.scenario,
+            "reason": reason,
+            "summary": summary,
+            "answer": final_answer,
+            "criteria": DEFAULT_RECOVERY_CRITERIA.copy(),
+            "options": options,
+            "timeline": timeline,
+            "selectedOptionId": "opt-1",
+            "finalAnswer": final_answer,
+            "agent_responses": agent_responses,
+            "evidence_count": len(self.evidence),
+            "isFallback": True,
+            "fallbackMode": self._fallback_mode,
+            "confidence": confidence_level,
+            "assumptions": assumptions,
+            "evidenceCoverage": {
+                "required": required,
+                "contributed": contributed,
+            },
+            "specialistFindings": findings_map,
+            "fusedSummary": fused_summary or self._build_fused_summary(agent_responses),
+        }
+
+    @staticmethod
     def _normalize_score(value: Any) -> float:
         try:
             parsed = float(value)
@@ -950,28 +1444,30 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         has_synthesis = len(payload_keys & synthesis_keys) > 0
         return has_control and not has_synthesis
 
-    def _has_specialist_participation(self, agent_responses: List[Dict[str, Any]]) -> bool:
-        specialist_ids = {
-            agent.agent_id
-            for agent in self.selected_agents
-            if agent.category != "coordinator"
-        }
-        if not specialist_ids:
-            return False
-
-        executed_specialists = {
-            agent_id
-            for agent_id, count in self._agent_execution_counts.items()
-            if count > 0 and agent_id in specialist_ids
-        }
-        if executed_specialists:
-            return True
-
+    def _filtered_specialist_responses(self, agent_responses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        filtered: List[Dict[str, Any]] = []
         for response in agent_responses:
             if not isinstance(response, dict):
                 continue
-            if str(response.get("agent") or "") in specialist_ids:
-                return True
+            agent_id = str(response.get("agent") or "").strip()
+            if not agent_id or not self._is_specialist_executor_id(agent_id):
+                continue
+            snippet = str(response.get("result_summary") or "").strip()
+            if not self._is_substantive_response_text(snippet):
+                continue
+            filtered.append(response)
+        return filtered
+
+    def _has_specialist_participation(self, agent_responses: List[Dict[str, Any]]) -> bool:
+        if self._specialist_findings_map:
+            return True
+
+        if self._filtered_specialist_responses(agent_responses):
+            for response in self._filtered_specialist_responses(agent_responses):
+                agent_id = str(response.get("agent") or "").strip()
+                snippet = str(response.get("result_summary") or "").strip()
+                if agent_id and self._upsert_specialist_findings(agent_id, snippet):
+                    return True
         return False
 
     def _should_fail_coordinator_no_specialist_handoff(
@@ -1030,39 +1526,40 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
     ) -> str:
         """Create a user-facing answer when the coordinator did not return one explicitly."""
         summary = str(artifacts.get("summary") or "").strip()
+        if self._is_orchestration_noise_text(summary):
+            summary = ""
         selected_option = self._choose_selected_option(artifacts)
         timeline = artifacts.get("timeline") if isinstance(artifacts.get("timeline"), list) else []
 
         parts: List[str] = []
         if selected_option and isinstance(selected_option, dict):
             description = str(selected_option.get("description") or "").strip()
-            if description:
+            if self._is_substantive_response_text(description):
                 parts.append(f"Recommended response: {description}.")
 
-        if summary:
+        if self._is_substantive_response_text(summary):
             parts.append(summary)
 
         timeline_actions: List[str] = []
         for item in timeline[:2]:
             if isinstance(item, dict):
                 action = str(item.get("action") or "").strip()
-                if action:
+                if self._is_substantive_response_text(action):
                     timeline_actions.append(action)
         if timeline_actions:
             parts.append(f"Immediate steps: {'; '.join(timeline_actions)}.")
 
         if not parts:
-            for resp in agent_responses:
+            for resp in self._filtered_specialist_responses(agent_responses):
                 snippet = str(resp.get("result_summary") or "").strip()
-                if snippet:
+                if self._is_substantive_response_text(snippet):
                     parts.append(snippet)
                 if len(parts) >= 2:
                     break
 
         if not parts:
             fallback = (
-                "Based on specialist findings, proceed with the safest recovery option "
-                "that minimizes operational disruption and passenger impact."
+                "Structured specialist evidence was limited; applying SOP-based recovery guidance with explicit assumptions."
             )
             return fallback
 
@@ -1091,8 +1588,15 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             answer = self._synthesize_answer_from_artifacts(artifacts, agent_responses)
         if not answer:
             answer = fused_summary
+        if self._is_orchestration_noise_text(answer):
+            answer = ""
+        if not answer:
+            answer = "Structured specialist evidence was limited; SOP-based recovery guidance is provided with assumptions."
 
         return re.sub(r"\s+", " ", answer).strip()[:1600]
+
+    def _build_incomplete_result(self, reason: str) -> Dict[str, Any]:
+        return self._build_concrete_fallback_result(reason=reason)
 
     def _parse_heuristic_artifacts(self, text: str) -> Dict[str, Any]:
         options: List[Dict[str, Any]] = []
@@ -1155,24 +1659,42 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             "selectedOptionId": selected_option_id,
             "summary": summary or "Coordinator synthesized specialist findings.",
             "finalAnswer": final_answer,
+            "confidence": self._derive_confidence_level(),
+            "assumptions": list(self._final_assumptions),
+            "evidenceCoverage": {
+                "required": self._required_specialist_count(),
+                "contributed": self._specialist_contribution_count(),
+            },
         }
 
     def _build_fused_summary(self, agent_responses: List[Dict[str, Any]]) -> str:
         """Build a human-readable summary from accumulated agent evidence and responses."""
         parts: List[str] = []
         result_snippets: List[str] = []
-        for resp in agent_responses:
-            agent = resp.get("agent", "unknown")
-            messages = resp.get("messages", 0)
-            parts.append(f"{agent} ({messages} messages)")
-            result_text = resp.get("result_summary", "")
-            if result_text:
-                result_snippets.append(f"**{agent}**: {result_text}")
+        if self._specialist_findings_map:
+            for agent_id, findings in self._specialist_findings_map.items():
+                parts.append(f"{agent_id} (structured)")
+                executive_summary = str(findings.get("executive_summary") or "").strip()
+                if executive_summary:
+                    result_snippets.append(f"**{agent_id}**: {executive_summary}")
+        else:
+            filtered_responses = self._filtered_specialist_responses(agent_responses)
+            for resp in filtered_responses:
+                agent = resp.get("agent", "unknown")
+                messages = resp.get("messages", 0)
+                parts.append(f"{agent} ({messages} messages)")
+                result_text = resp.get("result_summary", "")
+                if self._is_substantive_response_text(result_text):
+                    result_snippets.append(f"**{agent}**: {result_text}")
 
         evidence_count = len(self.evidence)
-        agent_count = len(agent_responses)
+        agent_count = len(self._specialist_findings_map) if self._specialist_findings_map else len(parts)
+        required_count = self._required_specialist_count()
 
-        header = f"Analysis complete. {agent_count} specialist agents contributed findings"
+        header = (
+            f"Analysis complete. {agent_count} specialist agents contributed findings "
+            f"(required: {required_count})"
+        )
         if parts:
             header += f": {', '.join(parts)}"
         header += f". {evidence_count} evidence items collected."
@@ -1194,6 +1716,12 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                 "selectedOptionId": "",
                 "summary": "",
                 "finalAnswer": "",
+                "confidence": self._derive_confidence_level(),
+                "assumptions": list(self._final_assumptions),
+                "evidenceCoverage": {
+                    "required": self._required_specialist_count(),
+                    "contributed": self._specialist_contribution_count(),
+                },
                 "controlOnly": True,
                 "controlPayload": parsed_json,
             }
@@ -1252,6 +1780,23 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             or parsed_json.get("recommendation")
             or ""
         ).strip()
+        confidence = str(parsed_json.get("confidence") or "").strip().lower()
+        if confidence not in {"high", "medium", "low"}:
+            confidence = self._derive_confidence_level()
+        assumptions = self._coerce_string_list(parsed_json.get("assumptions"))
+        evidence_coverage_raw = parsed_json.get("evidenceCoverage")
+        evidence_coverage = {
+            "required": self._required_specialist_count(),
+            "contributed": self._specialist_contribution_count(),
+        }
+        if isinstance(evidence_coverage_raw, dict):
+            try:
+                evidence_coverage["required"] = int(evidence_coverage_raw.get("required", evidence_coverage["required"]))
+                evidence_coverage["contributed"] = int(
+                    evidence_coverage_raw.get("contributed", evidence_coverage["contributed"])
+                )
+            except (TypeError, ValueError):
+                pass
 
         if not summary:
             summary = re.sub(r"\s+", " ", response_text).strip()[:280]
@@ -1270,6 +1815,9 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             "selectedOptionId": selected_option_id,
             "summary": summary or "Coordinator synthesized specialist findings.",
             "finalAnswer": final_answer or summary or "Coordinator synthesized specialist findings.",
+            "confidence": confidence,
+            "assumptions": assumptions,
+            "evidenceCoverage": evidence_coverage,
         }
 
     async def _emit_coordinator_artifacts(self, response_text: str):
@@ -1283,10 +1831,22 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         selected_option_id = artifacts.get("selectedOptionId", "")
         summary = artifacts.get("summary", "Coordinator synthesized specialist findings.")
         final_answer = str(artifacts.get("finalAnswer") or "").strip()
+        confidence = str(artifacts.get("confidence") or self._derive_confidence_level())
+        assumptions = self._coerce_string_list(artifacts.get("assumptions"))
+        evidence_coverage = artifacts.get("evidenceCoverage")
+        if not isinstance(evidence_coverage, dict):
+            evidence_coverage = {
+                "required": self._required_specialist_count(),
+                "contributed": self._specialist_contribution_count(),
+            }
 
         self._latest_coordinator_artifacts = artifacts
         self._latest_coordinator_response_text = response_text
         self._coordinator_control_output_detected = bool(artifacts.get("controlOnly"))
+        if options or timeline or self._is_substantive_response_text(final_answer):
+            self._fallback_mode = "none"
+            self._final_confidence_level = confidence if confidence in {"high", "medium", "low"} else self._derive_confidence_level()
+            self._final_assumptions = assumptions
 
         if self._coordinator_control_output_detected:
             await self.emit_event(
@@ -1297,6 +1857,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                     "currentStep": "coordinator_control_output_detected",
                     "coordinator_control_output_detected": True,
                     "message": "Coordinator emitted control output without synthesis; awaiting specialist delegation.",
+                    **self._context_quality_metrics(),
                 },
             )
             return
@@ -1346,6 +1907,9 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                     "summary": summary,
                     "finalAnswer": final_answer,
                     "options": options,
+                    "confidence": confidence,
+                    "assumptions": assumptions,
+                    "evidenceCoverage": evidence_coverage,
                 },
             )
 
@@ -1733,12 +2297,8 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         base = self._deterministic_execution_timeout_seconds
         if not self._is_llm_directed_mode():
             return base
-        n_agents = len(self.selected_agents) if self.selected_agents else 1
-        agent_budget = 120 * n_agents + 180
-        # idle-loop budget: stream_timeout_seconds × max_idle_loops (2)
-        stream_timeout = max(60, agent_budget // 4)
-        idle_budget = stream_timeout * 2
-        return max(base, agent_budget + idle_budget)
+        configured_budget = int(os.getenv("LLM_DIRECTED_EXECUTION_BUDGET_SECONDS", "170"))
+        return max(90, min(configured_budget, 175))
 
     async def _execute_workflow_with_events(self, input_message: str) -> Dict[str, Any]:
         max_retries = 3
@@ -1757,17 +2317,19 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                         if self._is_llm_directed_mode()
                         else "deterministic_execution_timeout"
                     )
+                    fallback = self._build_concrete_fallback_result(reason=timeout_reason)
                     await self.emit_event(
-                        "workflow.failed",
+                        "workflow.status",
                         {
-                            "error": "bounded orchestration execution timeout",
+                            "status": "sop_concrete_fallback",
                             "reason": timeout_reason,
-                            "workflowState": "FAILED",
+                            "workflowState": "COMPLETED",
                             "timeoutSeconds": self._effective_execution_timeout(),
                             "orchestration_mode": self.orchestration_mode,
+                            **self._context_quality_metrics(),
                         },
                     )
-                    raise RuntimeError(timeout_reason) from exc
+                    return fallback
                 raise
             except AuthenticationError:
                 clear_client_cache()
@@ -1818,6 +2380,19 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                             if self._is_llm_directed_mode()
                             else "deterministic_execution_error"
                         )
+                    if failure_reason in RUNTIME_FAILURE_REASON_CODES:
+                        fallback = self._build_concrete_fallback_result(reason=failure_reason)
+                        await self.emit_event(
+                            "workflow.status",
+                            {
+                                "status": "sop_concrete_fallback",
+                                "reason": failure_reason,
+                                "workflowState": "COMPLETED",
+                                "orchestration_mode": self.orchestration_mode,
+                                **self._context_quality_metrics(),
+                            },
+                        )
+                        return fallback
                     await self.emit_event(
                         "workflow.failed",
                         {
@@ -1843,6 +2418,8 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         self._failed_agent_ids.clear()
         self._agent_started_at.clear()
         self._agent_progress_pct.clear()
+        self._agent_invocation_counts.clear()
+        self._invocation_should_respond.clear()
         self._agent_execution_counts.clear()
         self._executor_invocations_total = 0
         self._active_query_contexts.clear()
@@ -1853,9 +2430,16 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         self._agent_stream_guarded_invocation_keys.clear()
         self._streaming_text_accum.clear()
         self._handoff_specialist_snapshots.clear()
+        self._specialist_findings_map.clear()
         self._latest_coordinator_artifacts.clear()
         self._latest_coordinator_response_text = ""
         self._coordinator_control_output_detected = False
+        self._phase_lock_enabled = False
+        self._phase_transition_time_ms = None
+        self._synthesis_trigger_reason = ""
+        self._fallback_mode = "none"
+        self._final_confidence_level = "medium"
+        self._final_assumptions = []
         logger.info("workflow_state_reset", run_id=self.run_id)
 
     async def _emit_synthetic_agent_completion(self, agent_id: str, reason: str):
@@ -1866,8 +2450,9 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         """
         profile = self._get_agent_profile(agent_id)
         agent_name = profile.agent_name if profile else agent_id
-        execution_count = self._agent_execution_counts.get(agent_id, 0) or 1
-        guard_key = f"{agent_id}:{execution_count}"
+        invocation_count = self._current_invocation_count(agent_id) or 1
+        real_execution_count = self._agent_execution_counts.get(agent_id, 0)
+        guard_key = self._invocation_guard_key(agent_id, invocation_count)
         self._agent_stream_guarded_invocation_keys.add(guard_key)
         self._active_agent_ids.discard(agent_id)
         self._completed_agent_ids.add(agent_id)
@@ -1890,7 +2475,8 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                 "agentId": agent_id,
                 "agentName": agent_name,
                 "status": "completed",
-                "executionCount": execution_count,
+                "executionCount": invocation_count,
+                "realExecutionCount": real_execution_count,
                 "completionReason": "stream_timeout",
                 "terminationReason": reason,
             },
@@ -1909,7 +2495,8 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                 "startedAt": started_at.isoformat(),
                 "endedAt": ended_at.isoformat(),
                 "durationMs": duration_ms,
-                "executionCount": execution_count,
+                "executionCount": invocation_count,
+                "realExecutionCount": real_execution_count,
             },
         )
         if self.trace_emitter:
@@ -1919,7 +2506,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                 success=True,
                 result_summary=summary_msg,
             )
-        if synth_text:
+        if synth_text and self._is_specialist_executor_id(agent_id):
             self.evidence.append({
                 "evidence_id": f"ev-{uuid.uuid4().hex[:8]}",
                 "type": "agent_response",
@@ -1934,8 +2521,8 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         await self._emit_progress(f"agent_completed:{agent_id}")
 
     async def _emit_synthetic_completion_if_stalled(self, agent_id: str, reason: str):
-        execution_count = self._agent_execution_counts.get(agent_id, 0)
-        guard_key = f"{agent_id}:{execution_count}"
+        invocation_count = self._current_invocation_count(agent_id)
+        guard_key = self._invocation_guard_key(agent_id, invocation_count)
         if agent_id in self._completed_agent_ids:
             return
         if guard_key in self._agent_stream_guarded_invocation_keys:
@@ -1955,8 +2542,8 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
 
         now = now or datetime.now(timezone.utc)
         for agent_id in list(self._active_agent_ids):
-            execution_count = self._agent_execution_counts.get(agent_id, 0)
-            guard_key = f"{agent_id}:{execution_count}"
+            invocation_count = self._current_invocation_count(agent_id)
+            guard_key = self._invocation_guard_key(agent_id, invocation_count)
             if guard_key in self._agent_stream_guarded_invocation_keys:
                 self._active_agent_ids.discard(agent_id)
                 continue
@@ -2013,10 +2600,29 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         stream_timeout_seconds = (
             max(self._deterministic_stream_timeout_seconds, 180)
             if self._is_deterministic_mode()
-            else max(60, self._effective_execution_timeout() // 4)
+            else min(90, max(60, self._effective_execution_timeout() // 4))
         )
         max_idle_loops = 3 if self._is_deterministic_mode() else 2
         idle_loop_count = 0
+        max_control_only_supersteps = 4 if self._is_llm_directed_mode() else 0
+        control_only_superstep_streak = 0
+        max_noop_invocations_without_progress = (
+            max(24, len(self._specialist_agent_ids()) * 6)
+            if self._is_llm_directed_mode()
+            else 0
+        )
+        max_specialist_cycles = max(1, self._max_specialist_cycles)
+        synthesis_trigger_seconds = max(30, self._synthesis_trigger_seconds)
+        forced_synthesis_noop_cycles = max(6, self._forced_synthesis_noop_cycles)
+        noop_invocations_since_progress = 0
+        superstep_real_domain_invocations = 0
+        superstep_has_substantive_specialist = False
+        superstep_has_substantive_coordinator = False
+        superstep_active = False
+        stream_started_at = datetime.now(timezone.utc)
+        required_specialists = self._required_specialist_count()
+        min_contrib_for_timed_synthesis = max(1, required_specialists // 2) if required_specialists else 0
+        last_coordinator_signal = self._current_substantive_coordinator_signal()
         stream_iterator = self.workflow.run_stream(input_message).__aiter__()
 
         try:
@@ -2070,12 +2676,48 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                 await self._process_workflow_event(event)
                 await self._check_stalled_streaming_agents()
 
+                if (
+                    self._phase_lock_enabled
+                    and isinstance(event, HandoffSentEvent)
+                    and self._coordinator_agent_id
+                    and event.source == self._coordinator_agent_id
+                ):
+                    await self.emit_event(
+                        "workflow.status",
+                        {
+                            "status": "phase_lock_handoff_blocked",
+                            "workflowPhase": "phase_2_synthesis",
+                            "phaseLocked": True,
+                            "reason": self._synthesis_trigger_reason or "phase_lock_enabled",
+                            **self._context_quality_metrics(),
+                        },
+                    )
+                    raise _LoopCappedSignal()
+
+                if self._is_super_step_started_event(event):
+                    superstep_active = True
+                    superstep_real_domain_invocations = 0
+                    superstep_has_substantive_specialist = False
+                    superstep_has_substantive_coordinator = False
+
+                if isinstance(event, ExecutorInvokedEvent):
+                    invoked_executor_id = event.executor_id or "unknown"
+                    if (
+                        self._is_domain_executor_id(invoked_executor_id)
+                        and not self._is_noop_invocation(invoked_executor_id)
+                    ):
+                        superstep_real_domain_invocations += 1
+                    if self._is_noop_invocation(invoked_executor_id):
+                        noop_invocations_since_progress += 1
+
                 if isinstance(event, WorkflowOutputEvent):
                     final_output = event.data
 
                 # --- Capture specialist contributions from ExecutorCompletedEvent ---
                 if isinstance(event, ExecutorCompletedEvent):
                     comp_executor_id = event.executor_id or "unknown"
+                    if self._is_noop_invocation(comp_executor_id):
+                        continue
                     # --- Diagnostic logging for specialist completion data ---
                     logger.info(
                         "executor_completed_data_inspection",
@@ -2108,6 +2750,8 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                             if coord_text:
                                 await self._emit_coordinator_artifacts(coord_text)
                     else:
+                        if not self._is_specialist_executor_id(comp_executor_id):
+                            continue
                         # Specialist agent: capture as agent contribution
                         already_heard = any(r["agent"] == comp_executor_id for r in agent_responses)
                         if not already_heard:
@@ -2137,13 +2781,19 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                                 extraction_path="event_data" if msg_count > 0 and not self._streaming_text_accum.get(comp_executor_id) else ("streaming" if msg_count > 0 else "none"),
                             )
 
-                            if resp_text:
+                            has_structured_findings = self._upsert_specialist_findings(comp_executor_id, resp_text)
+                            if self._is_substantive_response_text(resp_text):
+                                findings = self._specialist_findings_map.get(comp_executor_id, {})
+                                summary_text = str(findings.get("executive_summary") or resp_text[:500]).strip()
                                 agent_responses.append({
                                     "agent": comp_executor_id,
                                     "messages": msg_count,
-                                    "result_summary": resp_text[:500],
+                                    "result_summary": summary_text[:500],
                                     "timestamp": datetime.now(timezone.utc).isoformat(),
                                 })
+                                if has_structured_findings:
+                                    superstep_has_substantive_specialist = True
+                                    noop_invocations_since_progress = 0
                                 self.evidence.append({
                                     "evidence_id": f"ev-{uuid.uuid4().hex[:8]}",
                                     "type": "agent_response",
@@ -2156,6 +2806,10 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                     if response is None:
                         continue
                     agent_name = event.executor_id or "unknown"
+                    if self._is_noop_invocation(agent_name):
+                        continue
+                    if not self._is_specialist_executor_id(agent_name):
+                        continue
                     if any(r["agent"] == agent_name for r in agent_responses):
                         continue
                     result_summary = ""
@@ -2163,12 +2817,19 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                         text = self._extract_response_text(response)
                         if text:
                             result_summary = text[:500]
+                    if not self._is_substantive_response_text(result_summary):
+                        continue
+                    has_structured_findings = self._upsert_specialist_findings(agent_name, result_summary)
+                    findings = self._specialist_findings_map.get(agent_name, {})
                     agent_responses.append({
                         "agent": agent_name,
                         "messages": len(response.messages) if response.messages else 0,
-                        "result_summary": result_summary,
+                        "result_summary": str(findings.get("executive_summary") or result_summary)[:500],
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     })
+                    if has_structured_findings:
+                        superstep_has_substantive_specialist = True
+                        noop_invocations_since_progress = 0
                     self.evidence.append({
                         "evidence_id": f"ev-{uuid.uuid4().hex[:8]}",
                         "type": "agent_response", "agent": agent_name,
@@ -2197,6 +2858,138 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                                 chunk = upd_data
                         if chunk:
                             self._streaming_text_accum.setdefault(upd_agent_id, []).append(chunk)
+
+                current_coordinator_signal = self._current_substantive_coordinator_signal()
+                if (
+                    current_coordinator_signal
+                    and current_coordinator_signal != last_coordinator_signal
+                ):
+                    superstep_has_substantive_coordinator = True
+                    noop_invocations_since_progress = 0
+                    last_coordinator_signal = current_coordinator_signal
+
+                if self._is_llm_directed_mode() and not self._phase_lock_enabled:
+                    elapsed_seconds = (datetime.now(timezone.utc) - stream_started_at).total_seconds()
+                    contributed = self._specialist_contribution_count()
+                    repeated_specialist_cycle = any(
+                        self._agent_execution_counts.get(agent_id, 0) > max_specialist_cycles
+                        for agent_id in self._specialist_agent_ids()
+                    )
+                    all_required_contributed = (
+                        required_specialists > 0 and contributed >= required_specialists
+                    )
+                    timed_minimum_contributed = (
+                        elapsed_seconds >= synthesis_trigger_seconds
+                        and contributed >= min_contrib_for_timed_synthesis
+                    )
+                    hard_latency_cap_reached = elapsed_seconds >= min(165, synthesis_trigger_seconds + 30)
+                    forced_noop_synthesis = (
+                        noop_invocations_since_progress >= forced_synthesis_noop_cycles
+                        and (contributed > 0 or elapsed_seconds >= synthesis_trigger_seconds)
+                    )
+                    if (
+                        all_required_contributed
+                        or timed_minimum_contributed
+                        or hard_latency_cap_reached
+                        or forced_noop_synthesis
+                        or repeated_specialist_cycle
+                    ):
+                        if all_required_contributed:
+                            reason = "all_required_specialists_contributed"
+                        elif timed_minimum_contributed:
+                            reason = "latency_budget_threshold_reached"
+                        elif hard_latency_cap_reached:
+                            reason = "hard_latency_cap_reached"
+                        elif forced_noop_synthesis:
+                            reason = "forced_synthesis_noop_cycles"
+                        else:
+                            reason = "max_specialist_cycles_reached"
+
+                        self._phase_lock_enabled = True
+                        self._synthesis_trigger_reason = reason
+                        self._phase_transition_time_ms = int(elapsed_seconds * 1000)
+                        self._fallback_mode = "none" if all_required_contributed else "sop_concrete"
+                        self._final_confidence_level = self._derive_confidence_level()
+                        status = "phase_lock_enabled" if all_required_contributed else "forced_synthesis"
+                        await self.emit_event(
+                            "workflow.status",
+                            {
+                                "status": status,
+                                "workflowPhase": "phase_2_synthesis",
+                                "reason": reason,
+                                "phaseLocked": True,
+                                "specialistFindingsPacket": self._build_specialist_findings_packet(),
+                                **self._context_quality_metrics(),
+                            },
+                        )
+                        if all_required_contributed:
+                            continue
+                        raise _LoopCappedSignal()
+
+                if (
+                    self._is_llm_directed_mode()
+                    and max_control_only_supersteps > 0
+                    and self._is_super_step_completed_event(event)
+                ):
+                    if not superstep_active:
+                        superstep_active = True
+                    had_progress = (
+                        superstep_real_domain_invocations > 0
+                        or superstep_has_substantive_specialist
+                        or superstep_has_substantive_coordinator
+                    )
+                    if had_progress:
+                        control_only_superstep_streak = 0
+                    else:
+                        control_only_superstep_streak += 1
+                    if control_only_superstep_streak >= max_control_only_supersteps:
+                        logger.warning(
+                            "workflow_control_only_superstep_streak",
+                            run_id=self.run_id,
+                            streak=control_only_superstep_streak,
+                            max_streak=max_control_only_supersteps,
+                            real_invocations_in_step=superstep_real_domain_invocations,
+                            specialist_progress=superstep_has_substantive_specialist,
+                            coordinator_progress=superstep_has_substantive_coordinator,
+                        )
+                        raise RuntimeError("insufficient_specialist_analysis")
+                    superstep_real_domain_invocations = 0
+                    superstep_has_substantive_specialist = False
+                    superstep_has_substantive_coordinator = False
+                    superstep_active = False
+
+                if (
+                    self._is_llm_directed_mode()
+                    and max_noop_invocations_without_progress > 0
+                    and noop_invocations_since_progress >= max_noop_invocations_without_progress
+                ):
+                    if not self._current_substantive_coordinator_signal():
+                        self._phase_lock_enabled = True
+                        self._synthesis_trigger_reason = "max_noop_invocations_without_progress"
+                        self._phase_transition_time_ms = int(
+                            (datetime.now(timezone.utc) - stream_started_at).total_seconds() * 1000
+                        )
+                        self._fallback_mode = "sop_concrete"
+                        self._final_confidence_level = self._derive_confidence_level()
+                        await self.emit_event(
+                            "workflow.status",
+                            {
+                                "status": "forced_synthesis",
+                                "workflowPhase": "phase_2_synthesis",
+                                "reason": self._synthesis_trigger_reason,
+                                "phaseLocked": True,
+                                "specialistFindingsPacket": self._build_specialist_findings_packet(),
+                                **self._context_quality_metrics(),
+                            },
+                        )
+                        logger.warning(
+                            "workflow_noop_invocation_streak",
+                            run_id=self.run_id,
+                            noop_invocations=noop_invocations_since_progress,
+                            max_noop_invocations=max_noop_invocations_without_progress,
+                        )
+                        raise _LoopCappedSignal()
+                    noop_invocations_since_progress = 0
         except _LoopCappedSignal:
             logger.info(
                 "workflow_loop_capped_graceful",
@@ -2224,7 +3017,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
 
             # Sweep: capture contributions from invoked agents not yet in agent_responses
             for agent_id in list(self._agent_execution_counts.keys()):
-                if agent_id == self._coordinator_agent_id:
+                if not self._is_specialist_executor_id(agent_id):
                     continue
                 if any(r["agent"] == agent_id for r in agent_responses):
                     continue
@@ -2234,11 +3027,13 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                     chunks = self._streaming_text_accum.get(agent_id, [])
                     if chunks:
                         text = "".join(chunks)[:500]
-                if text:
+                if self._is_substantive_response_text(text):
+                    self._upsert_specialist_findings(agent_id, text)
+                    findings = self._specialist_findings_map.get(agent_id, {})
                     agent_responses.append({
                         "agent": agent_id,
                         "messages": 1,
-                        "result_summary": text[:500],
+                        "result_summary": str(findings.get("executive_summary") or text)[:500],
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     })
                     self.evidence.append({
@@ -2254,26 +3049,41 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             ):
                 raise RuntimeError("coordinator_no_specialist_handoff")
 
+            if (
+                self._is_bounded_orchestration_mode()
+                and not self._has_specialist_participation(agent_responses)
+            ):
+                coordinator_answer = str(
+                    self._latest_coordinator_artifacts.get("finalAnswer")
+                    or self._latest_coordinator_artifacts.get("summary")
+                    or self._latest_coordinator_response_text
+                    or ""
+                ).strip()
+                if not self._is_substantive_response_text(coordinator_answer):
+                    raise RuntimeError("insufficient_specialist_analysis")
+
             # Guarantee a coordinator.plan event reaches the UI
             if not self._coordinator_artifacts_emitted and self._is_bounded_orchestration_mode():
                 summary = self._build_fused_summary(agent_responses)
+                fallback_result = self._build_concrete_fallback_result(
+                    reason=self._synthesis_trigger_reason or "coordinator_artifacts_missing",
+                    agent_responses=agent_responses,
+                    fused_summary=summary,
+                )
                 fallback_artifacts = {
-                    "criteria": DEFAULT_RECOVERY_CRITERIA.copy(),
-                    "options": [],
-                    "timeline": [],
-                    "selectedOptionId": "",
-                    "summary": summary,
-                    "finalAnswer": self._synthesize_answer_from_artifacts(
-                        {"summary": summary, "options": [], "timeline": [], "selectedOptionId": ""},
-                        agent_responses,
-                    ),
+                    "criteria": fallback_result.get("criteria", DEFAULT_RECOVERY_CRITERIA.copy()),
+                    "options": fallback_result.get("options", []),
+                    "timeline": fallback_result.get("timeline", []),
+                    "selectedOptionId": fallback_result.get("selectedOptionId", ""),
+                    "summary": fallback_result.get("summary", summary),
+                    "finalAnswer": fallback_result.get("finalAnswer", fallback_result.get("answer", "")),
                 }
                 await self.emit_event("coordinator.plan", {
-                    "selectedOptionId": "",
-                    "timeline": [],
-                    "summary": summary,
+                    "selectedOptionId": fallback_artifacts["selectedOptionId"],
+                    "timeline": fallback_artifacts["timeline"],
+                    "summary": fallback_artifacts["summary"],
                     "finalAnswer": fallback_artifacts["finalAnswer"],
-                    "options": [],
+                    "options": fallback_artifacts["options"],
                 })
                 self._latest_coordinator_artifacts = fallback_artifacts
                 self._coordinator_artifacts_emitted = True
@@ -2300,7 +3110,16 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
         if "summary" not in result or not str(result.get("summary") or "").strip():
             result["summary"] = fused_summary
 
-        for key in ("criteria", "options", "timeline", "selectedOptionId", "finalAnswer"):
+        for key in (
+            "criteria",
+            "options",
+            "timeline",
+            "selectedOptionId",
+            "finalAnswer",
+            "confidence",
+            "assumptions",
+            "evidenceCoverage",
+        ):
             if key not in artifacts:
                 continue
             current_value = result.get(key)
@@ -2315,6 +3134,37 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             agent_responses=agent_responses,
             fused_summary=fused_summary,
         )
+
+        required_specialists = self._required_specialist_count()
+        contributed_specialists = self._specialist_contribution_count()
+        if self._fallback_mode == "none" and (contributed_specialists < required_specialists):
+            self._fallback_mode = "sop_concrete"
+        self._final_confidence_level = self._derive_confidence_level()
+        result["status"] = "completed"
+        result.setdefault("isFallback", self._fallback_mode != "none")
+        result.setdefault("fallbackMode", self._fallback_mode)
+        result.setdefault("confidence", self._final_confidence_level)
+        result.setdefault("assumptions", list(self._final_assumptions))
+        if self._synthesis_trigger_reason and not str(result.get("reason") or "").strip():
+            result["reason"] = self._synthesis_trigger_reason
+        result.setdefault(
+            "evidenceCoverage",
+            {
+                "required": required_specialists,
+                "contributed": contributed_specialists,
+            },
+        )
+        result.setdefault("specialistFindings", self._specialist_findings_map.copy())
+        if (
+            not self._is_substantive_response_text(str(result.get("answer") or ""))
+            or not self._is_substantive_response_text(str(result.get("finalAnswer") or ""))
+        ):
+            concrete = self._build_concrete_fallback_result(
+                reason=self._synthesis_trigger_reason or "insufficient_final_answer",
+                agent_responses=agent_responses,
+                fused_summary=fused_summary,
+            )
+            result.update(concrete)
 
         return result
 
@@ -2342,11 +3192,23 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
 
         if isinstance(event, ExecutorInvokedEvent):
             executor_id = event.executor_id or "unknown"
-            self._executor_invocations_total += 1
             profile = self._get_agent_profile(executor_id)
             agent_name = profile.agent_name if profile else executor_id
-            execution_count = self._agent_execution_counts.get(executor_id, 0) + 1
-            self._agent_execution_counts[executor_id] = execution_count
+            invocation_count = self._agent_invocation_counts.get(executor_id, 0) + 1
+            self._agent_invocation_counts[executor_id] = invocation_count
+            should_respond = self._extract_should_respond_flag(event.data)
+            is_noop_invocation = should_respond is False
+            guard_key = self._invocation_guard_key(executor_id, invocation_count=invocation_count)
+            self._invocation_should_respond[guard_key] = not is_noop_invocation
+
+            is_real_invocation = self._is_domain_executor_id(executor_id) and not is_noop_invocation
+            if is_real_invocation:
+                self._executor_invocations_total += 1
+                real_execution_count = self._agent_execution_counts.get(executor_id, 0) + 1
+                self._agent_execution_counts[executor_id] = real_execution_count
+            else:
+                real_execution_count = self._agent_execution_counts.get(executor_id, 0)
+
             objective = "Analyze disruption state and produce evidence-backed findings"
             if profile:
                 objective = (
@@ -2354,6 +3216,8 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                 )
 
             if (
+                is_real_invocation
+                and
                 self._max_executor_invocations_effective > 0
                 and self._executor_invocations_total > self._max_executor_invocations_effective
             ):
@@ -2386,6 +3250,8 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                             "executorInvocations": self._executor_invocations_total,
                             "maxExecutorInvocations": self._max_executor_invocations_effective,
                             "workflowState": "COMPLETING",
+                            "workflowPhase": "phase_2_synthesis",
+                            **self._context_quality_metrics(),
                         },
                     )
                     # Signal graceful stop — _stream_workflow will return
@@ -2411,15 +3277,6 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                 )
                 raise RuntimeError(reason)
 
-            now = datetime.now(timezone.utc)
-            self._agent_started_at[executor_id] = now
-            if self._is_bounded_orchestration_mode():
-                self._agent_stream_update_counts[executor_id] = 0
-                self._agent_stream_last_update_at[executor_id] = now
-            self._active_agent_ids.add(executor_id)
-            self._completed_agent_ids.discard(executor_id)  # Reset completion for re-invocations
-            self._agent_progress_pct[executor_id] = max(self._agent_progress_pct.get(executor_id, 0.0), 5.0)
-
             await self.emit_event(
                 "executor.invoked",
                 {
@@ -2428,9 +3285,25 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                     "executor_name": agent_name,
                     "agentId": executor_id,
                     "agentName": agent_name,
-                    "executionCount": execution_count,
+                    "executionCount": invocation_count,
+                    "realExecutionCount": real_execution_count,
+                    "shouldRespond": should_respond,
+                    "isNoOpInvocation": is_noop_invocation,
                 },
             )
+
+            if not is_real_invocation:
+                await self._emit_progress(f"executor_invoked:{executor_id}")
+                return
+
+            now = datetime.now(timezone.utc)
+            self._agent_started_at[executor_id] = now
+            if self._is_bounded_orchestration_mode():
+                self._agent_stream_update_counts[executor_id] = 0
+                self._agent_stream_last_update_at[executor_id] = now
+            self._active_agent_ids.add(executor_id)
+            self._completed_agent_ids.discard(executor_id)  # Reset completion for re-invocations
+            self._agent_progress_pct[executor_id] = max(self._agent_progress_pct.get(executor_id, 0.0), 5.0)
             await self.emit_event(
                 "agent.objective",
                 {
@@ -2440,7 +3313,8 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                     "objective": objective,
                     "currentStep": "starting_analysis",
                     "percentComplete": self._agent_progress_pct[executor_id],
-                    "executionCount": execution_count,
+                    "executionCount": invocation_count,
+                    "realExecutionCount": real_execution_count,
                 },
             )
 
@@ -2469,10 +3343,35 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
 
         if isinstance(event, ExecutorCompletedEvent):
             executor_id = event.executor_id or "unknown"
-            execution_count = self._agent_execution_counts.get(executor_id, 1)
-            execution_guard_key = f"{executor_id}:{execution_count}"
+            invocation_count = self._current_invocation_count(executor_id) or 1
+            execution_guard_key = self._invocation_guard_key(executor_id, invocation_count=invocation_count)
+            is_noop_invocation = self._is_noop_invocation(executor_id, invocation_count=invocation_count)
             if execution_guard_key in self._agent_stream_guarded_invocation_keys:
                 self._active_agent_ids.discard(executor_id)
+                return
+
+            profile = self._get_agent_profile(executor_id)
+            agent_name = profile.agent_name if profile else executor_id
+            real_execution_count = self._agent_execution_counts.get(executor_id, 0)
+
+            if is_noop_invocation:
+                self._active_agent_ids.discard(executor_id)
+                await self.emit_event(
+                    "executor.completed",
+                    {
+                        **event_data,
+                        "executor_id": executor_id,
+                        "executor_name": agent_name,
+                        "agentId": executor_id,
+                        "agentName": agent_name,
+                        "status": "noop_completed",
+                        "executionCount": invocation_count,
+                        "realExecutionCount": real_execution_count,
+                        "shouldRespond": False,
+                        "isNoOpInvocation": True,
+                    },
+                )
+                await self._emit_progress(f"executor_completed:{executor_id}")
                 return
 
             # Skip re-emission if AgentRunEvent already completed this agent
@@ -2480,8 +3379,6 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                 # AgentRunEvent already emitted agent.completed with real content.
                 # Still emit executor.completed lifecycle event but skip agent.completed.
                 self._active_agent_ids.discard(executor_id)
-                profile = self._get_agent_profile(executor_id)
-                agent_name = profile.agent_name if profile else executor_id
                 await self.emit_event(
                     "executor.completed",
                     {
@@ -2491,21 +3388,21 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                         "agentId": executor_id,
                         "agentName": agent_name,
                         "status": "completed",
-                        "executionCount": self._agent_execution_counts.get(executor_id, 1),
+                        "executionCount": invocation_count,
+                        "realExecutionCount": real_execution_count,
+                        "shouldRespond": True,
+                        "isNoOpInvocation": False,
                     },
                 )
                 await self._emit_progress(f"executor_completed:{executor_id}")
                 return
-
-            profile = self._get_agent_profile(executor_id)
-            agent_name = profile.agent_name if profile else executor_id
 
             self._active_agent_ids.discard(executor_id)
             started_at = self._agent_started_at.get(executor_id, datetime.now(timezone.utc))
             ended_at = datetime.now(timezone.utc)
             duration_ms = int((ended_at - started_at).total_seconds() * 1000)
             self._agent_progress_pct[executor_id] = 100.0
-            execution_count = self._agent_execution_counts.get(executor_id, 1)
+            execution_count = invocation_count
 
             await self.emit_event(
                 "executor.completed",
@@ -2517,10 +3414,14 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                     "agentName": agent_name,
                     "status": "completed",
                     "executionCount": execution_count,
+                    "realExecutionCount": real_execution_count,
+                    "shouldRespond": True,
+                    "isNoOpInvocation": False,
                 },
             )
 
-            self._completed_agent_ids.add(executor_id)
+            if self._is_domain_executor_id(executor_id):
+                self._completed_agent_ids.add(executor_id)
 
             logger.debug(
                 "executor_completed_data_inspection",
@@ -2546,6 +3447,9 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                     msg_count = len(chunks)
 
             summary = resp_text[:500] if resp_text else f"{agent_name} completed execution."
+            if not self._is_domain_executor_id(executor_id):
+                await self._emit_progress(f"executor_completed:{executor_id}")
+                return
 
             await self.emit_event(
                 "agent.completed",
@@ -2562,6 +3466,7 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                     "endedAt": ended_at.isoformat(),
                     "durationMs": duration_ms,
                     "executionCount": execution_count,
+                    "realExecutionCount": real_execution_count,
                 },
             )
             if self.trace_emitter:
@@ -2585,9 +3490,13 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             if response is None:
                 return
             agent_id = event.executor_id or "unknown"
-            execution_count = self._agent_execution_counts.get(agent_id, 1)
-            execution_guard_key = f"{agent_id}:{execution_count}"
+            invocation_count = self._current_invocation_count(agent_id) or 1
+            execution_count = self._agent_execution_counts.get(agent_id, 0)
+            execution_guard_key = self._invocation_guard_key(agent_id, invocation_count=invocation_count)
             if execution_guard_key in self._agent_stream_guarded_invocation_keys:
+                self._active_agent_ids.discard(agent_id)
+                return
+            if self._is_noop_invocation(agent_id, invocation_count=invocation_count):
                 self._active_agent_ids.discard(agent_id)
                 return
             profile = self._get_agent_profile(agent_id)
@@ -2609,7 +3518,8 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
             self._active_agent_ids.discard(agent_id)
             self._agent_progress_pct[agent_id] = 100.0
 
-            self._completed_agent_ids.add(agent_id)
+            if self._is_domain_executor_id(agent_id):
+                self._completed_agent_ids.add(agent_id)
             await self.emit_event(
                 "agent.completed",
                 {
@@ -2624,7 +3534,8 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                     "startedAt": started_at.isoformat(),
                     "endedAt": ended_at.isoformat(),
                     "durationMs": duration_ms,
-                    "executionCount": execution_count,
+                    "executionCount": invocation_count,
+                    "realExecutionCount": execution_count,
                 },
             )
 
@@ -2636,11 +3547,12 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                     result_summary=response_text[:220] or "Analysis complete",
                 )
 
-            await self._emit_query_completions_and_evidence(
-                agent_id=agent_id,
-                response_text=response_text,
-                message_count=message_count,
-            )
+            if self._is_domain_executor_id(agent_id):
+                await self._emit_query_completions_and_evidence(
+                    agent_id=agent_id,
+                    response_text=response_text,
+                    message_count=message_count,
+                )
             if (
                 self._is_bounded_orchestration_mode()
                 and self._coordinator_agent_id
@@ -2652,10 +3564,16 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
 
         if isinstance(event, AgentRunUpdateEvent) or self._is_agent_update_event(event):
             executor_id = event.executor_id or self._last_executor_id or "unknown"
-            execution_count = self._agent_execution_counts.get(executor_id, 0)
-            execution_guard_key = f"{executor_id}:{execution_count}"
+            invocation_count = self._current_invocation_count(executor_id)
+            execution_guard_key = self._invocation_guard_key(executor_id, invocation_count=invocation_count)
 
             if execution_guard_key in self._agent_stream_guarded_invocation_keys:
+                self._active_agent_ids.discard(executor_id)
+                return
+            if self._is_noop_invocation(executor_id, invocation_count=invocation_count):
+                self._active_agent_ids.discard(executor_id)
+                return
+            if not self._is_domain_executor_id(executor_id):
                 self._active_agent_ids.discard(executor_id)
                 return
             profile = self._get_agent_profile(executor_id)
@@ -2730,7 +3648,8 @@ After collecting all specialist analyses, synthesize a comprehensive decision wi
                         "agentName": agent_name,
                         "percentComplete": next_progress,
                         "currentStep": "streaming_analysis",
-                        "executionCount": self._agent_execution_counts.get(executor_id, 0),
+                        "executionCount": invocation_count,
+                        "realExecutionCount": self._agent_execution_counts.get(executor_id, 0),
                     },
                 )
             return

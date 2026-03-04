@@ -16,6 +16,7 @@ from orchestrator.trace_emitter import TraceEmitter
 from orchestrator.workflows import (
     OrchestrationMode,
     WorkflowType,
+    _SpecialistAggregator,
     create_coordinator_workflow,
     create_deterministic_coordinator_workflow,
     create_workflow,
@@ -453,7 +454,17 @@ def test_should_not_fail_when_specialist_participated():
 
     should_fail = engine._should_fail_coordinator_no_specialist_handoff(
         artifacts={"summary": "coordinator summary"},
-        agent_responses=[],
+        agent_responses=[{
+            "agent": "specialist_a",
+            "messages": 1,
+            "result_summary": (
+                '{"executive_summary":"Specialist identified 3 legal crew swaps",'
+                '"evidence_points":["22% delay reduction option"],'
+                '"recommended_actions":["Apply crew swap package A"],'
+                '"risks":["Reserve FO depletion by T+120"],'
+                '"confidence":0.79}'
+            ),
+        }],
     )
     assert should_fail is False
 
@@ -502,6 +513,68 @@ def test_parse_coordinator_artifacts_ignores_generic_preamble_for_final_answer()
     artifacts = engine._parse_coordinator_artifacts(response)
     assert artifacts["summary"].startswith("opt-1 minimizes")
     assert artifacts["finalAnswer"] == artifacts["summary"]
+
+
+def test_specialist_findings_contract_parses_from_json_block():
+    engine = OrchestratorEngine(run_id="test-specialist-contract", enable_checkpointing=False)
+    findings = engine._extract_specialist_findings_from_text(
+        """```json
+{
+  "executive_summary": "ORD ground stop impacts 47 flights and 6800 passengers.",
+  "evidence_points": ["47 flights delayed/cancelled", "3 runways closed"],
+  "recommended_actions": ["Prioritize swap for bank-1 departures"],
+  "risks": ["Crew legality erosion in T+90m window"],
+  "confidence": 0.74
+}
+```"""
+    )
+    assert findings is not None
+    assert findings["executive_summary"].startswith("ORD ground stop")
+    assert findings["confidence"] == 0.74
+
+
+def test_specialist_participation_requires_structured_findings():
+    engine = OrchestratorEngine(
+        run_id="test-structured-participation",
+        workflow_type=WorkflowType.HANDOFF,
+        orchestration_mode=OrchestrationMode.LLM_DIRECTED,
+        enable_checkpointing=False,
+    )
+    specialist = _agent("specialist_a", "Specialist A", category="specialist")
+    coordinator = _agent("decision_coordinator", "Decision Coordinator", category="coordinator")
+    engine.selected_agents = [specialist, coordinator]
+    engine._coordinator_agent_id = coordinator.agent_id
+
+    unstructured = [{
+        "agent": "specialist_a",
+        "messages": 1,
+        "result_summary": "General commentary without structured fields.",
+    }]
+    assert engine._has_specialist_participation(unstructured) is False
+
+    structured = [{
+        "agent": "specialist_a",
+        "messages": 1,
+        "result_summary": (
+            '{"executive_summary":"Crew legality at risk",'
+            '"evidence_points":["FO pairing at 11.5h duty"],'
+            '"recommended_actions":["Swap reserve FO at LAX"],'
+            '"risks":["FAR117 exceedance"],"confidence":0.68}'
+        ),
+    }]
+    assert engine._has_specialist_participation(structured) is True
+    assert "specialist_a" in engine._specialist_findings_map
+
+
+def test_concrete_fallback_response_contains_required_fields():
+    engine = OrchestratorEngine(run_id="test-concrete-fallback", enable_checkpointing=False)
+    result = engine._build_concrete_fallback_result(reason="insufficient_specialist_analysis")
+    assert result["status"] == "completed"
+    assert result["isFallback"] is True
+    assert result["fallbackMode"] == "sop_concrete"
+    assert result["selectedOptionId"] == "opt-1"
+    assert isinstance(result["timeline"], list) and result["timeline"]
+    assert result["confidence"] in {"high", "medium", "low"}
 
 
 def test_resolve_final_answer_prefers_explicit_output_answer():
@@ -555,6 +628,43 @@ def test_resolve_final_answer_ignores_control_payload_text():
     assert resolved
 
 
+def test_resolve_final_answer_rejects_orchestration_preamble_fallback():
+    engine = OrchestratorEngine(run_id="test-answer-noise-filter", enable_checkpointing=False)
+    specialist = _agent("specialist_a", "Specialist A", category="specialist")
+    coordinator = _agent("decision_coordinator", "Decision Coordinator", category="coordinator")
+    engine.selected_agents = [specialist, coordinator]
+    engine._coordinator_agent_id = "decision_coordinator"
+
+    resolved = engine._resolve_final_answer(
+        final_output={
+            "answer": (
+                "## Aviation Problem Analysis Task\nStreaming traces now. "
+                "Final answer will appear when the run completes."
+            ),
+        },
+        artifacts={
+            "summary": "Analysis complete. 0 specialist agents contributed findings.",
+            "finalAnswer": "",
+        },
+        agent_responses=[
+            {
+                "agent": "input-conversation",
+                "messages": 1,
+                "result_summary": "## Aviation Problem Analysis Task",
+            },
+            {
+                "agent": "specialist_a",
+                "messages": 0,
+                "result_summary": "Analysis complete. 0 specialist agents contributed findings.",
+            },
+        ],
+        fused_summary="Analysis complete. 0 specialist agents contributed findings.",
+    )
+
+    assert "aviation problem analysis task" not in resolved.lower()
+    assert "sop-based" in resolved.lower()
+
+
 @pytest.mark.asyncio
 async def test_deterministic_timeout_emits_failed_reason(monkeypatch):
     captured: list[tuple[str, dict]] = []
@@ -577,12 +687,15 @@ async def test_deterministic_timeout_emits_failed_reason(monkeypatch):
 
     monkeypatch.setattr(engine, "_stream_workflow", _slow_stream)
 
-    with pytest.raises(RuntimeError, match="deterministic_execution_timeout"):
-        await engine._execute_workflow_with_events("test input")
+    result = await engine._execute_workflow_with_events("test input")
+    assert result["status"] == "completed"
+    assert result["reason"] == "deterministic_execution_timeout"
+    assert result["fallbackMode"] == "sop_concrete"
 
-    failed = [payload for event_type, payload in captured if event_type == "workflow.failed"]
-    assert failed
-    assert failed[-1]["reason"] == "deterministic_execution_timeout"
+    status = [payload for event_type, payload in captured if event_type == "workflow.status"]
+    assert status
+    assert status[-1]["status"] == "sop_concrete_fallback"
+    assert status[-1]["reason"] == "deterministic_execution_timeout"
 
 
 @pytest.mark.asyncio
@@ -605,12 +718,48 @@ async def test_runtime_reason_code_passthrough(monkeypatch):
 
     monkeypatch.setattr(engine, "_stream_workflow", _fail_with_reason)
 
-    with pytest.raises(RuntimeError, match="coordinator_no_specialist_handoff"):
-        await engine._execute_workflow_with_events("test input")
+    result = await engine._execute_workflow_with_events("test input")
+    assert result["status"] == "completed"
+    assert result["reason"] == "coordinator_no_specialist_handoff"
+    assert result["fallbackMode"] == "sop_concrete"
+    assert "implement opt-1 immediately" in result["answer"].lower()
 
-    failed = [payload for event_type, payload in captured if event_type == "workflow.failed"]
-    assert failed
-    assert failed[-1]["reason"] == "coordinator_no_specialist_handoff"
+    status_events = [payload for event_type, payload in captured if event_type == "workflow.status"]
+    assert status_events
+    assert status_events[-1]["status"] == "sop_concrete_fallback"
+    assert status_events[-1]["reason"] == "coordinator_no_specialist_handoff"
+
+
+@pytest.mark.asyncio
+async def test_runtime_reason_code_passthrough_for_insufficient_specialist_analysis(monkeypatch):
+    captured: list[tuple[str, dict]] = []
+
+    async def emit(event_type: str, payload: dict):
+        captured.append((event_type, payload))
+
+    engine = OrchestratorEngine(
+        run_id="test-runtime-reason-insufficient-specialists",
+        event_emitter=emit,
+        workflow_type=WorkflowType.HANDOFF,
+        orchestration_mode=OrchestrationMode.DETERMINISTIC,
+        enable_checkpointing=False,
+    )
+
+    async def _fail_with_reason(_input_message: str):
+        raise RuntimeError("insufficient_specialist_analysis")
+
+    monkeypatch.setattr(engine, "_stream_workflow", _fail_with_reason)
+
+    result = await engine._execute_workflow_with_events("test input")
+    assert result["status"] == "completed"
+    assert result["reason"] == "insufficient_specialist_analysis"
+    assert result["fallbackMode"] == "sop_concrete"
+    assert "implement opt-1 immediately" in result["answer"].lower()
+
+    status_events = [payload for event_type, payload in captured if event_type == "workflow.status"]
+    assert status_events
+    assert status_events[-1]["status"] == "sop_concrete_fallback"
+    assert status_events[-1]["reason"] == "insufficient_specialist_analysis"
 
 
 class TestEstimateResultCount:
@@ -834,6 +983,203 @@ async def test_stream_workflow_extracts_single_executor_response_for_coordinator
 
 
 @pytest.mark.asyncio
+async def test_stream_workflow_phase_lock_all_required_allows_coordinator_synthesis():
+    class _FakeWorkflow:
+        def __init__(self, events):
+            self._events = events
+
+        async def run_stream(self, _input):
+            for event in self._events:
+                yield event
+
+    captured: list[tuple[str, dict]] = []
+
+    async def emit(event_type: str, payload: dict):
+        captured.append((event_type, payload))
+
+    engine = OrchestratorEngine(
+        run_id="test-phase-lock-all-required",
+        event_emitter=emit,
+        workflow_type=WorkflowType.HANDOFF,
+        orchestration_mode=OrchestrationMode.LLM_DIRECTED,
+        enable_checkpointing=False,
+    )
+    specialist = _agent("specialist_a", "Specialist A", category="specialist")
+    coordinator = _agent("decision_coordinator", "Decision Coordinator", category="coordinator")
+    engine.selected_agents = [specialist, coordinator]
+    engine._agent_lookup = {
+        specialist.agent_id: specialist,
+        coordinator.agent_id: coordinator,
+    }
+    engine._coordinator_agent_id = coordinator.agent_id
+
+    specialist_payload = (
+        '{"executive_summary":"Crew legality at risk on two pairings.",'
+        '"evidence_points":["2 pairings at 11.7h duty"],'
+        '"recommended_actions":["Swap reserve FO at ORD"],'
+        '"risks":["Reserve depletion by T+120"],'
+        '"confidence":0.72}'
+    )
+    coordinator_payload = (
+        '{"summary":"Apply reserve FO swap and rebalance rotations.",'
+        '"finalAnswer":"Apply reserve FO swap now and rebalance crew rotations.",'
+        '"criteria":["delay_reduction","crew_margin","safety_score","cost_impact","passenger_impact"],'
+        '"options":[{"optionId":"opt-1","description":"Swap reserve FO at ORD","rank":1,'
+        '"scores":{"delay_reduction":80,"crew_margin":78,"safety_score":90,"cost_impact":65,"passenger_impact":82}}],'
+        '"timeline":[{"time":"T+0","action":"Swap reserve FO at ORD","agent":"crew_recovery"}],'
+        '"selectedOptionId":"opt-1",'
+        '"confidence":"high","assumptions":[],"evidenceCoverage":{"required":1,"contributed":1}}'
+    )
+
+    specialist_resp = AgentExecutorResponse(
+        executor_id=specialist.agent_id,
+        agent_response=AgentResponse(messages=[ChatMessage(role="assistant", text=specialist_payload)]),
+    )
+    coordinator_resp = AgentExecutorResponse(
+        executor_id=coordinator.agent_id,
+        agent_response=AgentResponse(messages=[ChatMessage(role="assistant", text=coordinator_payload)]),
+    )
+
+    engine.workflow = _FakeWorkflow([
+        ExecutorInvokedEvent(specialist.agent_id),
+        ExecutorCompletedEvent(specialist.agent_id, specialist_resp),
+        ExecutorInvokedEvent(coordinator.agent_id),
+        ExecutorCompletedEvent(coordinator.agent_id, coordinator_resp),
+        WorkflowOutputEvent({}, coordinator.agent_id),
+    ])
+
+    result = await engine._stream_workflow("test")
+    assert result["fallbackMode"] == "none"
+    assert result["isFallback"] is False
+    assert result["answer"] == "Apply reserve FO swap now and rebalance crew rotations."
+    statuses = [p for t, p in captured if t == "workflow.status"]
+    assert any(p.get("status") == "phase_lock_enabled" for p in statuses)
+
+
+def test_concrete_fallback_result_aggregates_all_structured_findings():
+    engine = OrchestratorEngine(run_id="test-fallback-aggregation", enable_checkpointing=False)
+    engine._specialist_findings_map = {
+        "specialist_a": {
+            "executive_summary": "A summary",
+            "evidence_points": ["First evidence point"],
+            "recommended_actions": ["Action from specialist A"],
+            "risks": ["First risk"],
+            "confidence": 0.7,
+        },
+        "specialist_b": {
+            "executive_summary": "B summary",
+            "evidence_points": ["Second evidence point"],
+            "recommended_actions": ["Action from specialist B"],
+            "risks": ["Second risk"],
+            "confidence": 0.8,
+        },
+    }
+
+    result = engine._build_concrete_fallback_result(reason="insufficient_specialist_analysis")
+    answer = result["answer"].lower()
+    assert "first evidence point".lower() in answer
+    assert "second evidence point".lower() in answer
+    assert "first risk".lower() in answer
+    assert "second risk".lower() in answer
+
+
+@pytest.mark.asyncio
+async def test_stream_workflow_fails_fast_on_control_only_superstep_streak():
+    class _SuperStepStartedEvent:
+        pass
+
+    class _SuperStepCompletedEvent:
+        pass
+
+    class _FakeWorkflow:
+        def __init__(self, events):
+            self._events = events
+
+        async def run_stream(self, _input):
+            for event in self._events:
+                yield event
+
+    captured: list[tuple[str, dict]] = []
+
+    async def emit(event_type: str, payload: dict):
+        captured.append((event_type, payload))
+
+    engine = OrchestratorEngine(
+        run_id="test-control-only-superstep-streak",
+        event_emitter=emit,
+        workflow_type=WorkflowType.HANDOFF,
+        orchestration_mode=OrchestrationMode.LLM_DIRECTED,
+        enable_checkpointing=False,
+    )
+    specialist = _agent("specialist_streak", "Specialist Streak")
+    coordinator = _agent("decision_coordinator", "Decision Coordinator", category="coordinator")
+    engine.selected_agents = [specialist, coordinator]
+    engine._agent_lookup = {
+        specialist.agent_id: specialist,
+        coordinator.agent_id: coordinator,
+    }
+    engine._coordinator_agent_id = coordinator.agent_id
+
+    # 4 consecutive supersteps with only no-op invocation/completion should fail fast.
+    events = []
+    for _ in range(4):
+        events.extend([
+            _SuperStepStartedEvent(),
+            ExecutorInvokedEvent("specialist_streak", {"should_respond": False}),
+            ExecutorCompletedEvent("specialist_streak"),
+            _SuperStepCompletedEvent(),
+        ])
+    engine.workflow = _FakeWorkflow(events)
+
+    with pytest.raises(RuntimeError, match="insufficient_specialist_analysis"):
+        await engine._stream_workflow("test")
+
+
+@pytest.mark.asyncio
+async def test_stream_workflow_fails_fast_on_noop_invocation_streak_without_supersteps():
+    class _FakeWorkflow:
+        def __init__(self, events):
+            self._events = events
+
+        async def run_stream(self, _input):
+            for event in self._events:
+                yield event
+
+    captured: list[tuple[str, dict]] = []
+
+    async def emit(event_type: str, payload: dict):
+        captured.append((event_type, payload))
+
+    engine = OrchestratorEngine(
+        run_id="test-noop-streak-no-supersteps",
+        event_emitter=emit,
+        workflow_type=WorkflowType.HANDOFF,
+        orchestration_mode=OrchestrationMode.LLM_DIRECTED,
+        enable_checkpointing=False,
+    )
+    specialist = _agent("specialist_noop", "Specialist Noop")
+    coordinator = _agent("decision_coordinator", "Decision Coordinator", category="coordinator")
+    engine.selected_agents = [specialist, coordinator]
+    engine._agent_lookup = {
+        specialist.agent_id: specialist,
+        coordinator.agent_id: coordinator,
+    }
+    engine._coordinator_agent_id = coordinator.agent_id
+
+    events = []
+    # Exceed max_noop_invocations_without_progress (24 for 1 specialist in llm-directed mode).
+    for _ in range(25):
+        events.extend([
+            ExecutorInvokedEvent("specialist_noop", {"should_respond": False}),
+            ExecutorCompletedEvent("specialist_noop"),
+        ])
+    engine.workflow = _FakeWorkflow(events)
+
+    with pytest.raises(RuntimeError, match="insufficient_specialist_analysis"):
+        await engine._stream_workflow("test")
+
+
+@pytest.mark.asyncio
 async def test_executor_completed_extracts_from_full_conversation():
     """agent.completed should extract text from full_conversation when agent_response is empty."""
     captured: list[tuple[str, dict]] = []
@@ -1026,6 +1372,112 @@ async def test_streaming_accum_captures_function_result_content():
     assert "ILS 21L" in chunks[0]
 
 
+@pytest.mark.asyncio
+async def test_noop_invocation_does_not_count_as_real_execution():
+    captured: list[tuple[str, dict]] = []
+
+    async def emit(event_type: str, payload: dict):
+        captured.append((event_type, payload))
+
+    engine = OrchestratorEngine(
+        run_id="test-noop-counting",
+        event_emitter=emit,
+        workflow_type=WorkflowType.HANDOFF,
+        orchestration_mode=OrchestrationMode.LLM_DIRECTED,
+        enable_checkpointing=False,
+    )
+    specialist = _agent("specialist_a", "Specialist A", category="specialist")
+    engine.selected_agents = [specialist]
+    engine._agent_lookup = {specialist.agent_id: specialist}
+
+    await engine._process_workflow_event(
+        ExecutorInvokedEvent("specialist_a", {"should_respond": False}),
+    )
+
+    assert engine._agent_invocation_counts["specialist_a"] == 1
+    assert engine._agent_execution_counts.get("specialist_a", 0) == 0
+    assert engine._executor_invocations_total == 0
+    assert engine._has_specialist_participation([]) is False
+
+    invoked = [payload for event_type, payload in captured if event_type == "executor.invoked"]
+    assert len(invoked) == 1
+    assert invoked[0]["isNoOpInvocation"] is True
+    assert invoked[0]["shouldRespond"] is False
+    assert invoked[0]["realExecutionCount"] == 0
+
+
+@pytest.mark.asyncio
+async def test_loop_guard_ignores_noop_invocations_for_all_heard():
+    captured: list[tuple[str, dict]] = []
+
+    async def emit(event_type: str, payload: dict):
+        captured.append((event_type, payload))
+
+    engine = OrchestratorEngine(
+        run_id="test-loop-noop-guard",
+        event_emitter=emit,
+        workflow_type=WorkflowType.HANDOFF,
+        orchestration_mode=OrchestrationMode.LLM_DIRECTED,
+        max_executor_invocations=1,
+        enable_checkpointing=False,
+    )
+    specialist = _agent("specialist_a", "Specialist A", category="specialist")
+    engine.selected_agents = [specialist]
+    engine._agent_lookup = {specialist.agent_id: specialist}
+    engine._max_executor_invocations_effective = 1
+
+    # no-op warm-up invocation should not count toward loop cap or specialist-heard coverage
+    await engine._process_workflow_event(
+        ExecutorInvokedEvent("specialist_a", {"should_respond": False}),
+    )
+
+    # first real invocation should still be accepted under cap
+    await engine._process_workflow_event(ExecutorInvokedEvent("specialist_a"))
+
+    # second real invocation crosses cap and now loop-caps gracefully
+    with pytest.raises(_LoopCappedSignal):
+        await engine._process_workflow_event(ExecutorInvokedEvent("specialist_a"))
+
+    assert engine._executor_invocations_total == 2
+    status_events = [p for t, p in captured if t == "workflow.status" and p.get("status") == "loop_capped"]
+    assert status_events, "workflow.status with loop_capped should be emitted after real invocations exceed cap"
+
+
+@pytest.mark.asyncio
+async def test_noop_completion_does_not_emit_specialist_completion_or_evidence():
+    captured: list[tuple[str, dict]] = []
+
+    async def emit(event_type: str, payload: dict):
+        captured.append((event_type, payload))
+
+    engine = OrchestratorEngine(
+        run_id="test-noop-completed",
+        event_emitter=emit,
+        workflow_type=WorkflowType.HANDOFF,
+        orchestration_mode=OrchestrationMode.LLM_DIRECTED,
+        enable_checkpointing=False,
+    )
+    specialist = _agent("specialist_a", "Specialist A", category="specialist")
+    engine.selected_agents = [specialist]
+    engine._agent_lookup = {specialist.agent_id: specialist}
+
+    await engine._process_workflow_event(
+        ExecutorInvokedEvent("specialist_a", {"should_respond": False}),
+    )
+    await engine._process_workflow_event(ExecutorCompletedEvent("specialist_a"))
+
+    completed = [payload for event_type, payload in captured if event_type == "executor.completed"]
+    agent_completed = [payload for event_type, payload in captured if event_type == "agent.completed"]
+
+    assert len(completed) == 1
+    assert completed[0]["status"] == "noop_completed"
+    assert completed[0]["isNoOpInvocation"] is True
+    assert completed[0]["shouldRespond"] is False
+    assert agent_completed == []
+    assert "specialist_a" not in engine._completed_agent_ids
+    assert engine.evidence == []
+
+
 def test_extract_response_text_reads_message_contents_function_result():
     engine = OrchestratorEngine(run_id="test-contents-function-result", enable_checkpointing=False)
     response = AgentResponse(messages=[
@@ -1036,6 +1488,58 @@ def test_extract_response_text_reads_message_contents_function_result():
     ])
     extracted = engine._extract_response_text(response)
     assert "DTW recommended" in extracted
+
+
+@pytest.mark.asyncio
+async def test_specialist_aggregator_includes_function_result_only_messages():
+    class DummyContext:
+        def __init__(self):
+            self.calls: list[tuple[object, str | None]] = []
+
+        async def send_message(self, message, target_id=None):
+            self.calls.append((message, target_id))
+
+    aggregator = _SpecialistAggregator(
+        id="specialist_aggregator",
+        coordinator_executor_id="decision_coordinator",
+        specialist_ids=["maintenance_predictor"],
+    )
+    ctx = DummyContext()
+
+    response = AgentResponse(
+        messages=[
+            ChatMessage(
+                role="assistant",
+                contents=[
+                    Content.from_function_result(
+                        call_id="call_1",
+                        result={
+                            "trend": "rising",
+                            "repeat_tails": ["N738AA", "N739AA", "N741AA"],
+                            "recommendation": "escalate borescope inspection cadence",
+                        },
+                    )
+                ],
+            )
+        ]
+    )
+    results = [
+        AgentExecutorResponse(
+            executor_id="maintenance_predictor",
+            agent_response=response,
+        )
+    ]
+
+    await aggregator.aggregate(results, ctx)
+
+    assert len(ctx.calls) == 1
+    message, target_id = ctx.calls[0]
+    assert target_id == "decision_coordinator"
+    assert isinstance(message, list) and len(message) == 1
+    outbound = message[0]
+    assert "No findings returned" not in (outbound.text or "")
+    assert "N738AA" in (outbound.text or "")
+    assert "borescope inspection cadence" in (outbound.text or "")
 
 
 @pytest.mark.asyncio
