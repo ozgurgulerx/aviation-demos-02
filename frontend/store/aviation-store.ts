@@ -101,6 +101,23 @@ function synthesizeCompletionAnswer(payload: Record<string, unknown>, eventMessa
   return answer || "Analysis complete. A recommended recovery response is ready.";
 }
 
+function isOrchestrationNoiseAnswer(answer: string): boolean {
+  const normalized = answer.replace(/\s+/g, " ").trim().toLowerCase();
+  if (!normalized) return true;
+  if (normalized.startsWith("## aviation problem analysis task")) return true;
+  if (normalized.includes("streaming traces now. final answer will appear when the run completes.")) return true;
+  if (normalized.includes("specialist agents contributed findings") && normalized.startsWith("analysis complete")) return true;
+  if (normalized.includes("\"handoff_to\"")) return true;
+  return false;
+}
+
+function sanitizeCompletionAnswer(answer: string): string {
+  if (!isOrchestrationNoiseAnswer(answer)) {
+    return answer;
+  }
+  return "Analysis completed without substantive specialist findings. Reliable recommendations were not produced in this run.";
+}
+
 function incrementAgentTrace(agent: AgentNode, ts: string): AgentNode {
   return {
     ...agent,
@@ -1336,6 +1353,15 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
         const timeline = rawTimeline
           .map((entry: unknown) => parseTimelineEntry(entry))
           .filter((e): e is NonNullable<typeof e> => e !== null);
+        const confidence = payloadString(payload, "confidence") as "high" | "medium" | "low";
+        const assumptions = payloadArray<string>(payload, "assumptions");
+        const evidenceCoverageRaw = payload.evidenceCoverage as Record<string, unknown> | undefined;
+        const evidenceCoverage = evidenceCoverageRaw
+          ? {
+              required: payloadNumber(evidenceCoverageRaw, "required"),
+              contributed: payloadNumber(evidenceCoverageRaw, "contributed"),
+            }
+          : undefined;
         set({
           recoveryPlan: {
             selectedOptionId: payloadString(payload, "selectedOptionId"),
@@ -1343,6 +1369,11 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
             timeline,
             options: currentOptions.length > 0 ? currentOptions : payloadArray<RecoveryOption>(payload, "options"),
             criteria: ["delay_reduction", "crew_margin", "safety_score", "cost_impact", "passenger_impact"],
+            confidence,
+            assumptions,
+            evidenceCoverage,
+            isFallback: payload.fallbackMode === "sop_concrete" || Boolean(payload.isFallback),
+            fallbackMode: payloadString(payload, "fallbackMode") as "none" | "sop_concrete",
           },
           bottomDrawerTab: "plan",
           bottomDrawerOpen: true,
@@ -1440,10 +1471,36 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
 
       case EventKinds.RUN_COMPLETED: {
         const result = payload.result as Record<string, unknown> | undefined;
-        const completionAnswer =
+        const confidence = payloadString(result ?? {}, "confidence") as "high" | "medium" | "low";
+        const fallbackMode = payloadString(result ?? {}, "fallbackMode") as "none" | "sop_concrete";
+        const isFallback = fallbackMode === "sop_concrete" || Boolean(result?.isFallback);
+        const assumptions = payloadArray<string>(result ?? {}, "assumptions");
+        const evidenceCoverageRaw = result?.evidenceCoverage as Record<string, unknown> | undefined;
+        const evidenceCoverage = evidenceCoverageRaw
+          ? {
+              required: payloadNumber(evidenceCoverageRaw, "required"),
+              contributed: payloadNumber(evidenceCoverageRaw, "contributed"),
+            }
+          : undefined;
+        const rawCompletionAnswer =
           payloadString(payload, "answer") ||
           payloadString(result ?? {}, "answer") ||
           synthesizeCompletionAnswer(payload, event.message);
+        const completionAnswerCore = sanitizeCompletionAnswer(rawCompletionAnswer);
+        const badgeParts: string[] = [];
+        if (confidence) {
+          badgeParts.push(`${confidence} confidence`);
+        }
+        if (isFallback) {
+          badgeParts.push("SOP-based");
+        }
+        const completionAnswer = badgeParts.length > 0
+          ? `[${badgeParts.join(" | ")}] ${completionAnswerCore}`
+          : completionAnswerCore;
+        const assumptionsText = assumptions.length > 0
+          ? ` Assumptions: ${assumptions.slice(0, 2).join(" ")}`
+          : "";
+        const finalMessage = `${completionAnswer}${assumptionsText}`.trim();
         // If recovery plan is still empty, try to populate from result
         if (!get().recoveryPlan) {
           if (result?.summary) {
@@ -1454,6 +1511,11 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
                 timeline: Array.isArray(result.timeline) ? result.timeline : [],
                 options: get().recoveryOptions,
                 criteria: ["delay_reduction", "crew_margin", "safety_score", "cost_impact", "passenger_impact"],
+                confidence,
+                assumptions,
+                evidenceCoverage,
+                isFallback,
+                fallbackMode,
               },
               bottomDrawerTab: "plan",
               bottomDrawerOpen: true,
@@ -1462,13 +1524,13 @@ export const useAviationStore = create<AviationStore>((set, get) => ({
         }
         set((state) => ({
           chatMessages:
-            completionAnswer && !state.finalAnswerRunIds.includes(event.run_id)
+            finalMessage && !state.finalAnswerRunIds.includes(event.run_id)
               ? [
                   ...state.chatMessages,
                   {
                     id: `completion-${event.event_id}`,
                     role: "assistant",
-                    content: completionAnswer,
+                    content: finalMessage,
                   },
                 ]
               : state.chatMessages,

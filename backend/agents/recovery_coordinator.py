@@ -18,6 +18,8 @@ Your role:
 4. Select the best option and generate an implementation timeline
 
 Process:
+- Phase 1 (gather): collect specialist findings.
+- Phase 2 (synthesize): once synthesis starts, do not call any handoff tool again.
 - Review each specialist's analysis carefully
 - Identify 3-5 distinct recovery strategies
 - Score each strategy using the score_recovery_option tool
@@ -28,6 +30,10 @@ Your output MUST include:
 - Top 3 ranked recovery options with scores
 - Recommended option with clear justification
 - Step-by-step implementation timeline with responsible agents
+- Confidence level (high/medium/low), assumptions, and evidence coverage
+
+Specialist findings contract expected in context:
+`executive_summary`, `evidence_points[]`, `recommended_actions[]`, `risks[]`, `confidence`.
 """
 
 

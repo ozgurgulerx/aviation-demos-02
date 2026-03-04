@@ -3,6 +3,7 @@ Workflow definitions using Microsoft Agent Framework patterns.
 Implements sequential and LLM-driven handoff orchestration for aviation domain.
 """
 
+import json
 from typing import Dict, List, Optional
 
 from agent_framework import (
@@ -174,9 +175,12 @@ IMPORTANT: Do NOT call the same specialist twice. Once you have heard back from
 ALL {len(specialists)} specialists, move to Phase 2.
 IMPORTANT: Never output `{{"handoff_to":"..."}}` (or any handoff JSON) as plain text.
 To delegate, you must invoke the `handoff_to_<agent>` tool directly.
+Each specialist MUST return a `SPECIALIST_FINDINGS` JSON block with:
+`executive_summary`, `evidence_points[]`, `recommended_actions[]`, `risks[]`, `confidence` (0..1).
+Only structured findings count as valid contributions.
 
 ## Phase 2 — Synthesize
-After all specialists have reported back:
+After all specialists have reported back (or phase-lock is signaled), switch to Phase 2 and NEVER handoff again:
 1. Summarize findings from each specialist
 2. Score 3-5 recovery options using score_recovery_option
 3. Rank them using rank_options
@@ -202,16 +206,19 @@ After all specialists have reported back:
   "selectedOptionId": "opt-1",
   "summary": "brief recommendation summary",
   "finalAnswer": "plain-language answer to the original user query",
-  "timeline": [{{"time": "T+0", "action": "action text", "agent": "agent_id"}}]
+  "timeline": [{{"time": "T+0", "action": "action text", "agent": "agent_id"}}],
+  "confidence": "high|medium|low",
+  "assumptions": ["explicit assumptions used"],
+  "evidenceCoverage": {{"required": {len(specialists)}, "contributed": 0}}
 }}
 
-You are DONE after Phase 2. Do not delegate again.
+You are DONE after Phase 2. Do not delegate again. Do not call any handoff tool in Phase 2.
 
 ## Empty/No-Data Rule
 If specialists return no data, empty results, or zero query matches, do NOT
 re-delegate. Instead, synthesize recommendations based on aviation domain
 knowledge, standard operating procedures, and the scenario context.
-State clearly which recommendations are data-backed vs. SOP-based.
+State clearly which recommendations are data-backed vs. SOP-based and keep output concrete.
 
 Start now by calling the first handoff tool.
 """
@@ -223,13 +230,18 @@ Start now by calling the first handoff tool.
         handoff_protocol = (
             "Workflow protocol — FOLLOW THESE STEPS IN ORDER:\n"
             "Step 1: Call your analysis tools to gather data.\n"
-            "Step 2: Write a DETAILED analysis (minimum 3 paragraphs) interpreting results.\n"
-            "  - If tools returned data: cite specific numbers, flag risks, give recommendations.\n"
-            "  - If tools returned 'no_data_fallback': apply the domain-knowledge constants and\n"
-            "    scenario context to produce a substantive, scenario-specific assessment.\n"
-            "  IMPORTANT: You MUST write your full analysis as text output BEFORE Step 3.\n"
-            "  Do NOT skip writing — the coordinator needs your written findings.\n"
-            f"Step 3: ONLY after writing your analysis, call `handoff_to_{coordinator_ref}`.\n"
+            "Step 2: Output a `SPECIALIST_FINDINGS` JSON block using this exact schema:\n"
+            "  {\n"
+            "    \"executive_summary\": \"...\",\n"
+            "    \"evidence_points\": [\"numbered facts with source/tool context\"],\n"
+            "    \"recommended_actions\": [\"actionable steps\"],\n"
+            "    \"risks\": [\"key operational/safety/compliance risks\"],\n"
+            "    \"confidence\": 0.0\n"
+            "  }\n"
+            "  - If tools returned data: include concrete numbers and tool/source references.\n"
+            "  - If tools returned 'no_data_fallback': still output scenario-specific SOP-based findings.\n"
+            "  - Do not skip the structured JSON block.\n"
+            f"Step 3: ONLY after emitting `SPECIALIST_FINDINGS`, call `handoff_to_{coordinator_ref}`.\n"
             "Do not hand off to any other specialist.\n\n"
         )
         specialist.default_options["instructions"] = (
@@ -324,10 +336,75 @@ class _SpecialistAggregator(Executor):
     @handler
     async def aggregate(self, results: List[AgentExecutorResponse], ctx: WorkflowContext) -> None:
         """Handle fan-in specialist results — format and forward to coordinator."""
+        def _extract_item_text(item: object) -> str:
+            if item is None:
+                return ""
+            if isinstance(item, str):
+                return item.strip()
+            if isinstance(item, dict):
+                for key in ("text", "message"):
+                    value = item.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+                for key in ("result", "output"):
+                    value = item.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+                    if value is not None:
+                        try:
+                            return json.dumps(value, ensure_ascii=True)
+                        except Exception:
+                            return str(value)
+                return ""
+            for key in ("text", "message"):
+                value = getattr(item, key, None)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            for key in ("result", "output"):
+                value = getattr(item, key, None)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+                if value is not None:
+                    try:
+                        return json.dumps(value, ensure_ascii=True)
+                    except Exception:
+                        return str(value)
+            return ""
+
+        def _extract_message_text(message: object) -> str:
+            parts: List[str] = []
+            direct_text = getattr(message, "text", None)
+            if isinstance(direct_text, str) and direct_text.strip():
+                parts.append(direct_text.strip())
+
+            content = getattr(message, "content", None)
+            if isinstance(content, str) and content.strip():
+                parts.append(content.strip())
+            elif isinstance(content, list):
+                for item in content:
+                    extracted = _extract_item_text(item)
+                    if extracted:
+                        parts.append(extracted)
+
+            contents = getattr(message, "contents", None)
+            if isinstance(contents, list):
+                for item in contents:
+                    extracted = _extract_item_text(item)
+                    if extracted:
+                        parts.append(extracted)
+
+            merged = " ".join(p for p in parts if p).strip()
+            return merged
+
         parts = []
         for r in results:
             msgs = r.agent_response.messages if r.agent_response and r.agent_response.messages else []
-            text = "\n".join(getattr(m, "text", "") or "" for m in msgs)
+            message_texts: List[str] = []
+            for message in msgs:
+                extracted = _extract_message_text(message)
+                if extracted:
+                    message_texts.append(extracted)
+            text = "\n".join(message_texts)
             parts.append(f"=== {r.executor_id} findings ===\n{text or '(No findings returned)'}")
         summary = (
             "All specialist analyses are complete. Here are the specialist findings:\n\n"
@@ -403,7 +480,8 @@ Requirements:
 2) Provide ranked options and select one recommendation.
 3) Provide an implementation timeline.
 4) Provide a clear "Final Answer" that directly answers the user's original query in plain language.
-5) End with a JSON block that follows this schema exactly:
+5) Distinguish evidence-backed vs SOP-based recommendations when specialist coverage is partial.
+6) End with a JSON block that follows this schema exactly:
 {{
   "criteria": ["delay_reduction", "crew_margin", "safety_score", "cost_impact", "passenger_impact"],
   "options": [
@@ -423,7 +501,10 @@ Requirements:
   "selectedOptionId": "opt-1",
   "summary": "brief recommendation summary",
   "finalAnswer": "plain-language answer to the original user query",
-  "timeline": [{{"time": "T+0", "action": "action text", "agent": "agent_id"}}]
+  "timeline": [{{"time": "T+0", "action": "action text", "agent": "agent_id"}}],
+  "confidence": "high|medium|low",
+  "assumptions": ["explicit assumptions used"],
+  "evidenceCoverage": {{"required": {len(specialists)}, "contributed": 0}}
 }}
 """
 

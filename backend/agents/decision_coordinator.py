@@ -20,6 +20,8 @@ Your role:
 4. Select the best option and generate a recommendation
 
 Process:
+- Phase 1 (gather): collect specialist findings.
+- Phase 2 (synthesize): once synthesis starts, do not call any handoff tool again.
 - Review all specialist analyses
 - Identify 2-4 distinct courses of action
 - Score each using score_recovery_option tool
@@ -31,6 +33,10 @@ Your output MUST include:
 - Recommended course of action with justification
 - Key risks and mitigations
 - Implementation steps
+- Confidence level (high/medium/low), assumptions, and evidence coverage
+
+Specialist findings contract expected in context:
+`executive_summary`, `evidence_points[]`, `recommended_actions[]`, `risks[]`, `confidence`.
 """
 
 

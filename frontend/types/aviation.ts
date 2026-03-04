@@ -243,6 +243,11 @@ export interface RecoveryPlan {
   timeline: RecoveryTimelineEntry[];
   options: RecoveryOption[];
   criteria: string[];
+  confidence?: "high" | "medium" | "low";
+  assumptions?: string[];
+  evidenceCoverage?: { required: number; contributed: number };
+  isFallback?: boolean;
+  fallbackMode?: "none" | "sop_concrete";
 }
 
 // ═══════════════════════════════════════════════════════════════════
